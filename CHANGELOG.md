@@ -7,6 +7,10 @@
 - AstrBot Dashboard plugin page with live status, Operit test, configuration, sleep controls, health summary, tasks, reminders, and audit views.
 - Server-side configuration validation and masked Token display.
 
+### Documentation
+
+- Clarified that Operit requires a configured, working model with tool-calling support before remote phone tasks can run.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added

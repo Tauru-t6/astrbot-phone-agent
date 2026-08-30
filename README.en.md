@@ -19,6 +19,7 @@ Health data is a separate path: `xiaomi-health-sync` synchronizes Xiaomi Fitness
 - Operit installed on the phone.
 - Shizuku installed and running on the phone.
 - Shizuku access granted to the Operit tools or workflows you intend to use.
+- At least one working chat model configured in Operit. Verify that it can answer and call tools from a normal Operit chat before enabling remote control.
 - AstrBot 4.22 or newer.
 - A Xiaomi Fitness account and `xiaomi-health-sync` if health queries are needed.
 
@@ -40,15 +41,16 @@ The phone can use Wi-Fi or mobile data. Operit HTTP works through Tailscale and 
 
 1. Start Shizuku and verify that it is running.
 2. Open Operit and grant Shizuku access to the tools or workflows you will use.
-3. In Operit, open:
+3. Configure a working model in Operit, including its API endpoint, API Key, and model name. Test a normal reply first, then test one harmless tool action.
+4. In Operit, open:
 
    ```text
    Settings -> Data and permissions -> External HTTP calls
    ```
 
-4. Enable the external HTTP service. The default port is `8094`.
-5. Copy the displayed Bearer Token. Put it only in AstrBot configuration; never send it in chat or commit it to GitHub.
-6. The base URL is normally:
+5. Enable the external HTTP service. The default port is `8094`.
+6. Copy the displayed Bearer Token. Put it only in AstrBot configuration; never send it in chat or commit it to GitHub.
+7. The base URL is normally:
 
    ```text
    http://PHONE_TAILSCALE_IP:8094
@@ -226,7 +228,15 @@ Start Shizuku again using its on-screen instructions and verify that Operit's pe
 
 ### Operit connects but does not act
 
-Verify the HTTP service, Token, and Shizuku status. First test with:
+This usually means Operit has no model configured, the model is unavailable, or tool calling is not working. Verify:
+
+1. Operit has a valid API endpoint, API Key, and model name.
+2. The model replies in a normal Operit chat.
+3. The model supports and is allowed to call tools.
+4. Shizuku is running and Operit has permission.
+5. The External HTTP service is running and the Token is correct.
+
+Then test with:
 
 ```text
 Observe the phone only; do not click or type

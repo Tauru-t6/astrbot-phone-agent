@@ -18,6 +18,7 @@
 - 手机和服务器加入同一个 Tailscale tailnet。
 - 手机安装 Operit 和 Shizuku。
 - 在 Operit 中授予需要的 Shizuku 权限。
+- 在 Operit 中配置至少一个可用的聊天模型，并在 Operit 对话页确认模型能正常回复和调用工具。
 - AstrBot 4.22 或更高版本。
 - 如果需要健康数据，再准备小米运动健康账号和 `xiaomi-health-sync`。
 
@@ -39,15 +40,16 @@
 
 1. 打开 Shizuku，完成启动并确认状态为运行中。
 2. 打开 Operit，给需要的工具或工作流授权 Shizuku。
-3. 进入 Operit：
+3. 在 Operit 的模型设置中配置一个可用模型，包括 API 地址、API Key 和模型名。先在普通对话中测试，确认它能回复；再让它执行一个无害工具操作，确认工具调用可用。
+4. 进入 Operit：
 
    ```text
    设置 -> 数据和权限 -> 外部 HTTP 调用
    ```
 
-4. 打开外部 HTTP 服务，默认端口为 `8094`。
-5. 记录页面显示的 Bearer Token。Token 只填入 AstrBot 配置，不要发到聊天或提交到 GitHub。
-6. 服务地址通常是：
+5. 打开外部 HTTP 服务，默认端口为 `8094`。
+6. 记录页面显示的 Bearer Token。Token 只填入 AstrBot 配置，不要发到聊天或提交到 GitHub。
+7. 服务地址通常是：
 
    ```text
    http://PHONE_TAILSCALE_IP:8094
@@ -225,7 +227,15 @@ Operit Token 已失效或被重置。重新打开 Operit 外部 HTTP 页面，�
 
 ### Operit 能连接但不会操作
 
-确认 Operit HTTP 服务正在运行、Token 正确、Shizuku 为运行状态，先测试：
+这通常不是网络问题，而是 Operit 没有配置模型、模型不可用，或者模型不会调用工具。依次确认：
+
+1. Operit 已配置 API 地址、API Key 和模型名。
+2. 在 Operit 普通对话页中，模型能正常回复。
+3. 模型支持并允许工具调用。
+4. Shizuku 正在运行，Operit 已获得授权。
+5. Operit HTTP 服务正在运行且 Token 正确。
+
+然后先测试：
 
 ```text
 观察一下当前手机，只观察，不要点击
