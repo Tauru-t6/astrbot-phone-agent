@@ -6,6 +6,8 @@ Phone control for AstrBot through Operit, Shizuku, and Tailscale.
 - [English](README.en.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
+- [Releases](https://github.com/Tauru-t6/astrbot-phone-agent/releases)
+- [Contributors](https://github.com/Tauru-t6/astrbot-phone-agent/graphs/contributors)
 
 Private Companion integration is optional and disabled by default. See
 [`extensions/private_companion_auth.md`](extensions/private_companion_auth.md)
