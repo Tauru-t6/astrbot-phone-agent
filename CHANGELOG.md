@@ -10,6 +10,7 @@
 ### Documentation
 
 - Clarified that Operit requires a configured, working model with tool-calling support before remote phone tasks can run.
+- Expanded the bilingual installation guide with step-by-step Shizuku, model, Tailscale, HTTP, plugin, WebUI, validation, and acceptance-checklist instructions.
 
 ## [0.2.0] - 2026-08-30
 
