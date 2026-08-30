@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0] - 2026-08-30
+
+### Added
+
+- AstrBot Dashboard plugin page with live status, Operit test, configuration, sleep controls, health summary, tasks, reminders, and audit views.
+- Server-side configuration validation and masked Token display.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added

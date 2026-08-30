@@ -16,6 +16,7 @@ from typing import Any
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Star
+from quart import jsonify, request
 
 
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
@@ -59,6 +60,7 @@ class PhoneAgentPlugin(Star):
         self._reminder_tasks: dict[str, asyncio.Task[Any]] = {}
         self._reminders: dict[str, dict[str, Any]] = {}
         self._load_reminders()
+        self._register_web_api()
         if self._bool_config("sleep_guard_enabled", False):
             try:
                 self._guard_task = asyncio.create_task(self._sleep_guard_loop())
@@ -70,6 +72,156 @@ class PhoneAgentPlugin(Star):
         if isinstance(value, str):
             return value.strip().lower() not in {"0", "false", "off", "no", "disabled"}
         return bool(value)
+
+    def _register_web_api(self) -> None:
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register):
+            return
+        prefix = "/astrbot_plugin_phone_agent"
+        routes = (
+            ("/status", self._web_status, ["GET"], "Phone Agent status"),
+            ("/config", self._web_get_config, ["GET"], "Phone Agent configuration"),
+            ("/config", self._web_save_config, ["POST"], "Save Phone Agent configuration"),
+            ("/test_operit", self._web_test_operit, ["POST"], "Test Operit connection"),
+            ("/sleep_mode", self._web_sleep_mode, ["POST"], "Control temporary sleep mode"),
+            ("/health", self._web_health, ["GET"], "Read phone health summary"),
+            ("/tasks", self._web_tasks, ["GET"], "List Operit tasks"),
+            ("/reminders", self._web_reminders, ["GET"], "List phone reminders"),
+            ("/audit", self._web_audit, ["GET"], "List phone action audit"),
+        )
+        for route, handler, methods, description in routes:
+            register(prefix + route, handler, methods, description)
+
+    def _web_config_view(self) -> dict[str, Any]:
+        keys = (
+            "enabled", "control_backend", "operit_base_url", "allowed_user_ids",
+            "use_private_companion_auth", "app_aliases_json", "sleep_guard_enabled",
+            "sleep_guard_start", "sleep_guard_end", "sleep_guard_packages",
+            "sleep_guard_exempt_apps", "sleep_guard_poll_seconds", "operit_timeout_seconds",
+        )
+        result = {key: self.config.get(key) for key in keys}
+        result["operit_token_configured"] = bool(self._operit_token())
+        return result
+
+    async def _web_get_config(self):
+        return jsonify({"success": True, "config": self._web_config_view()})
+
+    async def _web_save_config(self):
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "JSON object required"}), 400
+        bool_keys = {"enabled", "use_private_companion_auth", "sleep_guard_enabled"}
+        int_keys = {"sleep_guard_poll_seconds", "operit_timeout_seconds"}
+        text_keys = {
+            "control_backend", "operit_base_url", "operit_token", "allowed_user_ids",
+            "app_aliases_json", "sleep_guard_start", "sleep_guard_end",
+            "sleep_guard_packages", "sleep_guard_exempt_apps",
+        }
+        updates: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in bool_keys:
+                updates[key] = bool(value)
+            elif key in int_keys:
+                try:
+                    updates[key] = max(1, min(int(value), 300))
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "error": f"invalid integer: {key}"}), 400
+            elif key in text_keys:
+                value = str(value or "").strip()
+                if len(value) > 2000:
+                    return jsonify({"success": False, "error": f"value too long: {key}"}), 400
+                if key == "control_backend" and value not in {"operit", "adb"}:
+                    return jsonify({"success": False, "error": "control_backend must be operit or adb"}), 400
+                if key == "app_aliases_json" and value:
+                    try:
+                        parsed = json.loads(value)
+                        if not isinstance(parsed, dict):
+                            raise ValueError
+                    except (json.JSONDecodeError, ValueError):
+                        return jsonify({"success": False, "error": "app_aliases_json must be a JSON object"}), 400
+                updates[key] = value
+        if updates:
+            self.config.update(updates)
+            saver = getattr(self.config, "save_config", None)
+            if callable(saver):
+                saver()
+        self._audit("web_config_saved", keys=sorted(updates))
+        return jsonify({"success": True, "config": self._web_config_view()})
+
+    async def _web_test_operit(self):
+        result = await asyncio.to_thread(self._operit_health_sync)
+        return jsonify({"success": bool(result.get("available")), "operit": result})
+
+    async def _web_status(self):
+        operit = await asyncio.to_thread(self._operit_health_sync)
+        health = await asyncio.to_thread(self._read_health_db_sync, 1) if self._health_db() else {"available": False, "error": "health_db_path is not configured"}
+        return jsonify({
+            "success": True,
+            "config": self._web_config_view(),
+            "operit": operit,
+            "health": {"available": health.get("available", False), "days": len(health.get("days", [])), "latest": (health.get("days") or [None])[0]},
+            "sleep_mode": {"manual_active": self._manual_guard_active(), "until": self._manual_guard_until.isoformat(timespec="minutes") if self._manual_guard_until else None, "suspended": sorted(self._guard_suspended)},
+            "tasks": len(self._operit_tasks),
+            "reminders": len(self._reminders),
+        })
+
+    async def _web_sleep_mode(self):
+        payload = await request.get_json(silent=True)
+        payload = payload if isinstance(payload, dict) else {}
+        mode = _text(payload.get("mode", "status"), 20).lower()
+        if mode in {"start", "on", "enable"}:
+            try:
+                minutes = max(5, min(int(payload.get("minutes", 480)), 1440))
+            except (TypeError, ValueError):
+                minutes = 480
+            requested = {self._resolve_package(value) for value in re.split(r"[,\s]+", str(payload.get("packages", "") or "")) if PACKAGE_RE.fullmatch(self._resolve_package(value))}
+            exempt = {self._resolve_package(value) for value in re.split(r"[,\s]+", str(payload.get("exempt", "") or "")) if PACKAGE_RE.fullmatch(self._resolve_package(value))}
+            self._manual_guard_exempt = exempt
+            self._manual_guard_packages = requested or self._guard_packages()
+            self._manual_guard_until = datetime.now() + timedelta(minutes=minutes)
+            self._ensure_guard_task()
+            self._audit("web_sleep_mode_started", minutes=minutes, packages=sorted(self._manual_guard_packages))
+        elif mode in {"stop", "off", "disable", "unlock"}:
+            self._manual_guard_until = None
+            self._manual_guard_packages = None
+            self._manual_guard_exempt = set()
+            await self._restore_guard_apps()
+            self._audit("web_sleep_mode_stopped")
+        return jsonify({"success": True, "mode": "active" if self._manual_guard_active() else "off", "until": self._manual_guard_until.isoformat(timespec="minutes") if self._manual_guard_until else None, "suspended": sorted(self._guard_suspended)})
+
+    async def _web_health(self):
+        try:
+            days = max(1, min(int(request.args.get("days", "7")), 30))
+        except ValueError:
+            days = 7
+        if not self._health_db():
+            return jsonify({"success": True, "health": {"available": False, "error": "health_db_path is not configured"}})
+        return jsonify({"success": True, "health": await asyncio.to_thread(self._read_health_db_sync, days)})
+
+    async def _web_tasks(self):
+        return jsonify({"success": True, "tasks": self._operit_tasks})
+
+    async def _web_reminders(self):
+        return jsonify({"success": True, "reminders": self._reminders})
+
+    async def _web_audit(self):
+        try:
+            limit = max(1, min(int(request.args.get("limit", "50")), 200))
+        except ValueError:
+            limit = 50
+        records: list[dict[str, Any]] = []
+        try:
+            lines = Path(self._audit_path()).read_text(encoding="utf-8").splitlines()[-limit:]
+            for line in lines:
+                try:
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        records.append(value)
+                except json.JSONDecodeError:
+                    pass
+        except OSError:
+            pass
+        return jsonify({"success": True, "records": records})
 
     def _enabled(self) -> bool:
         value = self.config.get("enabled", True)

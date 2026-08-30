@@ -83,7 +83,20 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 
 Restart AstrBot. The plugin itself has no extra Python dependencies.
 
-## 6. Configure the plugin
+## 6. Open the WebUI
+
+After installation and restart, open “Phone Agent” from the AstrBot Dashboard plugin pages. The page provides:
+
+- Operit online status and a connection test.
+- Operit URL, Token, backend, and user allowlist settings.
+- App alias JSON editing.
+- Sleep guard hours, target apps, and exceptions.
+- Start/stop controls for temporary sleep mode.
+- Health summary, background tasks, reminders, and recent audit records.
+
+The page uses AstrBot Dashboard authentication. The Operit Token is shown only as configured/not configured and is never echoed.
+
+## 7. Configure the plugin
 
 Configure the plugin in AstrBot WebUI:
 
@@ -115,7 +128,7 @@ If you explicitly want to reuse Private Companion authorization:
 
 This is an optional extension. The phone agent does not change Private Companion personality, memory, proactive messages, or prompts. See [`extensions/private_companion_auth.md`](extensions/private_companion_auth.md).
 
-## 7. Configure features
+## 8. Configure features
 
 ### App aliases
 
@@ -164,7 +177,7 @@ Background Operit tasks return a task ID and can be queried, cancelled, or retri
 
 Messages, comments, likes, shares, deletes, uninstallations, and payments require explicit confirmation. Opening apps, navigation, screen lock, and read-only status checks can run directly.
 
-## 8. Health data (optional)
+## 9. Health data (optional)
 
 The phone plugin does not read Xiaomi credentials directly. Deploy `xiaomi-health-sync` separately:
 
@@ -181,7 +194,7 @@ How did I sleep last night?
 Are my recent heart rate and SpO2 normal?
 ```
 
-## 9. Available tools
+## 10. Available tools
 
 - `operit_task`: delegate a natural-language UI task to Operit.
 - `operit_task_status`, `operit_task_cancel`, `operit_task_retry`: manage background tasks.
@@ -193,7 +206,7 @@ Are my recent heart rate and SpO2 normal?
 - `phone_audit`: read metadata-only audit records.
 - `phone_health`: query synchronized Xiaomi health data.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### `401 Unauthorized`
 

@@ -82,7 +82,20 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 
 然后重启 AstrBot。插件本身不需要额外安装 Python 依赖。
 
-## 六、配置插件
+## 六、打开 WebUI
+
+安装并重启后，在 AstrBot Dashboard 的插件页面中打开“手机 Agent 控制台”。页面提供：
+
+- Operit 在线状态和一键连接测试。
+- Operit 地址、Token、控制后端和用户白名单配置。
+- App 别名 JSON 编辑。
+- 睡眠守护时间、目标 App 和例外 App 配置。
+- 临时睡眠模式启动/解除。
+- 健康摘要、后台任务、提醒和最近审计记录。
+
+页面使用 AstrBot Dashboard 自带的登录鉴权。Token 只会显示“已配置”，不会回显。
+
+## 七、配置插件
 
 在 AstrBot WebUI 的插件配置中填写：
 
@@ -114,7 +127,7 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 
 这是可选扩展。插件不会修改私人陪伴的性格、记忆、主动消息或提示词。详见 [`extensions/private_companion_auth.md`](extensions/private_companion_auth.md)。
 
-## 七、功能配置
+## 八、功能配置
 
 ### App 别名
 
@@ -163,7 +176,7 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 
 发消息、评论、点赞、转发、删除、卸载和支付类任务需要显式确认。普通的打开 App、返回、锁屏和读取状态可以直接执行。
 
-## 八、健康数据（可选）
+## 九、健康数据（可选）
 
 手机插件本身不读取小米账号。需要单独部署 `xiaomi-health-sync`：
 
@@ -180,7 +193,7 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 最近心率和血氧正常吗？
 ```
 
-## 九、可用工具
+## 十、可用工具
 
 - `operit_task`：把自然语言 UI 任务交给 Operit。
 - `operit_task_status`、`operit_task_cancel`、`operit_task_retry`：管理后台任务。
@@ -192,7 +205,7 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 - `phone_audit`：读取不含 Token 和消息正文的审计记录。
 - `phone_health`：查询同步后的小米健康数据。
 
-## 十、故障排查
+## 十一、故障排查
 
 ### `401 Unauthorized`
 

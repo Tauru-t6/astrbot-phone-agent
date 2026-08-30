@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>手机 Agent 控制台</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f5f7fb; --panel:#fff; --ink:#172033; --muted:#68758a; --line:#e3e8f0; --accent:#365cf5; --good:#159566; --bad:#c54343; }
+    @media (prefers-color-scheme:dark) { :root { --bg:#101521; --panel:#182131; --ink:#eef3ff; --muted:#aab5c8; --line:#2a3548; --accent:#87a1ff; } }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    .shell { max-width:1180px; margin:0 auto; padding:28px 22px 48px; }
+    header { display:flex; justify-content:space-between; align-items:flex-end; gap:20px; margin-bottom:22px; }
+    h1,h2,h3,p { margin:0; } h1 { font-size:28px; letter-spacing:0; } h2 { font-size:19px; } h3 { font-size:15px; }
+    .eyebrow { color:var(--accent); font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; }
+    .muted { color:var(--muted); } .toolbar { display:flex; gap:10px; align-items:center; }
+    button { border:1px solid var(--line); border-radius:7px; background:var(--panel); color:var(--ink); cursor:pointer; padding:9px 13px; font:inherit; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; } button.danger { color:var(--bad); }
+    button:disabled { opacity:.5; cursor:wait; }
+    .tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:20px; overflow:auto; }
+    .tab { border:0; border-radius:6px 6px 0 0; background:transparent; color:var(--muted); white-space:nowrap; }
+    .tab.active { color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,transparent); }
+    .view { display:none; } .view.active { display:block; }
+    .grid { display:grid; gap:14px; } .stats { grid-template-columns:repeat(4,minmax(0,1fr)); } .two { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; box-shadow:0 2px 10px #2030500b; }
+    .stat strong { display:block; font-size:24px; margin-top:7px; } .stat small { color:var(--muted); }
+    .panel-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:15px; }
+    .status { display:inline-flex; align-items:center; gap:7px; color:var(--muted); } .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+    .dot.good { background:var(--good); } .dot.bad { background:var(--bad); }
+    .rows { display:grid; gap:10px; } .row { display:flex; justify-content:space-between; gap:18px; padding:8px 0; border-bottom:1px solid var(--line); } .row:last-child { border-bottom:0; }
+    .value { text-align:right; overflow-wrap:anywhere; } .good-text { color:var(--good); } .bad-text { color:var(--bad); }
+    form { display:grid; gap:14px; } label { display:grid; gap:6px; color:var(--muted); font-size:13px; } input,textarea,select { width:100%; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); padding:9px 10px; font:inherit; } textarea { min-height:86px; resize:vertical; }
+    .form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; } .full { grid-column:1/-1; }
+    .actions { display:flex; gap:9px; flex-wrap:wrap; } .notice { min-height:22px; color:var(--muted); } .notice.bad { color:var(--bad); } .notice.good { color:var(--good); }
+    table { width:100%; border-collapse:collapse; } th,td { padding:9px 7px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-weight:600; }
+    pre { max-height:260px; overflow:auto; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    @media (max-width:780px) { .shell { padding:20px 14px 36px; } header { align-items:flex-start; flex-direction:column; } .stats,.two,.form-grid { grid-template-columns:1fr 1fr; } }
+    @media (max-width:500px) { .stats,.two,.form-grid { grid-template-columns:1fr; } .full { grid-column:auto; } .row { flex-direction:column; gap:3px; } .value { text-align:left; } }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div><div class="eyebrow">AstrBot Plugin</div><h1>手机 Agent 控制台</h1><p class="muted">Operit 主控制 · Tailscale 连接 · Shizuku 执行</p></div>
+    <div class="toolbar"><span class="status"><i id="headerDot" class="dot"></i><span id="headerStatus">正在读取</span></span><button id="refreshBtn" type="button">刷新</button></div>
+  </header>
+  <nav class="tabs"><button class="tab active" data-view="overview" type="button">运行状态</button><button class="tab" data-view="settings" type="button">配置</button><button class="tab" data-view="policy" type="button">睡眠策略</button><button class="tab" data-view="logs" type="button">任务与审计</button></nav>
+
+  <section id="overview" class="view active">
+    <div class="grid stats">
+      <article class="panel stat"><span class="muted">Operit</span><strong id="operitState">--</strong><small id="operitVersion">--</small></article>
+      <article class="panel stat"><span class="muted">健康数据</span><strong id="healthState">--</strong><small id="healthDate">--</small></article>
+      <article class="panel stat"><span class="muted">睡眠模式</span><strong id="sleepState">--</strong><small id="sleepUntil">--</small></article>
+      <article class="panel stat"><span class="muted">后台任务</span><strong id="taskCount">0</strong><small id="reminderCount">提醒 0</small></article>
+    </div>
+    <div class="grid two" style="margin-top:14px">
+      <article class="panel"><div class="panel-head"><div><h2>连接状态</h2><p class="muted">只显示状态，不回显密钥</p></div><button id="testBtn" type="button">测试 Operit</button></div><div id="statusRows" class="rows"></div><p id="statusNotice" class="notice"></p></article>
+      <article class="panel"><div class="panel-head"><div><h2>今日健康摘要</h2><p class="muted">来自配置的只读 SQLite</p></div><button id="healthBtn" type="button">刷新健康</button></div><div id="healthRows" class="rows"></div></article>
+    </div>
+  </section>
+
+  <section id="settings" class="view"><article class="panel"><div class="panel-head"><div><h2>Operit 与访问控制</h2><p class="muted">Token 输入框留空表示保持原值</p></div><button id="saveBtn" class="primary" type="button">保存配置</button></div><form id="settingsForm"><div class="form-grid"><label>控制后端<select id="control_backend"><option value="operit">Operit</option><option value="adb">ADB（仅诊断）</option></select></label><label>Operit 地址<input id="operit_base_url" placeholder="http://PHONE_TAILSCALE_IP:8094"></label><label>Operit Token<input id="operit_token" type="password" placeholder="留空保持已配置 Token"></label><label>允许的 AstrBot 用户 ID<input id="allowed_user_ids" placeholder="多个 ID 用逗号分隔"></label><label class="full">App 别名 JSON<textarea id="app_aliases_json" spellcheck="false">{}</textarea></label></div><p id="saveNotice" class="notice"></p></form></article></section>
+
+  <section id="policy" class="view"><div class="grid two"><article class="panel"><div class="panel-head"><div><h2>睡眠守护</h2><p class="muted">时间段内由 Operit 检查并暂停视频 App</p></div><button id="policySaveBtn" class="primary" type="button">保存策略</button></div><form><div class="form-grid"><label>启用<select id="sleep_guard_enabled"><option value="true">开启</option><option value="false">关闭</option></select></label><label>轮询秒数<input id="sleep_guard_poll_seconds" type="number" min="10" max="300"></label><label>开始时间<input id="sleep_guard_start" type="time"></label><label>结束时间<input id="sleep_guard_end" type="time"></label><label class="full">目标 App（别名或包名）<input id="sleep_guard_packages"></label><label class="full">例外 App<input id="sleep_guard_exempt_apps"></label></div><p id="policyNotice" class="notice"></p></form></article><article class="panel"><div class="panel-head"><div><h2>临时模式</h2><p class="muted">立即启动，到期自动恢复</p></div></div><form><label>持续分钟数<input id="sleep_minutes" type="number" min="5" max="1440" value="120"></label><label>临时目标 App（可留空使用默认）<input id="sleep_packages" placeholder="例如：B站,快手"></label><div class="actions"><button id="sleepStartBtn" class="primary" type="button">启动临时模式</button><button id="sleepStopBtn" class="danger" type="button">解除限制</button></div><p id="modeNotice" class="notice"></p></form></article></div></section>
+
+  <section id="logs" class="view"><div class="grid two"><article class="panel"><div class="panel-head"><div><h2>Operit 任务</h2><p class="muted">当前实例内存中的任务</p></div><button id="tasksBtn" type="button">刷新</button></div><pre id="tasksPre">--</pre></article><article class="panel"><div class="panel-head"><div><h2>最近审计</h2><p class="muted">不含 Token 和消息正文</p></div><button id="auditBtn" type="button">刷新</button></div><div style="overflow:auto"><table><thead><tr><th>时间</th><th>操作</th><th>详情</th></tr></thead><tbody id="auditBody"></tbody></table></div></article></div></section>
+</div>
+<script>
+const fallback = { apiGet: async () => ({success:false,error:'插件页面桥接不可用'}), apiPost: async () => ({success:false,error:'插件页面桥接不可用'}) };
+const bridge = window.AstrBotPluginPage || fallback;
+const $ = (id) => document.getElementById(id);
+const text = (value) => value === null || value === undefined || value === '' ? '--' : String(value);
+function setNotice(id, message, good=false){ const el=$(id); el.textContent=message||''; el.className='notice '+(message?(good?'good':'bad'):''); }
+async function get(name, params){ return bridge.apiGet(name, params); }
+async function post(name, body){ return bridge.apiPost(name, body); }
+function fillConfig(c){ ['control_backend','operit_base_url','allowed_user_ids','app_aliases_json','sleep_guard_start','sleep_guard_end','sleep_guard_packages','sleep_guard_exempt_apps','sleep_guard_poll_seconds'].forEach(k=>{ if($(k)) $(k).value = c[k] ?? ''; }); if($('sleep_guard_enabled')) $('sleep_guard_enabled').value=String(Boolean(c.sleep_guard_enabled)); }
+function renderStatus(data){ const o=data.operit||{}, h=data.health||{}, s=data.sleep_mode||{}; $('operitState').textContent=o.available?'在线':'离线'; $('operitState').className=o.available?'good-text':'bad-text'; $('operitVersion').textContent=text(o.version); $('healthState').textContent=h.available?'可用':'未配置'; $('healthDate').textContent=text(h.latest?.date); $('sleepState').textContent=s.manual_active?'临时':'按计划'; $('sleepUntil').textContent=text(s.until); $('taskCount').textContent=text(data.tasks); $('reminderCount').textContent='提醒 '+text(data.reminders); $('headerStatus').textContent=o.available?'Operit 在线':'Operit 不可用'; $('headerDot').className='dot '+(o.available?'good':'bad'); const rows=[['后端',data.config?.control_backend],['Operit 地址',data.config?.operit_base_url],['Token',data.config?.operit_token_configured?'已配置':'未配置'],['健康库',h.available?'已连接':'未配置'],['私人陪伴授权',data.config?.use_private_companion_auth?'已开启':'关闭']]; $('statusRows').innerHTML=rows.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${text(r[1])}</span></div>`).join(''); const latest=h.latest||{}; const health=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]]; $('healthRows').innerHTML=health.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${text(r[1])}</span></div>`).join(''); fillConfig(data.config||{}); }
+async function refresh(){ try { const data=await get('status'); if(data.success===false) throw Error(data.error||'读取失败'); renderStatus(data); setNotice('statusNotice',''); } catch(e){ $('headerStatus').textContent='状态读取失败'; $('headerDot').className='dot bad'; setNotice('statusNotice',e.message); } }
+async function loadHealth(){ try { const data=await get('health',{days:'7'}); const h=data.health||{}; const latest=(h.days||[])[0]||{}; $('healthRows').innerHTML=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]].map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${text(r[1])}</span></div>`).join(''); } catch(e){ setNotice('statusNotice',e.message); } }
+async function saveConfig(){ try { let aliases=$('app_aliases_json').value.trim(); if(aliases) JSON.parse(aliases); const body={}; ['control_backend','operit_base_url','allowed_user_ids','app_aliases_json'].forEach(k=>body[k]=$(k).value); if($('operit_token').value.trim()) body.operit_token=$('operit_token').value.trim(); const r=await post('config',body); if(r.success===false) throw Error(r.error||'保存失败'); $('operit_token').value=''; setNotice('saveNotice','已保存',true); renderStatus({config:r.config||body,operit:{available:false},health:{}}); } catch(e){ setNotice('saveNotice',e.message); } }
+async function savePolicy(){ const body={sleep_guard_enabled:$('sleep_guard_enabled').value==='true',sleep_guard_poll_seconds:Number($('sleep_guard_poll_seconds').value),sleep_guard_start:$('sleep_guard_start').value,sleep_guard_end:$('sleep_guard_end').value,sleep_guard_packages:$('sleep_guard_packages').value,sleep_guard_exempt_apps:$('sleep_guard_exempt_apps').value}; try { const r=await post('config',body); if(r.success===false) throw Error(r.error||'保存失败'); setNotice('policyNotice','策略已保存',true); } catch(e){ setNotice('policyNotice',e.message); } }
+async function testOperit(){ $('testBtn').disabled=true; try { const r=await post('test_operit',{}); setNotice('statusNotice',r.success?'Operit 连接正常':'Operit 不可用：'+(r.operit?.error||'未知错误'),r.success); await refresh(); } finally { $('testBtn').disabled=false; } }
+async function sleepMode(mode){ const body={mode}; if(mode==='start'){ body.minutes=Number($('sleep_minutes').value); body.packages=$('sleep_packages').value; } try { const r=await post('sleep_mode',body); if(r.success===false) throw Error(r.error||'操作失败'); setNotice('modeNotice',mode==='start'?'临时模式已启动':'限制已解除',true); await refresh(); } catch(e){ setNotice('modeNotice',e.message); } }
+async function loadTasks(){ const r=await get('tasks'); $('tasksPre').textContent=JSON.stringify(r.tasks||{},null,2); }
+async function loadAudit(){ const r=await get('audit',{limit:'50'}); $('auditBody').innerHTML=(r.records||[]).slice().reverse().map(x=>`<tr><td>${text(x.time)}</td><td>${text(x.operation)}</td><td>${Object.entries(x).filter(([k])=>!['time','operation'].includes(k)).map(([k,v])=>`${k}=${typeof v==='object'?JSON.stringify(v):v}`).join(' ')}</td></tr>`).join(''); }
+document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));btn.classList.add('active');$(btn.dataset.view).classList.add('active');}));
+$('refreshBtn').onclick=refresh; $('testBtn').onclick=testOperit; $('healthBtn').onclick=loadHealth; $('saveBtn').onclick=saveConfig; $('policySaveBtn').onclick=savePolicy; $('sleepStartBtn').onclick=()=>sleepMode('start'); $('sleepStopBtn').onclick=()=>sleepMode('stop'); $('tasksBtn').onclick=loadTasks; $('auditBtn').onclick=loadAudit;
+refresh(); loadTasks(); loadAudit();
+</script>
+</body>
+</html>
