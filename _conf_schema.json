@@ -51,12 +51,12 @@
   },
   "audit_log_path": {
     "type": "text",
-    "default": "/home/tauru/data/phone_agent_audit.jsonl",
+    "default": "phone_agent_audit.jsonl",
     "description": "Local metadata-only action audit log"
   },
   "reminders_path": {
     "type": "text",
-    "default": "/home/tauru/data/phone_agent_reminders.json",
+    "default": "phone_agent_reminders.json",
     "description": "Persistent phone-agent reminder file"
   },
   "adb_full_port_scan": {

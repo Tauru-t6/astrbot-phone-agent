@@ -93,7 +93,7 @@ class PhoneAgentPlugin(Star):
         return _text(self.config.get("health_db_path"), 500)
 
     def _audit_path(self) -> str:
-        return _text(self.config.get("audit_log_path"), 500) or "/home/tauru/data/phone_agent_audit.jsonl"
+        return _text(self.config.get("audit_log_path"), 500) or "phone_agent_audit.jsonl"
 
     def _audit(self, operation: str, **fields: Any) -> None:
         record = {"time": datetime.now().isoformat(timespec="seconds"), "operation": operation, **fields}
@@ -106,7 +106,7 @@ class PhoneAgentPlugin(Star):
             logger.debug("phone agent audit write failed: %s", exc)
 
     def _reminder_path(self) -> str:
-        return _text(self.config.get("reminders_path"), 500) or "/home/tauru/data/phone_agent_reminders.json"
+        return _text(self.config.get("reminders_path"), 500) or "phone_agent_reminders.json"
 
     def _save_reminders(self) -> None:
         try:
