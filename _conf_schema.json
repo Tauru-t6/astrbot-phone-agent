@@ -1,0 +1,107 @@
+{
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "Enable phone tools"
+  },
+  "adb_path": {
+    "type": "text",
+    "default": "adb",
+    "description": "ADB executable path"
+  },
+  "adb_serial": {
+    "type": "text",
+    "default": "",
+    "description": "Phone ADB serial"
+  },
+  "health_db_path": {
+    "type": "text",
+    "default": "",
+    "description": "Read-only Xiaomi health SQLite database path"
+  },
+  "operit_base_url": {
+    "type": "text",
+    "default": "http://127.0.0.1:8094",
+    "description": "Phone Operit external HTTP base URL"
+  },
+  "operit_token": {
+    "type": "text",
+    "default": "",
+    "description": "Bearer token for Operit external HTTP service"
+  },
+  "operit_timeout_seconds": {
+    "type": "int",
+    "default": 120,
+    "description": "Operit task timeout"
+  },
+  "control_backend": {
+    "type": "text",
+    "default": "operit",
+    "description": "Phone control backend: operit or adb"
+  },
+  "app_aliases_json": {
+    "type": "text",
+    "default": "{}",
+    "description": "Optional JSON map of friendly app names to Android package names"
+  },
+  "sleep_guard_exempt_apps": {
+    "type": "text",
+    "default": "",
+    "description": "Apps excluded from scheduled sleep guard"
+  },
+  "audit_log_path": {
+    "type": "text",
+    "default": "/home/tauru/data/phone_agent_audit.jsonl",
+    "description": "Local metadata-only action audit log"
+  },
+  "reminders_path": {
+    "type": "text",
+    "default": "/home/tauru/data/phone_agent_reminders.json",
+    "description": "Persistent phone-agent reminder file"
+  },
+  "adb_full_port_scan": {
+    "type": "bool",
+    "default": true,
+    "description": "Scan all TCP ports when recovering optional ADB diagnostics"
+  },
+  "allowed_user_ids": {
+    "type": "text",
+    "default": "",
+    "description": "Comma-separated AstrBot user IDs allowed to invoke phone actions"
+  },
+  "use_private_companion_auth": {
+    "type": "bool",
+    "default": false,
+    "description": "Optional: use Private Companion authorization when allowlist is empty"
+  },
+  "command_timeout_seconds": {
+    "type": "int",
+    "default": 20,
+    "description": "ADB command timeout"
+  },
+  "sleep_guard_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "Suspend configured video apps during quiet hours"
+  },
+  "sleep_guard_start": {
+    "type": "text",
+    "default": "00:30",
+    "description": "Quiet-hours start in local time (HH:MM)"
+  },
+  "sleep_guard_end": {
+    "type": "text",
+    "default": "07:00",
+    "description": "Quiet-hours end in local time (HH:MM)"
+  },
+  "sleep_guard_packages": {
+    "type": "text",
+    "default": "tv.danmaku.bilibilihd,com.kuaishou.nebula,com.hihonor.youku.video",
+    "description": "Comma-separated video app package names"
+  },
+  "sleep_guard_poll_seconds": {
+    "type": "int",
+    "default": 30,
+    "description": "Foreground check interval for sleep guard"
+  }
+}
