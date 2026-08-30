@@ -149,11 +149,17 @@ class PhoneAgentPlugin(Star):
         return jsonify({"success": True, "config": self._web_config_view()})
 
     async def _web_test_operit(self):
-        result = await asyncio.to_thread(self._operit_health_sync)
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(self._operit_health_sync), timeout=10)
+        except asyncio.TimeoutError:
+            result = {"available": False, "error": "Operit health check timed out"}
         return jsonify({"success": bool(result.get("available")), "operit": result})
 
     async def _web_status(self):
-        operit = await asyncio.to_thread(self._operit_health_sync)
+        try:
+            operit = await asyncio.wait_for(asyncio.to_thread(self._operit_health_sync), timeout=3)
+        except asyncio.TimeoutError:
+            operit = {"available": False, "error": "Operit health check timed out"}
         health = await asyncio.to_thread(self._read_health_db_sync, 1) if self._health_db() else {"available": False, "error": "health_db_path is not configured"}
         return jsonify({
             "success": True,
