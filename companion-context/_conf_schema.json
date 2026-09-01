@@ -1,0 +1,127 @@
+{
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "Add a private phone and health snapshot before proactive messages"
+  },
+  "timeout_seconds": {
+    "type": "int",
+    "default": 20,
+    "description": "Maximum wait for the phone observation"
+  },
+  "include_screen": {
+    "type": "bool",
+    "default": true,
+    "description": "Include foreground app and activity impression"
+  },
+  "include_health": {
+    "type": "bool",
+    "default": true,
+    "description": "Include today's health summary"
+  },
+  "relationship_mode_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "Explicitly enable relationship-mode prompt enrichment"
+  },
+  "autonomous_decision_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "Let the companion decide whether a proactive message is worth sending"
+  },
+  "autonomous_decision_mode": {
+    "type": "text",
+    "default": "preview",
+    "description": "Autonomy mode: preview or low_risk_auto; phone control always requires confirmation"
+  },
+  "decision_cooldown_minutes": {
+    "type": "int",
+    "default": 180,
+    "description": "Minimum interval between autonomous relationship messages per user"
+  },
+  "decision_daily_limit": {
+    "type": "int",
+    "default": 3,
+    "description": "Maximum autonomous relationship messages per user per day"
+  },
+  "quiet_hours": {
+    "type": "text",
+    "default": "00:30-08:00",
+    "description": "Do not initiate autonomous messages during this local-time window"
+  },
+  "autonomy_initiative": {
+    "type": "int",
+    "default": 45,
+    "description": "How readily the companion initiates contact, from 0 to 100"
+  },
+  "autonomy_intimacy": {
+    "type": "int",
+    "default": 55,
+    "description": "Relationship warmth for autonomous decisions, from 0 to 100"
+  },
+  "private_only": {
+    "type": "bool",
+    "default": true,
+    "description": "Only enrich private-message proactive generation"
+  },
+  "allowed_user_ids": {
+    "type": "text",
+    "default": "",
+    "description": "Explicit primary-user allowlist; empty means no user is observed"
+  },
+  "romance_intensity": {
+    "type": "text",
+    "default": "firm",
+    "description": "Tone level: soft, warm, firm, bold, or devoted"
+  },
+  "pet_name": {
+    "type": "text",
+    "default": "",
+    "description": "Optional occasional affectionate name; leave empty for natural no-name phrasing"
+  },
+  "enable_playful_jealousy": {
+    "type": "bool",
+    "default": true,
+    "description": "Allow playful jealousy based on coarse phone activity"
+  },
+  "enable_health_care": {
+    "type": "bool",
+    "default": true,
+    "description": "Use sleep and activity summaries as caring context"
+  },
+  "enable_daily_rituals": {
+    "type": "bool",
+    "default": true,
+    "description": "Add morning, evening, and late-night relationship rituals"
+  },
+  "force_affectionate_coda": {
+    "type": "bool",
+    "default": false,
+    "description": "Append an occasional stronger relationship-style closing to proactive messages"
+  },
+  "affection_coda_cooldown_minutes": {
+    "type": "int",
+    "default": 120,
+    "description": "Minimum interval between forced affectionate closings"
+  },
+  "allow_fictional_touch": {
+    "type": "bool",
+    "default": true,
+    "description": "Allow fictional affectionate gestures in relationship-style text"
+  },
+  "custom_romance_prompt": {
+    "type": "text",
+    "default": "",
+    "description": "Optional extra relationship-style instruction"
+  },
+  "screen_cache_seconds": {
+    "type": "int",
+    "default": 90,
+    "description": "Reuse a coarse phone observation for this many seconds"
+  },
+  "health_cache_seconds": {
+    "type": "int",
+    "default": 900,
+    "description": "Reuse a health snapshot for this many seconds"
+  }
+}
