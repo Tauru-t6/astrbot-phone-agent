@@ -6,3 +6,5 @@ __pycache__/
 *.log
 *.jsonl
 *.zip
+phone_agent_reminders.json
+phone_agent_policies.json

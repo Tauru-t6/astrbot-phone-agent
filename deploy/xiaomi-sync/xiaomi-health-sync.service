@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync Xiaomi Fitness health data
+
+[Service]
+Type=oneshot
+ExecStart=/home/tauru/data/xiaomi_health_sync/sync-health.sh
+Environment=HEALTH_SYNC_DAYS=7
+UMask=0077
+NoNewPrivileges=true

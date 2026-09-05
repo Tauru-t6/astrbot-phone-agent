@@ -17,7 +17,7 @@
   "health_db_path": {
     "type": "text",
     "default": "",
-    "description": "Read-only Xiaomi health SQLite database path"
+    "description": "Read-only SQLite path produced by xiaomi-sync (usually .../data/health.db)"
   },
   "operit_base_url": {
     "type": "text",
@@ -47,7 +47,7 @@
   "sleep_guard_exempt_apps": {
     "type": "text",
     "default": "",
-    "description": "Apps excluded from scheduled sleep guard"
+    "description": "Apps excluded from on-demand temporary policies"
   },
   "audit_log_path": {
     "type": "text",
@@ -58,6 +58,11 @@
     "type": "text",
     "default": "phone_agent_reminders.json",
     "description": "Persistent phone-agent reminder file"
+  },
+  "policy_state_path": {
+    "type": "text",
+    "default": "phone_agent_policies.json",
+    "description": "Persistent app-policy state used to restore temporary restrictions after restart"
   },
   "adb_full_port_scan": {
     "type": "bool",
@@ -79,29 +84,9 @@
     "default": 20,
     "description": "ADB command timeout"
   },
-  "sleep_guard_enabled": {
-    "type": "bool",
-    "default": false,
-    "description": "Suspend configured video apps during quiet hours"
-  },
-  "sleep_guard_start": {
-    "type": "text",
-    "default": "00:30",
-    "description": "Quiet-hours start in local time (HH:MM)"
-  },
-  "sleep_guard_end": {
-    "type": "text",
-    "default": "07:00",
-    "description": "Quiet-hours end in local time (HH:MM)"
-  },
   "sleep_guard_packages": {
     "type": "text",
     "default": "tv.danmaku.bilibilihd,com.kuaishou.nebula,com.hihonor.youku.video",
-    "description": "Comma-separated video app package names"
-  },
-  "sleep_guard_poll_seconds": {
-    "type": "int",
-    "default": 30,
-    "description": "Foreground check interval for sleep guard"
+    "description": "Default comma-separated app aliases or package names for on-demand temporary policies"
   }
 }

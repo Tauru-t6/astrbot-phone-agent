@@ -10,7 +10,7 @@ The default control backend is Operit. The server does not need a persistent ADB
 Chat platform -> AstrBot -> Tailscale -> Operit HTTP -> Operit Agent + Shizuku
 ```
 
-Health data is a separate path: `xiaomi-health-sync` synchronizes Xiaomi Fitness data into a server-side SQLite database, and `phone_health` reads that database.
+Health data is a separate path: the server-side `xiaomi-sync` deployment (the `xiaomi-health-sync` repository) synchronizes Xiaomi Fitness data into SQLite, and `phone_health` reads that database. Android Health Bridge is not part of this path.
 
 ## 2. Prerequisites
 
@@ -21,7 +21,7 @@ Health data is a separate path: `xiaomi-health-sync` synchronizes Xiaomi Fitness
 - Shizuku access granted to the Operit tools or workflows you intend to use.
 - At least one working chat model configured in Operit. Verify that it can answer and call tools from a normal Operit chat before enabling remote control.
 - AstrBot 4.22 or newer.
-- A Xiaomi Fitness account and `xiaomi-health-sync` if health queries are needed.
+- A Xiaomi Fitness account and the server-side `xiaomi-sync` deployment if health queries are needed.
 
 The phone can use Wi-Fi or mobile data. Operit HTTP works through Tailscale and does not require wireless ADB. Shizuku may need to be started again after a phone reboot.
 
@@ -210,6 +210,8 @@ Expected log entries include:
 Loading plugin astrbot_plugin_phone_agent
 Added llm tool: operit_task
 Added llm tool: phone_observe
+Added llm tool: phone_location
+Added llm tool: phone_app_policy
 Plugin astrbot_plugin_phone_agent (...)
 ```
 
@@ -228,8 +230,9 @@ The page provides:
 - Operit online status and a connection test.
 - Operit URL, Token, backend, and user allowlist settings.
 - App alias JSON editing.
-- Sleep guard hours, target apps, and exceptions.
-- Start/stop controls for temporary sleep mode.
+- On-demand app policies and default target-app settings; no background polling.
+- Start/stop controls for temporary restrictions with automatic restore.
+- One-shot location lookup.
 - Health summary, background tasks, reminders, and recent audit records.
 
 The page uses AstrBot Dashboard authentication. The Operit Token is shown only as configured/not configured and is never echoed.
@@ -256,6 +259,7 @@ At minimum configure:
 - `operit_base_url`: the phone Tailscale address plus `:8094`.
 - `operit_token`: the Bearer Token shown by Operit.
 - `allowed_user_ids`: AstrBot account IDs allowed to control the phone, separated by commas.
+- `phone_location` reads one location fix on demand; high-accuracy fixes and address lookup require explicit confirmation.
 
 This ID is the sender ID supplied by the chat platform. For QQ OneBot it is normally the QQ number; other platforms may use an openid. Check `user_id` or sender ID in AstrBot receive logs.
 
@@ -310,7 +314,7 @@ Fix the first failing layer before debugging later layers. Reinstalling the Astr
 
 ### App aliases
 
-Built-in aliases include Bilibili, Kuaishou, Youku, and WeChat. Add your own mappings with `app_aliases_json`:
+Built-in aliases include Bilibili, Kuaishou, Youku, Douyin, Douyin Lite, and WeChat. Add your own mappings with `app_aliases_json`:
 
 ```json
 {
@@ -319,25 +323,25 @@ Built-in aliases include Bilibili, Kuaishou, Youku, and WeChat. Add your own map
 }
 ```
 
-### Sleep guard
+### On-demand app policies
 
 ```json
 {
-  "sleep_guard_enabled": true,
-  "sleep_guard_start": "00:30",
-  "sleep_guard_end": "07:00",
   "sleep_guard_packages": "Bilibili,Kuaishou,Youku",
-  "sleep_guard_exempt_apps": "WeChat",
-  "sleep_guard_poll_seconds": 30
+  "sleep_guard_exempt_apps": "WeChat"
 }
 ```
 
-During quiet hours, Operit checks the foreground app and uses Shizuku to suspend configured video apps. They are restored when the window ends. You can also say:
+These fields are only the default target and exception lists for `phone_sleep_mode`. The plugin does not inspect the foreground app on a schedule or poll in the background. It acts only when AstrBot's LLM calls `phone_app_policy` or `phone_sleep_mode`. Examples:
 
 ```text
 Do not let me watch videos for two hours
 Unlock the video restriction
+Disable Douyin Lite for 30 minutes
+Restore Douyin Lite
 ```
+
+`phone_location` is also on demand. Call it only when the user explicitly asks for location or the current task requires it; high-accuracy fixes and address lookup require an extra confirmation.
 
 ### Tasks, reminders, and audit
 
@@ -357,14 +361,14 @@ Messages, comments, likes, shares, deletes, uninstallations, and payments requir
 
 ## 9. Health data (optional)
 
-The phone plugin does not read Xiaomi credentials directly. Deploy `xiaomi-health-sync` separately:
+The phone plugin does not read Xiaomi credentials directly. Deploy the server-side `xiaomi-sync` (`xiaomi-health-sync`) separately:
 
 1. Install the project and its dependencies on the server.
 2. Use its QR login flow for the Xiaomi account.
-3. Set the plugin's `health_db_path` to the synchronized database.
+3. Install the timer templates in [`deploy/xiaomi-sync`](deploy/xiaomi-sync), then set `health_db_path` to `/home/tauru/data/xiaomi_health_sync/data/health.db` (a directory containing `health.db` is also accepted).
 4. Run synchronization periodically with a systemd timer or another scheduler.
 
-The plugin only reads SQLite. Xiaomi tokens are never uploaded to GitHub or chat. Example queries:
+The plugin only reads the `xiaomi-sync` SQLite database. Xiaomi tokens are never uploaded to GitHub or chat. Health responses include the latest sync time, success state, and staleness; a failed sync is reported as unavailable instead of success. Example queries:
 
 ```text
 How many steps did I take today?
@@ -378,6 +382,8 @@ Are my recent heart rate and SpO2 normal?
 - `operit_task_status`, `operit_task_cancel`, `operit_task_retry`: manage background tasks.
 - `phone_action`: execute allowlisted phone actions.
 - `phone_observe`: inspect phone state.
+- `phone_location`: read one phone location fix on demand.
+- `phone_app_policy`: let the LLM disable or restore a selected app, optionally with automatic restore.
 - `phone_sleep_mode`: start a temporary video restriction.
 - `phone_usage`: query app usage time.
 - `phone_reminder`: create, list, and cancel reminders.
@@ -424,6 +430,7 @@ Observe the phone only; do not click or type
 - Never commit Operit Tokens, Xiaomi Tokens, SSH passwords, or server configuration.
 - Restrict access with `allowed_user_ids`.
 - This plugin does not accept arbitrary shell commands.
+- Location is never collected in the background; it is read only for an explicit request or a task that needs it.
 - Android may show “Managed by Shell” for `pm suspend`; this is an OS-owned label and cannot be changed by the plugin.
 
 ## Used projects

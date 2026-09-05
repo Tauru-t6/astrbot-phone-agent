@@ -10,7 +10,7 @@
 聊天平台 -> AstrBot -> Tailscale -> 手机 Operit HTTP -> Operit Agent + Shizuku
 ```
 
-健康数据是独立链路：小米运动健康数据由 `xiaomi-health-sync` 同步到服务器 SQLite，然后由 `phone_health` 查询。
+健康数据是独立链路：服务器上的 `xiaomi-sync`（仓库 `xiaomi-health-sync`）定时同步小米运动健康数据到 SQLite，然后由 `phone_health` 查询。Android Health Bridge 不参与这条链路。
 
 ## 二、前置条件
 
@@ -20,7 +20,7 @@
 - 在 Operit 中授予需要的 Shizuku 权限。
 - 在 Operit 中配置至少一个可用的聊天模型，并在 Operit 对话页确认模型能正常回复和调用工具。
 - AstrBot 4.22 或更高版本。
-- 如果需要健康数据，再准备小米运动健康账号和 `xiaomi-health-sync`。
+- 如果需要健康数据，再准备小米运动健康账号和服务器端 `xiaomi-sync`。
 
 手机可以使用 Wi-Fi 或移动数据。Operit HTTP 通过 Tailscale 工作，不依赖 ADB 无线调试。Shizuku 在手机重启后可能需要重新启动一次。
 
@@ -209,6 +209,8 @@ journalctl --user -u astrbot.service -n 100 --no-pager
 Loading plugin astrbot_plugin_phone_agent
 Added llm tool: operit_task
 Added llm tool: phone_observe
+Added llm tool: phone_location
+Added llm tool: phone_app_policy
 Plugin astrbot_plugin_phone_agent (...)
 ```
 
@@ -227,8 +229,9 @@ Plugin astrbot_plugin_phone_agent (...)
 - Operit 在线状态和一键连接测试。
 - Operit 地址、Token、控制后端和用户白名单配置。
 - App 别名 JSON 编辑。
-- 睡眠守护时间、目标 App 和例外 App 配置。
-- 临时睡眠模式启动/解除。
+- 按需 App 策略与默认目标 App 配置，不会后台轮询。
+- 临时限制启动/解除，到期自动恢复。
+- 一次性定位读取入口。
 - 健康摘要、后台任务、提醒和最近审计记录。
 
 页面使用 AstrBot Dashboard 自带的登录鉴权。Token 只会显示“已配置”，不会回显。
@@ -255,6 +258,7 @@ Plugin astrbot_plugin_phone_agent (...)
 - `operit_base_url`：手机 Tailscale 地址加 `:8094`。
 - `operit_token`：Operit 外部 HTTP 页面里的 Bearer Token。
 - `allowed_user_ids`：允许控制手机的 AstrBot 用户 ID，多个 ID 用逗号分隔。
+- `phone_location` 只按需读取一次位置；高精度定位和地址反查需要显式确认。
 
 用户 ID 是聊天平台传给 AstrBot 的发送者 ID。QQ OneBot 通常是 QQ 号；其他平台可能是 openid。可以从 AstrBot 收到消息时的日志中确认，例如日志中的 `user_id` 或发送者 ID。
 
@@ -311,7 +315,7 @@ Plugin astrbot_plugin_phone_agent (...)
 
 ### App 别名
 
-默认支持“B 站”“哔哩哔哩”“快手”“优酷”“微信”等名称。通过 `app_aliases_json` 添加别名：
+默认支持“B 站”“哔哩哔哩”“快手”“优酷”“抖音”“抖音极速版”“微信”等名称。通过 `app_aliases_json` 添加别名：
 
 ```json
 {
@@ -320,25 +324,25 @@ Plugin astrbot_plugin_phone_agent (...)
 }
 ```
 
-### 睡眠守护
+### 按需 App 策略
 
 ```json
 {
-  "sleep_guard_enabled": true,
-  "sleep_guard_start": "00:30",
-  "sleep_guard_end": "07:00",
   "sleep_guard_packages": "哔哩哔哩,快手,优酷",
-  "sleep_guard_exempt_apps": "微信",
-  "sleep_guard_poll_seconds": 30
+  "sleep_guard_exempt_apps": "微信"
 }
 ```
 
-安静时段内，Operit 检查前台 App，并通过 Shizuku 暂停目标视频 App；时段结束后恢复。也可以直接说：
+这两个字段只作为 `phone_sleep_mode` 的默认目标和例外列表。插件不会按时间段检查前台 App，也不会后台轮询；只有 AstrBot LLM 实际调用 `phone_app_policy` 或 `phone_sleep_mode` 时才执行禁用/恢复。可以直接说：
 
 ```text
 别让我刷视频两小时
 解除视频限制
+禁用抖音极速版 30 分钟
+恢复抖音极速版
 ```
+
+`phone_location` 也是按需工具，只在用户明确询问位置或当前任务确实需要时调用；高精度定位和地址反查需要额外确认。
 
 ### 任务、提醒和审计
 
@@ -362,10 +366,10 @@ Plugin astrbot_plugin_phone_agent (...)
 
 1. 在服务器安装项目及依赖。
 2. 用项目提供的二维码登录小米账号。
-3. 将数据库目录配置到 `health_db_path`。
+3. 使用仓库内 [`deploy/xiaomi-sync`](deploy/xiaomi-sync) 的定时任务，并将 `/home/tauru/data/xiaomi_health_sync/data/health.db` 配置到 `health_db_path`（也可以填包含该文件的目录）。
 4. 用 systemd timer 或其他计划任务定期同步。
 
-插件只读查询 SQLite，不会把小米 Token 上传到 GitHub 或聊天平台。成功后可以问：
+插件只读查询 `xiaomi-sync` 的 SQLite，不会把小米 Token 上传到 GitHub 或聊天平台。健康查询会同时返回最近一次同步时间、成功状态和是否过期；同步失败时不会伪装成成功。成功后可以问：
 
 ```text
 我今天走了多少步？
@@ -379,6 +383,8 @@ Plugin astrbot_plugin_phone_agent (...)
 - `operit_task_status`、`operit_task_cancel`、`operit_task_retry`：管理后台任务。
 - `phone_action`：执行白名单手机动作。
 - `phone_observe`：观察手机状态。
+- `phone_location`：按需读取一次手机位置。
+- `phone_app_policy`：由 LLM 选择 App 并禁用或恢复，可选自动恢复时间。
 - `phone_sleep_mode`：临时限制视频 App。
 - `phone_usage`：查询应用使用时长。
 - `phone_reminder`：创建、查看和取消提醒。
@@ -425,6 +431,7 @@ Operit Token 已失效或被重置。重新打开 Operit 外部 HTTP 页面，�
 - 不要提交 Operit Token、小米 Token、SSH 密码或服务器配置。
 - 使用 `allowed_user_ids` 限制手机控制权限。
 - 本插件不接受任意 shell 命令。
+- 定位不是后台功能，只在用户明确请求或当前任务需要时读取。
 - Android 可能显示“由 Shell 管理”，这是系统对 `pm suspend` 来源的标记，插件不能修改。
 
 ## 使用过的项目

@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.1] - 2026-09-05
+
+### Changed
+
+- Health monitoring now documents and reports the server-side `xiaomi-sync` source, latest sync result, and stale data state.
+- The health query returns an unsuccessful result when the configured database is missing or unavailable.
+
+## [0.4.0] - 2026-09-05
+
+### Added
+
+- Added on-demand `phone_location` and `phone_app_policy` LLM tools.
+- Added WebUI controls for one-shot location lookup and app policy execution.
+- Added verified ADB policy state checks and rollback when a temporary policy partially fails.
+
+### Changed
+
+- Removed quiet-hours foreground polling. App restrictions now run only when an LLM or WebUI action requests them, with optional one-shot automatic restore.
+- Protected the phone control app, Operit, Settings, and System UI from app policy changes.
+- Health queries now identify the server-side `xiaomi-sync` source, expose the latest sync result, and report stale or unavailable data accurately.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added
