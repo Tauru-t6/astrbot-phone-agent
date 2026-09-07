@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2] - 2026-09-07
+
+### Changed
+
+- Market description rewritten in Chinese.
+
+## [0.5.1] - 2026-09-07
 ## [0.5.1] - 2026-09-07
 
 ### Changed
