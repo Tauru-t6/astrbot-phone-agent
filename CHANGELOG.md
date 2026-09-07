@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0] - 2026-09-07
+
+### Changed
+
+- Core vs optional split: a fresh install only exposes the Operit task tools (`operit_task*`, `phone_action`, `phone_observe`) and core WebUI routes. Health, usage, location, reminders, app-policy, and audit are now opt-in via `enable_health_tools`, `enable_usage_tool`, `enable_location_tool`, `enable_reminder_tools`, `enable_policy_tools`, and `enable_audit_tool`.
+- `display_name` renamed to Phone Control (plugin id `astrbot_plugin_phone_agent` is unchanged).
+- Removed the personal default `sleep_guard_packages` list; the field now defaults to empty.
+- Removed the private `com.tauru.healthbridge` entry from the protected package list.
+
+## [0.4.2] - 2026-09-07
 ## [0.4.2] - 2026-09-07
 
 ### Fixed

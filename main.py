@@ -49,7 +49,6 @@ PROTECTED_POLICY_PACKAGES = frozenset({
     "com.android.settings",
     "com.android.systemui",
     "com.ai.assistance.operit",
-    "com.tauru.healthbridge",
 })
 
 
@@ -93,6 +92,24 @@ def _tolerate_nested_args(handler):
     return wrapper
 
 
+def _feature_gate(tool_name: str):
+    """Deny optional tools with a clear message when their feature is off."""
+
+    def decorator(handler):
+        @functools.wraps(handler)
+        async def wrapper(self, event, *args, **kwargs):
+            if not self._tool_enabled(tool_name):
+                return json.dumps({
+                    "success": False,
+                    "error": f"{tool_name} is disabled; enable its feature flag in the plugin config",
+                }, ensure_ascii=False)
+            return await handler(self, event, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 class PhoneAgentPlugin(Star):
     def __init__(self, context: Any, config: AstrBotConfig):
         super().__init__(context)
@@ -119,6 +136,26 @@ class PhoneAgentPlugin(Star):
             return value.strip().lower() not in {"0", "false", "off", "no", "disabled"}
         return bool(value)
 
+    # Feature flags: core Operit phone control is always on; the rest is
+    # opt-in per deployment so a fresh install only exposes what it uses.
+    def _feature(self, key: str) -> bool:
+        return self._bool_config("enable_" + key, False)
+
+    def _tool_enabled(self, name: str) -> bool:
+        groups = {
+            "phone_health": ("health_tools",),
+            "phone_usage": ("usage_tool",),
+            "phone_location": ("location_tool",),
+            "phone_reminder": ("reminder_tools",),
+            "phone_audit": ("audit_tool",),
+            "phone_app_policy": ("policy_tools",),
+            "phone_sleep_mode": ("policy_tools",),
+        }
+        keys = groups.get(name)
+        if not keys:
+            return True
+        return all(self._feature(k) for k in keys)
+
     def _register_web_api(self) -> None:
         register = getattr(self.context, "register_web_api", None)
         if not callable(register):
@@ -129,16 +166,19 @@ class PhoneAgentPlugin(Star):
             ("/config", self._web_get_config, ["GET"], "Phone Agent configuration"),
             ("/config", self._web_save_config, ["POST"], "Save Phone Agent configuration"),
             ("/test_operit", self._web_test_operit, ["POST"], "Test Operit connection"),
-            ("/app_policy", self._web_app_policy, ["POST"], "Apply an on-demand app policy"),
-            ("/sleep_mode", self._web_sleep_mode, ["POST"], "Control temporary sleep mode"),
-            ("/location", self._web_location, ["GET"], "Read phone location on demand"),
-            ("/health", self._web_health, ["GET"], "Read phone health summary"),
-            ("/tasks", self._web_tasks, ["GET"], "List Operit tasks"),
-            ("/reminders", self._web_reminders, ["GET"], "List phone reminders"),
-            ("/audit", self._web_audit, ["GET"], "List phone action audit"),
+            ("/app_policy", self._web_app_policy, ["POST"], "Apply an on-demand app policy", "policy_tools"),
+            ("/sleep_mode", self._web_sleep_mode, ["POST"], "Control temporary sleep mode", "policy_tools"),
+            ("/location", self._web_location, ["GET"], "Read phone location on demand", "location_tool"),
+            ("/health", self._web_health, ["GET"], "Read phone health summary", "health_tools"),
+            ("/tasks", self._web_tasks, ["GET"], "List Operit tasks", None),
+            ("/reminders", self._web_reminders, ["GET"], "List phone reminders", "reminder_tools"),
+            ("/audit", self._web_audit, ["GET"], "List phone action audit", "audit_tool"),
         )
-        for route, handler, methods, description in routes:
-            register(prefix + route, handler, methods, description)
+        for route in routes:
+            gate = route[4] if len(route) > 4 else None
+            if gate and not self._feature(gate):
+                continue
+            register(prefix + route[0], route[1], route[2], route[3])
 
     def _web_config_view(self) -> dict[str, Any]:
         keys = (
@@ -1203,6 +1243,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_health")
     @_tolerate_nested_args
+    @_feature_gate("phone_health")
     async def phone_health(self, event: AstrMessageEvent, days: int = 1, **_kwargs: Any) -> str:
         """Read authorized Xiaomi health data. Use for steps, sleep, heart rate, SpO2, calories, stress, or activity questions.
 
@@ -1235,6 +1276,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_usage")
     @_tolerate_nested_args
+    @_feature_gate("phone_usage")
     async def phone_usage(self, event: AstrMessageEvent, days: int = 1, **_kwargs: Any) -> str:
         """Read Android app usage time through Operit without changing the phone.
 
@@ -1257,6 +1299,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_reminder")
     @_tolerate_nested_args
+    @_feature_gate("phone_reminder")
     async def phone_reminder(
         self,
         event: AstrMessageEvent,
@@ -1310,6 +1353,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_audit")
     @_tolerate_nested_args
+    @_feature_gate("phone_audit")
     async def phone_audit(self, event: AstrMessageEvent, limit: int = 20, **_kwargs: Any) -> str:
         """Read recent phone-agent action metadata without secrets or message contents.
         Args:
@@ -1493,6 +1537,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_location")
     @_tolerate_nested_args
+    @_feature_gate("phone_location")
     async def phone_location(
         self,
         event: AstrMessageEvent,
@@ -1556,6 +1601,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_app_policy")
     @_tolerate_nested_args
+    @_feature_gate("phone_app_policy")
     async def phone_app_policy(
         self,
         event: AstrMessageEvent,
@@ -1654,6 +1700,8 @@ class PhoneAgentPlugin(Star):
         action = _text(action, 40).lower()
         if action not in ALLOWED_ACTIONS:
             return json.dumps({"success": False, "error": "unsupported action"}, ensure_ascii=False)
+        if action in {"suspend_app", "unsuspend_app", "suspend_video_apps", "unsuspend_video_apps"} and not self._tool_enabled("phone_app_policy"):
+            return json.dumps({"success": False, "error": "app policy actions are disabled; enable policy_tools in the plugin config"}, ensure_ascii=False)
         if action == "trigger_workflow" and not confirmed:
             return json.dumps({"success": False, "needs_confirmation": True, "error": "Ask the user for confirmation before triggering an external workflow."}, ensure_ascii=False)
 
@@ -1869,6 +1917,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_sleep_mode")
     @_tolerate_nested_args
+    @_feature_gate("phone_sleep_mode")
     async def phone_sleep_mode(
         self,
         event: AstrMessageEvent,

@@ -86,8 +86,8 @@
   },
   "sleep_guard_packages": {
     "type": "text",
-    "default": "tv.danmaku.bilibilihd,com.kuaishou.nebula,com.hihonor.youku.video",
-    "description": "Default comma-separated app aliases or package names for on-demand temporary policies"
+    "default": "",
+    "description": "Comma-separated app aliases or package names for on-demand temporary policies (empty disables the default list)"
   },
   "relay_base_url": {
     "type": "text",
@@ -98,5 +98,35 @@
     "type": "text",
     "default": "",
     "description": "Shared bearer token for the relay queue"
+  },
+  "enable_health_tools": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_health tool and /health route (requires xiaomi-sync health.db)"
+  },
+  "enable_usage_tool": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_usage tool (reads Android app usage through Operit)"
+  },
+  "enable_location_tool": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_location tool and /location route (sensitive)"
+  },
+  "enable_reminder_tools": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_reminder tool and /reminders route"
+  },
+  "enable_policy_tools": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_app_policy, phone_sleep_mode, /app_policy and /sleep_mode, plus suspend actions in phone_action"
+  },
+  "enable_audit_tool": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_audit tool and /audit route"
   }
 }
