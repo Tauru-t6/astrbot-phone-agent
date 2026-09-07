@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.2] - 2026-09-07
+
+### Fixed
+
+- `phone_location` now converts China-area GCJ02 fixes to BD09 and returns them as `bd09_latitude`/`bd09_longitude`, plus a `coord_type` field. Feeding raw GCJ02 coordinates to Baidu Map APIs resolved to a street ~500-800m away. Fixes outside China stay WGS84 and are passed through unchanged.
+
+### Changed
+
+- `phone_location` tool documentation now tells the LLM which coordinate fields to chain into Baidu Map MCP tools (`map_reverse_geocode`, `map_search_places`, `map_directions`, `map_road_traffic`).
+
 ## [0.4.1] - 2026-09-05
 
 ### Changed
