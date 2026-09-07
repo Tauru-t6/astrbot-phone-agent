@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1] - 2026-09-07
+
+### Changed
+
+- README rewritten in Chinese with a complete relay fallback guide; the plugin market page and the AstrBot in-app document viewer only render README.md.
+
+## [0.5.0] - 2026-09-07
 ## [0.5.0] - 2026-09-07
 
 ### Changed
