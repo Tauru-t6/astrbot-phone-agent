@@ -603,6 +603,14 @@ class PhoneAgentPlugin(Star):
             "error": error if not success else "",
         }
 
+    @staticmethod
+    def _gcj02_to_bd09(latitude: float, longitude: float) -> tuple[float, float]:
+        """Baidu's published GCJ02 -> BD09 shift (api.map.baidu.com/geoconvert)."""
+        x_pi = math.pi * 3000.0 / 180.0
+        z = math.sqrt(longitude * longitude + latitude * latitude) + 0.00002 * math.sin(latitude * x_pi)
+        theta = math.atan2(latitude, longitude) + 0.000003 * math.cos(longitude * x_pi)
+        return z * math.sin(theta) + 0.006, z * math.cos(theta) + 0.0065
+
     def _parse_location_result(self, raw: dict[str, Any]) -> dict[str, Any]:
         payload = _first_json_object(raw.get("ai_response")) if raw.get("success") else None
         if not payload:
@@ -611,11 +619,18 @@ class PhoneAgentPlugin(Star):
         longitude = self._float_in_range(payload.get("longitude"), -180, 180)
         if latitude is None or longitude is None:
             return {"success": False, "backend": "operit", "error": "Operit location result did not contain valid coordinates"}
-        result: dict[str, Any] = {
-            "success": True,
-            "backend": "operit",
-            "location": {"latitude": latitude, "longitude": longitude},
-        }
+        in_china = 3.86 <= latitude <= 53.56 and 73.55 <= longitude <= 135.09
+        location: dict[str, Any] = {"latitude": latitude, "longitude": longitude, "coord_type": "gcj02"}
+        if in_china:
+            # Android GPS/network fixes are GCJ02; Baidu Map APIs expect BD09.
+            location["bd09_latitude"], location["bd09_longitude"] = (
+                round(value, 6) for value in self._gcj02_to_bd09(latitude, longitude)
+            )
+        else:
+            # Outside China the fix is plain WGS84 and Baidu's overseas APIs
+            # accept it directly; no shift is applied.
+            location["coord_type"] = "wgs84"
+        result: dict[str, Any] = {"success": True, "backend": "operit", "location": location}
         accuracy = self._float_in_range(payload.get("accuracy_m"), 0, 100000)
         if accuracy is not None:
             result["location"]["accuracy_m"] = accuracy
@@ -1400,6 +1415,13 @@ class PhoneAgentPlugin(Star):
         current task needs it. It never runs in the background and does not
         retain the coordinates. Address lookup or high-accuracy location needs
         an explicit confirmation because they are more sensitive.
+        Chain with Baidu Map MCP: inside China the fix is GCJ02 and
+        location.bd09_latitude/bd09_longitude are already converted for Baidu
+        tools — pass those two fields as latitude/longitude to map_reverse_geocode,
+        map_search_places (location), map_directions, or map_road_traffic. Do
+        not pass the raw gcj02 latitude/longitude to Baidu tools; outside China
+        use the raw wgs84 values. When the user asks "我在哪", call
+        phone_location first, then map_reverse_geocode with the bd09 pair.
         Args:
             high_accuracy(boolean): Request a high-accuracy fix when true.
             include_address(boolean): Ask the phone to reverse geocode the fix.
