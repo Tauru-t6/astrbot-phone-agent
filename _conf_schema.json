@@ -88,5 +88,15 @@
     "type": "text",
     "default": "tv.danmaku.bilibilihd,com.kuaishou.nebula,com.hihonor.youku.video",
     "description": "Default comma-separated app aliases or package names for on-demand temporary policies"
+  },
+  "relay_base_url": {
+    "type": "text",
+    "default": "",
+    "description": "Public relay base URL (deploy/relay) used when Operit over Tailscale is unreachable, e.g. http://[240e:...]:8888/phone-relay"
+  },
+  "relay_token": {
+    "type": "text",
+    "default": "",
+    "description": "Shared bearer token for the relay queue"
   }
 }

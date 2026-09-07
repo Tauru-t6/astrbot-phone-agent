@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sqlite3
+import time
 import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
@@ -1043,7 +1044,99 @@ class PhoneAgentPlugin(Star):
             logger.warning("health database read failed: %s", exc)
             return {"source": "xiaomi-sync", "available": False, "fresh": False, "days": [], "error": str(exc)[:200]}
 
+    # ==================== Relay fallback (no VPN) ====================
+    # When Tailscale is down the phone cannot be reached directly. The relay
+    # queue on the public server lets the phone's Operit workflow pick tasks
+    # up on its own schedule (deploy/relay/relay_server.py).
+
+    def _relay_url(self) -> str:
+        return _text(self.config.get("relay_base_url"), 500).rstrip("/")
+
+    def _relay_token(self) -> str:
+        return str(self.config.get("relay_token") or "").strip()
+
+    def _relay_enabled(self) -> bool:
+        return bool(self._relay_url() and self._relay_token())
+
+    @staticmethod
+    def _relay_request(url: str, token: str, method: str = "GET", payload: dict[str, Any] | None = None, timeout: float = 15.0) -> dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "application/json",
+            },
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read(64 * 1024).decode("utf-8", errors="replace"))
+            return data if isinstance(data, dict) else {"success": False, "error": "relay returned invalid JSON"}
+        except urllib.error.HTTPError as exc:
+            return {"success": False, "error": f"relay HTTP {exc.code}"}
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            return {"success": False, "error": f"relay connection failed: {str(exc)[:180]}"}
+
+    def _relay_health(self) -> dict[str, Any]:
+        if not self._relay_enabled():
+            return {"available": False, "error": "relay is not configured"}
+        result = self._relay_request(self._relay_url() + "/health", self._relay_token(), timeout=6)
+        return {"available": bool(result.get("success")), "error": result.get("error", "")}
+
+    def _relay_submit(self, task: str, timeout: float) -> dict[str, Any]:
+        """Queue a task for the phone's polling workflow and wait for its result."""
+        push = self._relay_request(
+            self._relay_url() + "/task", self._relay_token(), "POST",
+            {"message": task}, timeout=10,
+        )
+        if not push.get("success"):
+            return {"success": False, "backend": "relay", "error": push.get("error", "relay task push failed")}
+        task_id = str(push.get("task_id", ""))
+        deadline = datetime.now().timestamp() + timeout
+        while datetime.now().timestamp() < deadline:
+            await_time = 15 if datetime.now().timestamp() + 15 < deadline else max(1.0, deadline - datetime.now().timestamp())
+            time.sleep(min(await_time, 15))
+            result = self._relay_request(f"{self._relay_url()}/result/{task_id}", self._relay_token(), timeout=10)
+            payload = result.get("result") or {}
+            status = _text(payload.get("status"), 20)
+            if status == "pending" or status == "claimed" or status == "running":
+                continue
+            if payload.get("ai_response") is not None or payload.get("finished_at") is not None:
+                return {
+                    "success": bool(payload.get("success")),
+                    "backend": "relay",
+                    "task_id": task_id,
+                    "ai_response": _text(payload.get("ai_response"), 6000),
+                    "error": _text(payload.get("error"), 300),
+                }
+            # 404: task vanished (relay restarted); stop waiting.
+            if not result.get("success"):
+                return {"success": False, "backend": "relay", "task_id": task_id, "error": result.get("error", "relay lost the task")}
+            continue
+        return {
+            "success": False,
+            "backend": "relay",
+            "task_id": task_id,
+            "error": "queued via relay but the phone did not pick it up in time; it may still run later",
+        }
+
     def _operit_task_sync(self, task: str, show_floating: bool, initial_mode: str) -> dict[str, Any]:
+        token = self._operit_token()
+        if not token and not self._relay_enabled():
+            return {"success": False, "error": "Operit HTTP token is not configured"}
+        # Direct Operit first; if Tailscale is down, queue through the relay
+        # so the phone's polling workflow can pick the task up without a VPN.
+        if token:
+            direct = self._operit_task_direct(task, show_floating, initial_mode)
+            if direct.get("success") or not self._relay_enabled():
+                return direct
+            self._audit("relay_fallback", reason=_text(direct.get("error"), 180))
+        return self._relay_submit(task, self._operit_timeout())
+
+    def _operit_task_direct(self, task: str, show_floating: bool, initial_mode: str) -> dict[str, Any]:
         token = self._operit_token()
         if not token:
             return {"success": False, "error": "Operit HTTP token is not configured"}

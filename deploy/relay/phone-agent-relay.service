@@ -1,0 +1,21 @@
+[Unit]
+Description=Phone Agent relay queue
+After=network.target
+
+[Service]
+Type=simple
+Environment=RELAY_TOKEN=__RELAY_TOKEN__
+Environment=RELAY_HOST=127.0.0.1
+Environment=RELAY_PORT=8791
+Environment=RELAY_STATE=/home/tauru/data/phone_agent_relay_state.json
+ExecStart=/usr/bin/python3 /home/tauru/phone-agent-relay/relay_server.py
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/tauru/data
+
+[Install]
+WantedBy=multi-user.target
