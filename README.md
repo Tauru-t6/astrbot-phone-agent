@@ -12,3 +12,4 @@ Phone control for AstrBot through Operit, Shizuku, and Tailscale.
 Private Companion integration is optional and disabled by default. See
 [`extensions/private_companion_auth.md`](extensions/private_companion_auth.md)
 when you explicitly want to enable it.
+Tips:本项目是由GPT 5.6 sol/Terra，GLM 5.3编写的,我本身是没有代码基础的，教程啥的也不是我写的，后面可能会上架AstrBot插件市场，还会改名字
