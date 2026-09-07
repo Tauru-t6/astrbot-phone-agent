@@ -2,7 +2,7 @@ name: astrbot_plugin_phone_agent
 display_name: Phone Control
 author: tauru
 description: Control an Android phone through the Operit AI agent over Tailscale, with an optional public relay fallback. Core tools delegate natural-language tasks and allowlisted actions to Operit; health, location, reminders, and app-policy tools are opt-in feature flags.
-version: 0.5.0
+version: 0.5.1
 astrbot_version: ">=4.22.0"
 support_platforms:
   - aiocqhttp
