@@ -11,8 +11,8 @@
   },
   "include_screen": {
     "type": "bool",
-    "default": true,
-    "description": "Include foreground app and activity impression"
+    "default": false,
+    "description": "Allow Operit to inspect the current app during proactive companion generation"
   },
   "include_health": {
     "type": "bool",

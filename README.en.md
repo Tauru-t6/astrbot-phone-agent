@@ -209,7 +209,7 @@ Expected log entries include:
 ```text
 Loading plugin astrbot_plugin_phone_agent
 Added llm tool: operit_task
-Added llm tool: phone_observe
+Added llm tool: phone_observe (disabled by default; enable `enable_observe_tool` before it can call Operit to inspect the current app)
 Added llm tool: phone_location
 Added llm tool: phone_app_policy
 Plugin astrbot_plugin_phone_agent (...)

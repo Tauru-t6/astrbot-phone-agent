@@ -208,7 +208,7 @@ journalctl --user -u astrbot.service -n 100 --no-pager
 ```text
 Loading plugin astrbot_plugin_phone_agent
 Added llm tool: operit_task
-Added llm tool: phone_observe
+Added llm tool: phone_observe（默认关闭；开启 `enable_observe_tool` 后才会调用 Operit 读取当前 App）
 Added llm tool: phone_location
 Added llm tool: phone_app_policy
 Plugin astrbot_plugin_phone_agent (...)

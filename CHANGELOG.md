@@ -5,6 +5,8 @@
 ### Changed
 
 - Market description rewritten in Chinese.
+- Disabled `phone_observe` by default. It now requires `enable_observe_tool=true`.
+- Disabled screen observation in `companion-context` by default so proactive companion generation does not call Operit unless `include_screen=true` is explicitly configured.
 
 ## [0.5.1] - 2026-09-07
 ## [0.5.1] - 2026-09-07

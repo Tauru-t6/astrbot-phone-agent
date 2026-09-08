@@ -143,6 +143,7 @@ class PhoneAgentPlugin(Star):
 
     def _tool_enabled(self, name: str) -> bool:
         groups = {
+            "phone_observe": ("observe_tool",),
             "phone_health": ("health_tools",),
             "phone_usage": ("usage_tool",),
             "phone_location": ("location_tool",),
@@ -491,12 +492,26 @@ class PhoneAgentPlugin(Star):
         try:
             delay = max(0.0, float(item.get("due", 0)) - datetime.now().timestamp())
             await asyncio.sleep(delay)
-            item = self._reminders.pop(reminder_id, None)
-            self._reminder_tasks.pop(reminder_id, None)
-            self._save_reminders()
             if item:
-                await self.context.send_message(item["session"], MessageChain().message("提醒：" + str(item["text"])))
-                self._audit("reminder_sent", reminder_id=reminder_id)
+                sent = False
+                for attempt in range(3):
+                    try:
+                        await self.context.send_message(item["session"], MessageChain().message("提醒：" + str(item["text"])))
+                        sent = True
+                        break
+                    except Exception as exc:
+                        if attempt == 2:
+                            logger.warning("phone agent reminder failed after retries: %s", exc)
+                            item["due"] = datetime.now().timestamp() + 15 * 60
+                            self._save_reminders()
+                            self._reminder_tasks[reminder_id] = asyncio.create_task(self._run_reminder(reminder_id))
+                        else:
+                            await asyncio.sleep(2 ** attempt)
+                if sent:
+                    self._reminders.pop(reminder_id, None)
+                    self._reminder_tasks.pop(reminder_id, None)
+                    self._save_reminders()
+                    self._audit("reminder_sent", reminder_id=reminder_id)
         except asyncio.CancelledError:
             return
         except Exception as exc:
@@ -1453,6 +1468,8 @@ class PhoneAgentPlugin(Star):
         if not item:
             return json.dumps({"success": False, "error": "task not found"}, ensure_ascii=False)
         item["status"] = "cancelled"
+        item["cancel_requested"] = True
+        item["cancel_note"] = "local wait cancelled; phone-side Operit request may still be running"
         handle = self._operit_task_handles.get(task_id)
         if handle is not None and handle is not asyncio.current_task():
             handle.cancel()
@@ -1478,6 +1495,7 @@ class PhoneAgentPlugin(Star):
 
     @filter.llm_tool(name="phone_observe")
     @_tolerate_nested_args
+    @_feature_gate("phone_observe")
     async def phone_observe(self, event: AstrMessageEvent, **_kwargs: Any) -> str:
         """Observe the authorized phone before acting: foreground app, visible UI text, and battery.
 

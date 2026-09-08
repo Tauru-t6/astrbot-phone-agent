@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import importlib
+import inspect
 import json
 import re
 from contextlib import suppress
@@ -211,6 +212,15 @@ class PhoneCompanionContext(Star):
             if target is not None and phone is not None:
                 current = target._generate_proactive_message_with_llm
                 if target is not self._target or current is not self._wrapped:
+                    try:
+                        if len(inspect.signature(current).parameters) < 1:
+                            logger.warning("[PhoneCompanionContext] bridge skipped: incompatible companion method signature")
+                            await asyncio.sleep(10)
+                            continue
+                    except (TypeError, ValueError):
+                        logger.warning("[PhoneCompanionContext] bridge skipped: companion method signature unavailable")
+                        await asyncio.sleep(10)
+                        continue
                     if getattr(current, "_phone_context_bridge", False):
                         await asyncio.sleep(10)
                         continue
@@ -307,6 +317,16 @@ class PhoneCompanionContext(Star):
         return dict(snapshot)
 
     async def _screen_snapshot(self, phone: Any) -> dict[str, Any]:
+        # Keep proactive context observation behind the phone plugin's explicit
+        # observe flag as well, including when an older config has include_screen
+        # enabled already.
+        enabled = getattr(phone, "_tool_enabled", None)
+        if callable(enabled):
+            try:
+                if not enabled("phone_observe"):
+                    return {}
+            except Exception:
+                return {}
         ttl = self._cache_seconds("screen_cache_seconds", 90, 600)
         if self._screen_cache and datetime.now() - self._screen_cache[0] < timedelta(seconds=ttl):
             return dict(self._screen_cache[1])
@@ -342,7 +362,9 @@ class PhoneCompanionContext(Star):
             if self._feature_enabled("include_health", True):
                 tasks.append(asyncio.ensure_future(self._health_snapshot(phone)))
                 kinds.append("health")
-            if self._feature_enabled("include_screen", True):
+            # Screen observation is an explicit opt-in because it calls Operit
+            # during proactive message generation and can wake the phone agent.
+            if self._feature_enabled("include_screen", False):
                 tasks.append(asyncio.ensure_future(self._screen_snapshot(phone)))
                 kinds.append("screen")
             try:

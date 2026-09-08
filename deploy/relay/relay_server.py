@@ -25,6 +25,7 @@ PORT = int(os.environ.get("RELAY_PORT", "8791"))
 MAX_TASKS = 64
 TASK_TTL_SECONDS = 24 * 3600
 RESULT_TTL_SECONDS = 24 * 3600
+CLAIM_LEASE_SECONDS = 5 * 60
 
 _lock = threading.Lock()
 _state: dict = {"tasks": [], "results": {}}
@@ -48,9 +49,13 @@ def _load() -> None:
 
 
 def _gc_locked(now: float) -> None:
+    for task in _state["tasks"]:
+        if task.get("status") == "claimed" and now - task.get("claimed_at", task.get("created_at", now)) >= CLAIM_LEASE_SECONDS:
+            task["status"] = "pending"
+            task.pop("claimed_at", None)
     _state["tasks"] = [
         t for t in _state["tasks"]
-        if t.get("status") == "pending" or now - t.get("created_at", 0) < TASK_TTL_SECONDS
+        if now - t.get("created_at", 0) < TASK_TTL_SECONDS
     ]
     _state["results"] = {
         k: v for k, v in _state["results"].items()
@@ -83,6 +88,7 @@ def poll_task() -> dict | None:
         for task in _state["tasks"]:
             if task["status"] == "pending":
                 task["status"] = "claimed"
+                task["claimed_at"] = now
                 _persist()
                 return task
     return None
@@ -164,7 +170,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         try:
-            length = min(int(self.headers.get("Content-Length", "0")), 64 * 1024)
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > 64 * 1024:
+                self._reply(413, {"success": False, "error": "request body too large"})
+                return
             payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
             self._reply(400, {"success": False, "error": "invalid JSON"})

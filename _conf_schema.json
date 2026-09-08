@@ -104,6 +104,11 @@
     "default": false,
     "description": "Enable phone_health tool and /health route (requires xiaomi-sync health.db)"
   },
+  "enable_observe_tool": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_observe, which asks Operit to inspect the current app and screen"
+  },
   "enable_usage_tool": {
     "type": "bool",
     "default": false,
