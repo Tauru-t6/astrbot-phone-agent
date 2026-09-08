@@ -174,6 +174,7 @@ class PhoneAgentPlugin(Star):
             ("/health", self._web_health, ["GET"], "Read phone health summary", "health_tools"),
             ("/tasks", self._web_tasks, ["GET"], "List Operit tasks", None),
             ("/reminders", self._web_reminders, ["GET"], "List phone reminders", "reminder_tools"),
+            ("/reminders", self._web_reminders, ["POST"], "Cancel a phone reminder", "reminder_tools"),
             ("/audit", self._web_audit, ["GET"], "List phone action audit", "audit_tool"),
         )
         for route in routes:
@@ -371,6 +372,20 @@ class PhoneAgentPlugin(Star):
         return jsonify({"success": True, "tasks": self._operit_tasks})
 
     async def _web_reminders(self):
+        if request.method == "POST":
+            if not self._web_write_allowed():
+                return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
+            payload = await request.get_json(silent=True)
+            reminder_id = _text(payload.get("reminder_id"), 40) if isinstance(payload, dict) else ""
+            if _text(payload.get("action"), 20).lower() not in {"cancel", "remove", "delete"} or not reminder_id:
+                return jsonify({"success": False, "error": "action=cancel and reminder_id are required"}), 400
+            item = self._reminders.pop(reminder_id, None)
+            task = self._reminder_tasks.pop(reminder_id, None)
+            if task:
+                task.cancel()
+            self._save_reminders()
+            self._audit("web_reminder_cancelled", reminder_id=reminder_id, success=bool(item))
+            return jsonify({"success": bool(item), "reminder_id": reminder_id, "status": "cancelled" if item else "not_found"})
         return jsonify({"success": True, "reminders": self._reminders})
 
     async def _web_audit(self):
