@@ -7,6 +7,8 @@
 - Market description rewritten in Chinese.
 - Disabled `phone_observe` by default. It now requires `enable_observe_tool=true`.
 - Disabled screen observation in `companion-context` by default so proactive companion generation does not call Operit unless `include_screen=true` is explicitly configured.
+- Made the Private Companion bridge opt-in by default (`companion-context.enabled=false`).
+- Added phone task confirmation for typing and clicking, relay lease renewal, relay request-size rejection, background-task limits, and same-origin checks for WebUI writes.
 
 ## [0.5.1] - 2026-09-07
 ## [0.5.1] - 2026-09-07

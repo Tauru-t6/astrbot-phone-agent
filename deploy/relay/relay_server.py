@@ -113,6 +113,17 @@ def submit_result(task_id: str, success: bool, ai_response: str, error: str = ""
         return True
 
 
+def renew_task(task_id: str) -> bool:
+    now = time.time()
+    with _lock:
+        task = next((t for t in _state["tasks"] if t["id"] == task_id), None)
+        if task is None or task.get("status") not in {"claimed", "running"}:
+            return False
+        task["claimed_at"] = now
+        _persist()
+        return True
+
+
 def get_result(task_id: str) -> dict | None:
     with _lock:
         result = _state["results"].get(task_id)
@@ -198,6 +209,13 @@ class RelayHandler(BaseHTTPRequestHandler):
                 str(payload.get("error", "")),
             ):
                 self._reply(404, {"success": False, "error": "task not found"})
+                return
+            self._reply(200, {"success": True})
+            return
+        if path == "/renew":
+            task_id = str(payload.get("task_id", ""))
+            if not task_id or not renew_task(task_id):
+                self._reply(404, {"success": False, "error": "task not found or not claimable"})
                 return
             self._reply(200, {"success": True})
             return

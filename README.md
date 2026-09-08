@@ -10,6 +10,7 @@
 |---|---|---|
 | 自然语言手机任务（开关应用、点按、输入等） | `operit_task` 系列、`phone_action` | ✅ 默认开启 |
 | 观察手机状态（前台应用、屏幕文字、电量） | `phone_observe` | 关闭，需显式开启 `enable_observe_tool` |
+| Private Companion 手机上下文桥接 | `companion-context` | 关闭，需显式开启 |
 | App 禁用/恢复、临时限制视频 App | `phone_app_policy`、`phone_sleep_mode` | 🔧 按需开启 |
 | 一次性读取手机位置（可联动百度地图 MCP） | `phone_location` | 🔧 按需开启 |
 | 应用使用时长统计 | `phone_usage` | 🔧 按需开启 |

@@ -104,6 +104,16 @@
     "default": false,
     "description": "Enable phone_health tool and /health route (requires xiaomi-sync health.db)"
   },
+  "max_background_tasks": {
+    "type": "int",
+    "default": 2,
+    "description": "Maximum concurrent background Operit tasks"
+  },
+  "max_background_tasks": {
+    "type": "int",
+    "default": 2,
+    "description": "Maximum concurrent background Operit tasks"
+  },
   "enable_observe_tool": {
     "type": "bool",
     "default": false,

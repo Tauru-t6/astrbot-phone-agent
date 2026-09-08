@@ -124,6 +124,7 @@ class PhoneAgentPlugin(Star):
         self._policy_state: dict[str, float | None] = {}
         self._operit_tasks: dict[str, dict[str, Any]] = {}
         self._operit_task_handles: dict[str, asyncio.Task[Any]] = {}
+        self._max_background_tasks = 2
         self._reminder_tasks: dict[str, asyncio.Task[Any]] = {}
         self._reminders: dict[str, dict[str, Any]] = {}
         self._load_reminders()
@@ -196,11 +197,13 @@ class PhoneAgentPlugin(Star):
         return jsonify({"success": True, "config": self._web_config_view()})
 
     async def _web_save_config(self):
+        if not self._web_write_allowed():
+            return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
         payload = await request.get_json(silent=True)
         if not isinstance(payload, dict):
             return jsonify({"success": False, "error": "JSON object required"}), 400
         bool_keys = {"enabled", "use_private_companion_auth"}
-        int_keys = {"operit_timeout_seconds"}
+        int_keys = {"operit_timeout_seconds", "max_background_tasks"}
         text_keys = {
             "control_backend", "operit_base_url", "operit_token", "allowed_user_ids",
             "app_aliases_json", "sleep_guard_packages", "sleep_guard_exempt_apps",
@@ -237,6 +240,8 @@ class PhoneAgentPlugin(Star):
         return jsonify({"success": True, "config": self._web_config_view()})
 
     async def _web_app_policy(self):
+        if not self._web_write_allowed():
+            return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
         payload = await request.get_json(silent=True)
         if not isinstance(payload, dict):
             return jsonify({"success": False, "error": "JSON object required"}), 400
@@ -284,6 +289,13 @@ class PhoneAgentPlugin(Star):
             result = {"available": False, "error": "Operit health check timed out"}
         return jsonify({"success": bool(result.get("available")), "operit": result})
 
+    @staticmethod
+    def _web_write_allowed() -> bool:
+        origin = str(request.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        return origin.rstrip("/") == request.host_url.rstrip("/")
+
     async def _web_status(self):
         try:
             operit = await asyncio.wait_for(asyncio.to_thread(self._operit_health_sync), timeout=3)
@@ -308,6 +320,8 @@ class PhoneAgentPlugin(Star):
         })
 
     async def _web_sleep_mode(self):
+        if not self._web_write_allowed():
+            return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
         payload = await request.get_json(silent=True)
         payload = payload if isinstance(payload, dict) else {}
         mode = _text(payload.get("mode", "status"), 20).lower()
@@ -1158,6 +1172,10 @@ class PhoneAgentPlugin(Star):
             payload = result.get("result") or {}
             status = _text(payload.get("status"), 20)
             if status == "pending" or status == "claimed" or status == "running":
+                self._relay_request(
+                    self._relay_url() + "/renew", self._relay_token(), "POST",
+                    {"task_id": task_id}, timeout=5,
+                )
                 continue
             if payload.get("ai_response") is not None or payload.get("finished_at") is not None:
                 return {
@@ -1436,6 +1454,13 @@ class PhoneAgentPlugin(Star):
         if initial_mode not in {"WINDOW", "BALL", "VOICE_BALL", "FULLSCREEN", "RESULT_DISPLAY", "SCREEN_OCR"}:
             initial_mode = "WINDOW"
         if background:
+            try:
+                max_tasks = max(1, min(int(self.config.get("max_background_tasks", self._max_background_tasks)), 8))
+            except (TypeError, ValueError):
+                max_tasks = self._max_background_tasks
+            active = sum(value.get("status") in {"queued", "running"} for value in self._operit_tasks.values())
+            if active >= max_tasks:
+                return json.dumps({"success": False, "error": "too many background phone tasks; wait for one to finish"}, ensure_ascii=False)
             task_id = uuid.uuid4().hex[:12]
             self._operit_tasks[task_id] = {"status": "queued", "task": task, "confirmed": bool(confirmed), "created_at": datetime.now().isoformat(timespec="seconds")}
             self._operit_task_handles[task_id] = asyncio.create_task(
@@ -1448,7 +1473,7 @@ class PhoneAgentPlugin(Star):
         return json.dumps(result, ensure_ascii=False)
 
     def _task_requires_confirmation(self, task: str) -> bool:
-        return bool(re.search(r"(发消息|发送|私信|回复|评论|点赞|转发|删除|卸载|支付|付款|send|message|reply|comment|like|share|delete|uninstall|pay)", task, re.I))
+        return bool(re.search(r"(发消息|发送|私信|回复|评论|点赞|转发|删除|卸载|支付|付款|输入|填写|点击|点按|确认按钮|send|message|reply|comment|like|share|delete|uninstall|pay|type|tap|click)", task, re.I))
 
     @filter.llm_tool(name="operit_task_status")
     @_tolerate_nested_args

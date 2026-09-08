@@ -1,8 +1,8 @@
 {
   "enabled": {
     "type": "bool",
-    "default": true,
-    "description": "Add a private phone and health snapshot before proactive messages"
+    "default": false,
+    "description": "Enable the optional Private Companion bridge"
   },
   "timeout_seconds": {
     "type": "int",
