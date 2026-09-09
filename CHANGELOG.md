@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.3] - 2026-09-09
+
+### Fixed
+
+- Disabled unintended automatic Operit screen observation unless explicitly enabled.
+- Made the Private Companion bridge opt-in.
+- Added relay lease recovery and renewal, reminder retries, background task limits, and safer WebUI writes.
+- Upgraded the WebUI with task controls, reminder cancellation, automatic refresh, and clearer status cards.
+
 ## [0.5.2] - 2026-09-07
 
 ### Changed
