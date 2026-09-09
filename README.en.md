@@ -234,6 +234,7 @@ The page provides:
 - Start/stop controls for temporary restrictions with automatic restore.
 - One-shot location lookup.
 - Health summary, background tasks, reminders, and recent audit records.
+- Background tasks can be cancelled or retried, reminders can be cancelled, and the page supports 15-second auto-refresh.
 
 The page uses AstrBot Dashboard authentication. The Operit Token is shown only as configured/not configured and is never echoed.
 
@@ -268,7 +269,7 @@ Validate in this order after saving:
 1. WebUI shows the Token as configured.
 2. Test Operit succeeds and shows the Operit version.
 3. Refresh Health. “Not configured” is expected when no health database is configured.
-4. In an authorized private chat, send:
+4. If phone observation is needed, first set `enable_observe_tool=true`, then in an authorized private chat send:
 
    ```text
    Observe the phone only; do not click or type
@@ -357,7 +358,11 @@ Background Operit tasks return a task ID and can be queried, cancelled, or retri
 
 ### High-risk actions
 
-Messages, comments, likes, shares, deletes, uninstallations, and payments require explicit confirmation. Opening apps, navigation, screen lock, and read-only status checks can run directly.
+Messages, comments, likes, shares, deletes, uninstallations, payments, typing, and button clicks require explicit confirmation. Opening apps, navigation, screen lock, and read-only status checks can run directly.
+
+### Private Companion bridge
+
+`companion-context` is optional and defaults to `enabled=false`. It is installed only when explicitly enabled. To let proactive messages inspect the current app, also enable `enable_observe_tool=true` in the phone plugin and `include_screen=true` in the bridge config. Otherwise it does not call Operit.
 
 ## 9. Health data (optional)
 

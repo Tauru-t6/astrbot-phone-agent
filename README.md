@@ -18,7 +18,7 @@
 | 操作审计查询 | `phone_audit` | 🔧 按需开启 |
 | 小米健康数据（步数/睡眠/心率/血氧） | `phone_health` | 🔧 按需开启 |
 
-可选功能通过插件配置里的 `enable_*` 开关控制，不开就不注册对应工具——安装即用、零噪音。
+可选功能通过插件配置里的 `enable_*` 开关控制，不开就不注册对应工具。`phone_observe` 默认关闭；Private Companion 的 `companion-context` 也默认关闭，避免主动消息生成时自动读取手机屏幕。
 
 ## 工作原理
 
@@ -30,6 +30,7 @@
 - **主链路（实时）**：服务器经 Tailscale 直连手机上的 Operit HTTP 服务，随叫随到。
 - **兜底链路（relay）**：手机开不了 VPN 时（公司网络、运营商限制等），插件自动把任务放进你自己服务器上的公网队列；手机上的 Operit 定时工作流轮询领取、执行并回传结果。轮询间隔受 Android WorkManager 限制，最小 15 分钟。
 - 两条链路自动切换：主链路失败才走兜底，恢复后自动切回。切换行为会记录在审计日志（`relay_fallback`）里。
+- Relay 任务领取有 5 分钟租约，手机执行较慢时会自动续租；手机中断后任务会重新进入队列。
 
 ## 安装
 
@@ -63,8 +64,10 @@ git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_pho
 | `operit_base_url` | 手机 Operit 地址（Tailscale IP + 端口，如 `http://100.x.y.z:8094`） |
 | `operit_token` | Operit 外部 HTTP 的 Bearer Token |
 | `allowed_user_ids` | 允许使用手机功能的用户 ID，逗号分隔。**留空则所有功能拒绝调用，务必填写** |
+| `enable_observe_tool` | 是否允许 `phone_observe` 调用 Operit 查看当前 App，默认 `false` |
+| `max_background_tasks` | 后台 Operit 任务并发上限，默认 `2` |
 
-配置完成后在聊天里发一句"打开设置"，能收到手机执行结果就是通了。
+配置完成后在聊天里发一句"打开设置"，能收到手机执行结果就是通了。输入文字、点击按钮、发送消息、删除、支付等可能产生副作用的任务会先要求确认。
 
 ## Relay 兜底（可选）
 
@@ -110,6 +113,11 @@ sudo systemctl daemon-reload && sudo systemctl enable --now phone-agent-relay
 - **健康数据**（`enable_health_tools`）：需另行部署 `xiaomi-health-sync`（小米运动健康 → SQLite 同步工具），把生成的 `health.db` 路径填到 `health_db_path`。插件只读查询，不上传任何小米凭据。
 - **位置**（`enable_location_tool`）：返回 GCJ02 原始坐标和转换后的 BD09 坐标。BD09 可直接传给百度地图 MCP 的 `map_reverse_geocode`、`map_search_places` 等工具，实现"我在哪 / 附近有什么 / 怎么去"。高精度定位和地址反查需要你在聊天里显式确认。
 - **App 策略**（`enable_policy_tools`）：通过 Shizuku 执行 `pm suspend`，禁用后自动核验实际状态，支持定时自动恢复；系统包和 Operit 自身受保护，不会被误禁。
+- **Private Companion 桥接**（`companion-context.enabled`）：默认关闭。开启后才会向 Private Companion 的主动消息生成注入健康或屏幕摘要；屏幕摘要还需要同时开启主插件的 `enable_observe_tool` 和桥接的 `include_screen`。
+
+## WebUI 里还能做什么
+
+Phone Control 页面支持连接测试、配置编辑、健康摘要、临时 App 限制、一次性定位、后台任务取消/重试、提醒取消、审计查看和 15 秒自动刷新。页面中的 Token 只显示是否已配置。
 
 ## 安全说明
 

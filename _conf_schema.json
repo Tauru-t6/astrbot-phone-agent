@@ -109,11 +109,6 @@
     "default": 2,
     "description": "Maximum concurrent background Operit tasks"
   },
-  "max_background_tasks": {
-    "type": "int",
-    "default": 2,
-    "description": "Maximum concurrent background Operit tasks"
-  },
   "enable_observe_tool": {
     "type": "bool",
     "default": false,

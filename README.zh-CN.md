@@ -233,6 +233,7 @@ Plugin astrbot_plugin_phone_agent (...)
 - 临时限制启动/解除，到期自动恢复。
 - 一次性定位读取入口。
 - 健康摘要、后台任务、提醒和最近审计记录。
+- 后台任务支持取消等待和重试，提醒支持直接取消；页面可开启 15 秒自动刷新。
 
 页面使用 AstrBot Dashboard 自带的登录鉴权。Token 只会显示“已配置”，不会回显。
 
@@ -267,7 +268,7 @@ Plugin astrbot_plugin_phone_agent (...)
 1. WebUI 中 Token 状态显示“已配置”。
 2. 点击“测试 Operit”，预期显示在线和 Operit 版本。
 3. 点击“刷新健康”。未配置健康库时显示未配置是正常的。
-4. 在和 AstrBot 的授权私聊中发送：
+4. 如果需要使用手机观察功能，先在配置中开启 `enable_observe_tool=true`，再在和 AstrBot 的授权私聊中发送：
 
    ```text
    观察一下当前手机，只观察，不要点击
@@ -358,7 +359,11 @@ Plugin astrbot_plugin_phone_agent (...)
 
 ### 高风险操作
 
-发消息、评论、点赞、转发、删除、卸载和支付类任务需要显式确认。普通的打开 App、返回、锁屏和读取状态可以直接执行。
+发消息、评论、点赞、转发、删除、卸载、支付、输入文字和点击按钮类任务需要显式确认。普通的打开 App、返回、锁屏和读取状态可以直接执行。
+
+### Private Companion 桥接
+
+`companion-context` 是独立的可选插件，默认 `enabled=false`。只有显式开启后才会安装桥接；如果还要让主动消息读取当前 App，需要同时开启主插件的 `enable_observe_tool=true` 和桥接配置的 `include_screen=true`。不开启时不会调用 Operit。
 
 ## 九、健康数据（可选）
 
