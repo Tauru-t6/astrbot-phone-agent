@@ -125,6 +125,7 @@ class PhoneAgentPlugin(Star):
         self._operit_tasks: dict[str, dict[str, Any]] = {}
         self._operit_task_handles: dict[str, asyncio.Task[Any]] = {}
         self._max_background_tasks = 2
+        self._load_operit_tasks()
         self._reminder_tasks: dict[str, asyncio.Task[Any]] = {}
         self._reminders: dict[str, dict[str, Any]] = {}
         self._load_reminders()
@@ -187,7 +188,7 @@ class PhoneAgentPlugin(Star):
         keys = (
             "enabled", "control_backend", "operit_base_url", "allowed_user_ids",
             "use_private_companion_auth", "app_aliases_json", "sleep_guard_packages",
-            "sleep_guard_exempt_apps", "operit_timeout_seconds",
+            "sleep_guard_exempt_apps", "operit_timeout_seconds", "max_background_tasks", "tasks_path",
         )
         result = {key: self.config.get(key) for key in keys}
         result["operit_token_configured"] = bool(self._operit_token())
@@ -208,6 +209,7 @@ class PhoneAgentPlugin(Star):
         text_keys = {
             "control_backend", "operit_base_url", "operit_token", "allowed_user_ids",
             "app_aliases_json", "sleep_guard_packages", "sleep_guard_exempt_apps",
+            "tasks_path",
         }
         updates: dict[str, Any] = {}
         for key, value in payload.items():
@@ -443,6 +445,38 @@ class PhoneAgentPlugin(Star):
 
     def _reminder_path(self) -> str:
         return _text(self.config.get("reminders_path"), 500) or "phone_agent_reminders.json"
+
+    def _task_path(self) -> str:
+        return _text(self.config.get("tasks_path"), 500) or "phone_agent_tasks.json"
+
+    def _save_operit_tasks(self) -> None:
+        try:
+            path = Path(self._task_path())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            items = list(self._operit_tasks.items())[-100:]
+            path.write_text(json.dumps(dict(items), ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("phone agent task save failed: %s", exc)
+
+    def _load_operit_tasks(self) -> None:
+        try:
+            path = Path(self._task_path())
+            if not path.exists():
+                return
+            values = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(values, dict):
+                return
+            for task_id, item in list(values.items())[-100:]:
+                if not isinstance(item, dict) or not item.get("task"):
+                    continue
+                item = dict(item)
+                if item.get("status") in {"queued", "running"}:
+                    item["status"] = "interrupted"
+                    item["error"] = "AstrBot restarted before this background task finished"
+                item.pop("result", None)
+                self._operit_tasks[str(task_id)] = item
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            logger.warning("phone agent task file is invalid; ignoring it")
 
     def _policy_state_path(self) -> str:
         return _text(self.config.get("policy_state_path"), 500) or "phone_agent_policies.json"
@@ -1279,6 +1313,7 @@ class PhoneAgentPlugin(Star):
 
     async def _run_operit_background(self, task_id: str, task: str, show_floating: bool, initial_mode: str) -> None:
         self._operit_tasks[task_id]["status"] = "running"
+        self._save_operit_tasks()
         try:
             result = await asyncio.to_thread(self._operit_task_sync, task, show_floating, initial_mode)
             if self._operit_tasks.get(task_id, {}).get("status") != "cancelled":
@@ -1287,6 +1322,7 @@ class PhoneAgentPlugin(Star):
             self._operit_tasks.get(task_id, {}).update({"status": "cancelled"})
         except Exception as exc:
             self._operit_tasks.get(task_id, {}).update({"status": "failed", "result": {"success": False, "error": str(exc)[:200]}})
+        self._save_operit_tasks()
         self._audit("operit_task_finished", task_id=task_id, status=self._operit_tasks.get(task_id, {}).get("status"))
 
     @filter.llm_tool(name="phone_health")
@@ -1478,6 +1514,7 @@ class PhoneAgentPlugin(Star):
                 return json.dumps({"success": False, "error": "too many background phone tasks; wait for one to finish"}, ensure_ascii=False)
             task_id = uuid.uuid4().hex[:12]
             self._operit_tasks[task_id] = {"status": "queued", "task": task, "confirmed": bool(confirmed), "created_at": datetime.now().isoformat(timespec="seconds")}
+            self._save_operit_tasks()
             self._operit_task_handles[task_id] = asyncio.create_task(
                 self._run_operit_background(task_id, task, bool(show_floating), initial_mode)
             )
@@ -1510,6 +1547,7 @@ class PhoneAgentPlugin(Star):
         item["status"] = "cancelled"
         item["cancel_requested"] = True
         item["cancel_note"] = "local wait cancelled; phone-side Operit request may still be running"
+        self._save_operit_tasks()
         handle = self._operit_task_handles.get(task_id)
         if handle is not None and handle is not asyncio.current_task():
             handle.cancel()
@@ -1528,6 +1566,7 @@ class PhoneAgentPlugin(Star):
             return json.dumps({"success": False, "needs_confirmation": True, "error": "Ask the user for confirmation before retrying this task."}, ensure_ascii=False)
         new_id = uuid.uuid4().hex[:12]
         self._operit_tasks[new_id] = {"status": "queued", "task": item["task"], "confirmed": bool(item.get("confirmed")), "created_at": datetime.now().isoformat(timespec="seconds"), "retry_of": task_id}
+        self._save_operit_tasks()
         self._operit_task_handles[new_id] = asyncio.create_task(
             self._run_operit_background(new_id, item["task"], False, "WINDOW")
         )

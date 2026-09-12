@@ -109,6 +109,11 @@
     "default": 2,
     "description": "Maximum concurrent background Operit tasks"
   },
+  "tasks_path": {
+    "type": "text",
+    "default": "phone_agent_tasks.json",
+    "description": "Persistent metadata file for background Operit tasks"
+  },
   "enable_observe_tool": {
     "type": "bool",
     "default": false,

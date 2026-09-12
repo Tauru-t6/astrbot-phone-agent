@@ -37,6 +37,7 @@ class PhoneCompanionContext(Star):
         self._observe_lock = asyncio.Lock()
         self._screen_cache: tuple[datetime, dict[str, Any]] | None = None
         self._health_cache: tuple[datetime, dict[str, Any]] | None = None
+        self._bridge_status: dict[str, Any] = {"enabled": self._enabled(), "installed": False}
 
     def _enabled(self) -> bool:
         value = self.config.get("enabled", True)
@@ -206,6 +207,7 @@ class PhoneCompanionContext(Star):
     async def _install_when_ready(self) -> None:
         while True:
             if not self._enabled():
+                self._bridge_status.update({"enabled": False, "installed": False, "reason": "disabled"})
                 return
             target = self._companion()
             phone = self._phone()
@@ -254,8 +256,14 @@ class PhoneCompanionContext(Star):
                     self._target = target
                     self._original = original
                     self._wrapped = wrapped
+                    self._bridge_status = {"enabled": True, "installed": True, "target": type(target).__name__}
                     logger.info("[PhoneCompanionContext] installed optional proactive phone/health context bridge")
+            elif target is None:
+                self._bridge_status.update({"enabled": True, "installed": False, "reason": "private companion unavailable"})
             await asyncio.sleep(10)
+
+    def status(self) -> dict[str, Any]:
+        return dict(self._bridge_status)
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:

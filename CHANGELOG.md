@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.4] - 2026-09-12
+
+### Added
+
+- Optional relay device isolation with claim ownership, lease renewal, request limits, and body-size protection.
+- Persistent background Operit task metadata with restart recovery states.
+- Private Companion bridge health status and automated CI checks.
+
 ## [0.5.3] - 2026-09-09
 
 ### Fixed

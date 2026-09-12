@@ -30,7 +30,7 @@
 - **主链路（实时）**：服务器经 Tailscale 直连手机上的 Operit HTTP 服务，随叫随到。
 - **兜底链路（relay）**：手机开不了 VPN 时（公司网络、运营商限制等），插件自动把任务放进你自己服务器上的公网队列；手机上的 Operit 定时工作流轮询领取、执行并回传结果。轮询间隔受 Android WorkManager 限制，最小 15 分钟。
 - 两条链路自动切换：主链路失败才走兜底，恢复后自动切回。切换行为会记录在审计日志（`relay_fallback`）里。
-- Relay 任务领取有 5 分钟租约，手机执行较慢时会自动续租；手机中断后任务会重新进入队列。
+- Relay 任务领取有 5 分钟租约，手机执行较慢时会自动续租；手机中断后任务会重新进入队列。设置 `RELAY_REQUIRE_DEVICE_ID=1` 并让手机请求带 `X-Relay-Device-ID`，可避免多台手机互相领取任务；默认保持旧工作流兼容。
 
 ## 安装
 
@@ -94,10 +94,10 @@ sudo systemctl daemon-reload && sudo systemctl enable --now phone-agent-relay
 在 Operit 工作流编辑器里创建：
 
 1. **触发器**：`schedule` 类型，间隔 15 分钟（WorkManager 最小周期）。
-2. **执行节点**（`http_request` 工具）：`GET https://<你的域名>/poll`，请求头 `Authorization: Bearer <relay token>`。
+2. **执行节点**（`http_request` 工具）：`GET https://<你的域名>/poll`，请求头 `Authorization: Bearer <relay token>`。启用设备隔离时，再加 `X-Relay-Device-ID: phone-1`。
 3. **条件节点**：响应 JSON 里 `task` 不为 null 才继续，否则结束。
 4. **执行节点**（`send_message_to_ai` 工具）：内容引用 `task.message`，让 Operit 在手机上执行任务。
-5. **执行节点**（`http_request` 工具）：`POST https://<你的域名>/result`，body 为 `{"task_id": "<task.id>", "success": true, "ai_response": "<AI 回复>"}`。
+5. **执行节点**（`http_request` 工具）：`POST https://<你的域名>/result`，body 为 `{"task_id": "<task.id>", "success": true, "ai_response": "<AI 回复>"}`；启用设备隔离时同样带 `X-Relay-Device-ID`。
 
 ### 第三步：插件配置
 
@@ -105,6 +105,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now phone-agent-relay
 |---|---|
 | `relay_base_url` | `https://<你的域名>` |
 | `relay_token` | 与 relay 服务相同的 token |
+| `max_background_tasks` | 后台 Operit 任务并发上限，默认 `2`；元数据保存在 `tasks_path` |
+| `tasks_path` | 后台任务元数据文件，默认 `phone_agent_tasks.json` |
 
 之后 AstrBot 会在 Tailscale 失联时自动降级到 relay，恢复后自动切回直连。
 
@@ -118,6 +120,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now phone-agent-relay
 ## WebUI 里还能做什么
 
 Phone Control 页面支持连接测试、配置编辑、健康摘要、临时 App 限制、一次性定位、后台任务取消/重试、提醒取消、审计查看和 15 秒自动刷新。页面中的 Token 只显示是否已配置。
+
+Relay 默认限制普通请求每分钟 120 次、创建任务每分钟 30 次，可通过 `RELAY_RATE_LIMIT` 和 `RELAY_TASK_RATE_LIMIT` 调整。
 
 ## 安全说明
 

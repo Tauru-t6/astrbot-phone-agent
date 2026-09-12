@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile plugin modules
+        run: python -m py_compile main.py companion-context/main.py deploy/relay/relay_server.py
+      - name: Validate configuration JSON
+        run: python -m json.tool _conf_schema.json >/dev/null && python -m json.tool companion-context/_conf_schema.json >/dev/null
+      - name: Run relay tests
+        run: python -m unittest discover -s tests -v

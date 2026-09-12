@@ -234,6 +234,7 @@ Plugin astrbot_plugin_phone_agent (...)
 - 一次性定位读取入口。
 - 健康摘要、后台任务、提醒和最近审计记录。
 - 后台任务支持取消等待和重试，提醒支持直接取消；页面可开启 15 秒自动刷新。
+- 后台任务元数据会保存到 `tasks_path`，AstrBot 重启后仍能查看；重启时正在执行的任务会标记为中断。
 
 页面使用 AstrBot Dashboard 自带的登录鉴权。Token 只会显示“已配置”，不会回显。
 
@@ -364,6 +365,8 @@ Plugin astrbot_plugin_phone_agent (...)
 ### Private Companion 桥接
 
 `companion-context` 是独立的可选插件，默认 `enabled=false`。只有显式开启后才会安装桥接；如果还要让主动消息读取当前 App，需要同时开启主插件的 `enable_observe_tool=true` 和桥接配置的 `include_screen=true`。不开启时不会调用 Operit。
+
+Relay 支持多设备隔离。设置 `RELAY_REQUIRE_DEVICE_ID=1` 后，手机轮询、续租和回传时都要带 `X-Relay-Device-ID`；默认关闭以兼容已有工作流。默认限流为普通请求每分钟 120 次、创建任务每分钟 30 次，可用 `RELAY_RATE_LIMIT` 和 `RELAY_TASK_RATE_LIMIT` 调整。
 
 ## 九、健康数据（可选）
 

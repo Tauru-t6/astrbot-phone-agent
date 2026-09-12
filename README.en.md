@@ -235,6 +235,7 @@ The page provides:
 - One-shot location lookup.
 - Health summary, background tasks, reminders, and recent audit records.
 - Background tasks can be cancelled or retried, reminders can be cancelled, and the page supports 15-second auto-refresh.
+- Background task metadata is persisted in `tasks_path`; tasks interrupted by an AstrBot restart are marked as interrupted.
 
 The page uses AstrBot Dashboard authentication. The Operit Token is shown only as configured/not configured and is never echoed.
 
@@ -363,6 +364,8 @@ Messages, comments, likes, shares, deletes, uninstallations, payments, typing, a
 ### Private Companion bridge
 
 `companion-context` is optional and defaults to `enabled=false`. It is installed only when explicitly enabled. To let proactive messages inspect the current app, also enable `enable_observe_tool=true` in the phone plugin and `include_screen=true` in the bridge config. Otherwise it does not call Operit.
+
+Relay supports device isolation. Set `RELAY_REQUIRE_DEVICE_ID=1` and send `X-Relay-Device-ID` from the phone workflow for polling, lease renewal, and result submission. The default is disabled for compatibility. Rate limits default to 120 requests per minute and 30 task creations per minute, configurable with `RELAY_RATE_LIMIT` and `RELAY_TASK_RATE_LIMIT`.
 
 ## 9. Health data (optional)
 

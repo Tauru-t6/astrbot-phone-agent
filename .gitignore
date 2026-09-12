@@ -8,6 +8,7 @@ __pycache__/
 *.zip
 phone_agent_reminders.json
 phone_agent_policies.json
+phone_agent_tasks.json
 
 # runtime artifacts
 phone_agent_audit.jsonl
