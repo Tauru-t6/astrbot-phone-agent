@@ -2,20 +2,20 @@
 
 ## [0.5.4] - 2026-09-12
 
-### Added
+### 新增
 
-- Optional relay device isolation with claim ownership, lease renewal, request limits, and body-size protection.
-- Persistent background Operit task metadata with restart recovery states.
-- Private Companion bridge health status and automated CI checks.
+- Relay 支持可选的设备隔离、任务归属、租约续期、请求限流和请求体大小保护。
+- 后台 Operit 任务元数据持久化，AstrBot 重启后可恢复查看，并标记中断任务。
+- Private Companion 桥接状态检查和 GitHub Actions 自动检查。
 
 ## [0.5.3] - 2026-09-09
 
-### Fixed
+### 修复
 
-- Disabled unintended automatic Operit screen observation unless explicitly enabled.
-- Made the Private Companion bridge opt-in.
-- Added relay lease recovery and renewal, reminder retries, background task limits, and safer WebUI writes.
-- Upgraded the WebUI with task controls, reminder cancellation, automatic refresh, and clearer status cards.
+- 修复未显式开启时 Operit 自动读取当前 App 的问题。
+- Private Companion 桥接改为按需启用。
+- 增加 Relay 租约恢复与续期、提醒重试、后台任务并发限制和更安全的 WebUI 写操作。
+- WebUI 增加任务控制、提醒取消、自动刷新和更清晰的状态卡片。
 
 ## [0.5.2] - 2026-09-07
 
