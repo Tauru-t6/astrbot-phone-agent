@@ -2,8 +2,8 @@ name: astrbot_plugin_phone_agent
 display_name: Phone Control
 author: tauru
 description: |
-  让 AstrBot 通过手机上的 Operit AI 助手控制 Android 手机：聊天里说一句话就能开关应用、点按输入、查电量、读屏幕。主链路走 Tailscale 实时执行；断网时自动降级到自建 relay 队列。健康数据、定位、App 管控等高级功能按需开启。
-version: 0.5.5
+  让 AstrBot 控制你的 Android 手机：手机搭子 App（结构化 JSON 命令 + Shizuku 确定性执行）或 Operit 双后端。聊天里说一句话就能开关应用、管控视频 App、查电量、读屏幕。主链路走 Tailscale 实时执行；断网时自动降级到自建 relay 队列。健康数据、定位等高级功能按需开启。
+version: 0.6.1
 astrbot_version: ">=4.22.0"
 support_platforms:
   - aiocqhttp
