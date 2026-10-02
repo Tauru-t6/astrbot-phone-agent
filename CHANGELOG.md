@@ -1,10 +1,22 @@
 # Changelog
 
+## [0.6.2] - 2026-10-02
+
+- Completed authenticated App state and reminder routes, atomic persistence,
+  request idempotency, cancellation, and overdue recovery after restarts.
+- App-created reminders publish a single due event for phone polling; chat
+  reminders retain chat delivery. Expired reminders older than 24 hours are quiet.
+- Fixed App actions accidentally falling through to ADB, added real App/Operit
+  selection and backend-specific connection tests in the control page.
+- Added ordered configured/registered direct addresses, shared timeout budgets,
+  result identity validation, JSON-string output decoding and final device denials.
+- Added route, restart, validation and failover tests; corrected feature documentation.
+
 ## [0.6.1] - 2026-10-02
 
 ### Added
 
-- Added the Tauru Phone Agent App backend with structured JSON commands, app registration, timeline sync, reminders, and direct/relay routing.
+- Added the AstrBot Phone Agent App backend scaffolding. Reminder lifecycle and mode dispatch fixes are completed in 0.6.2.
 - Added LAN-first direct endpoints with Tailscale fallback through `app_direct_urls`.
 - Reorganized documentation around the two supported modes: `app` and `operit`.
 

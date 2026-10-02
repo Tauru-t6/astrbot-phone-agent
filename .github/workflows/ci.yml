@@ -13,8 +13,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Compile plugin modules
-        run: python -m py_compile main.py companion-context/main.py deploy/relay/relay_server.py
+        run: python -m py_compile main.py device_app.py companion-context/main.py deploy/relay/relay_server.py
       - name: Validate configuration JSON
         run: python -m json.tool _conf_schema.json >/dev/null && python -m json.tool companion-context/_conf_schema.json >/dev/null
-      - name: Run relay tests
-        run: python -m unittest discover -s tests -v
+      - name: Install test dependencies
+        run: python -m pip install quart pytest
+      - name: Run plugin and relay tests
+        run: python -m pytest tests -q

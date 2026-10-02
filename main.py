@@ -55,6 +55,7 @@ PROTECTED_POLICY_PACKAGES = frozenset({
     "com.android.settings",
     "com.android.systemui",
     "com.ai.assistance.operit",
+    "com.tauru.astrbotphoneagent",
 })
 
 
@@ -140,6 +141,13 @@ class PhoneAgentPlugin(Star):
         self._load_reminders()
         self._register_web_api()
 
+    async def terminate(self) -> None:
+        tasks = [*self._reminder_tasks.values(), *self._policy_expiry_tasks.values(), *self._operit_task_handles.values()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _bool_config(self, key: str, default: bool) -> bool:
         value = self.config.get(key, default)
         if isinstance(value, str):
@@ -177,6 +185,7 @@ class PhoneAgentPlugin(Star):
             ("/config", self._web_get_config, ["GET"], "Phone Agent configuration"),
             ("/config", self._web_save_config, ["POST"], "Save Phone Agent configuration"),
             ("/test_operit", self._web_test_operit, ["POST"], "Test Operit connection"),
+            ("/test_backend", self._web_test_backend, ["POST"], "Test the selected phone backend"),
             ("/app_policy", self._web_app_policy, ["POST"], "Apply an on-demand app policy", "policy_tools"),
             ("/sleep_mode", self._web_sleep_mode, ["POST"], "Control temporary sleep mode", "policy_tools"),
             ("/location", self._web_location, ["GET"], "Read phone location on demand", "location_tool"),
@@ -190,9 +199,9 @@ class PhoneAgentPlugin(Star):
             ("/device/command", self._web_device_command, ["POST"], "Send one structured command to the phone app", None),
             ("/device/test", self._web_device_test, ["POST"], "Ping the phone app through the current backend", None),
             ("/device/timeline", self._web_device_timeline, ["GET"], "Timeline items for the phone app sync", None),
-            ("/app/state", self._web_app_state, ["GET"], "Phone Buddy app state snapshot", None),
-            ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create a Phone Buddy reminder", None),
-            ("/app/reminders/cancel", self._web_app_reminder_cancel, ["POST"], "Cancel a Phone Buddy reminder", None),
+            ("/app/state", self._web_app_state, ["GET"], "AstrBot Phone Agent App state snapshot", None),
+            ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create an App reminder", None),
+            ("/app/reminders/cancel", self._web_app_reminder_cancel, ["POST"], "Cancel an App reminder", None),
         )
         for route in routes:
             gate = route[4] if len(route) > 4 else None
@@ -206,8 +215,10 @@ class PhoneAgentPlugin(Star):
             "use_private_companion_auth", "app_aliases_json", "sleep_guard_packages",
             "sleep_guard_exempt_apps", "operit_timeout_seconds", "max_background_tasks", "tasks_path",
             "app_command_timeout_seconds",
+            "app_direct_urls",
         )
         result = {key: self.config.get(key) for key in keys}
+        result["control_backend"] = self._control_backend()
         result["operit_token_configured"] = bool(self._operit_token())
         result["app_shared_token_configured"] = bool(self.device_app.shared_token())
         result["sleep_guard_mode"] = "on_demand"
@@ -242,8 +253,12 @@ class PhoneAgentPlugin(Star):
                 value = str(value or "").strip()
                 if len(value) > 2000:
                     return jsonify({"success": False, "error": f"value too long: {key}"}), 400
-                if key == "control_backend" and value not in {"operit", "adb", "app"}:
-                    return jsonify({"success": False, "error": "control_backend must be operit, adb or app"}), 400
+                if key == "control_backend":
+                    value = self._normalize_backend(value)
+                    if value not in {"operit", "adb", "app"}:
+                        return jsonify({"success": False, "error": "control_backend must be operit, app or legacy adb"}), 400
+                if key == "app_direct_urls" and any(not self.device_app.valid_base_url(url.strip()) for url in value.split(",") if url.strip()):
+                    return jsonify({"success": False, "error": "app_direct_urls must contain comma-separated http(s) base URLs"}), 400
                 if key == "app_aliases_json" and value:
                     try:
                         parsed = json.loads(value)
@@ -289,7 +304,7 @@ class PhoneAgentPlugin(Star):
     async def _web_location(self):
         if not self._enabled():
             return jsonify({"success": False, "error": "phone agent disabled"})
-        if not self._operit_token():
+        if self._control_backend() != "app" and not self._operit_token():
             return jsonify({"success": False, "error": "Operit HTTP token is not configured"})
         try:
             high_accuracy = str(request.args.get("high_accuracy", "false")).lower() in {"1", "true", "yes", "on"}
@@ -298,6 +313,9 @@ class PhoneAgentPlugin(Star):
         except (TypeError, ValueError):
             high_accuracy, include_address, timeout_seconds = False, False, 10
         try:
+            if self._control_backend() == "app":
+                return jsonify(await asyncio.to_thread(self.device_app.execute, "location", {
+                    "high_accuracy": high_accuracy, "include_address": include_address, "timeout_seconds": timeout_seconds}))
             result = await asyncio.to_thread(self._operit_location_sync, high_accuracy, timeout_seconds, include_address)
             return jsonify(result)
         except Exception as exc:
@@ -309,6 +327,18 @@ class PhoneAgentPlugin(Star):
         except asyncio.TimeoutError:
             result = {"available": False, "error": "Operit health check timed out"}
         return jsonify({"success": bool(result.get("available")), "operit": result})
+
+    async def _web_test_backend(self):
+        if not self._web_write_allowed() or not self._enabled():
+            return jsonify({"success": False, "error": "backend test is disabled or cross-origin"}), 403
+        backend = self._control_backend()
+        if backend == "app":
+            result = await asyncio.to_thread(self.device_app.health)
+        elif backend == "operit":
+            result = await asyncio.to_thread(self._operit_health_sync)
+        else:
+            result = {"available": False, "error": "Legacy ADB diagnostics are available through phone tools"}
+        return jsonify({"success": bool(result.get("available")), "backend": backend, "connection": result})
 
     @staticmethod
     def _web_write_allowed() -> bool:
@@ -322,11 +352,13 @@ class PhoneAgentPlugin(Star):
         device_app: dict[str, Any] | None = None
         if backend == "app":
             device_app = await asyncio.to_thread(self.device_app.health)
-        else:
+        elif backend == "operit":
             try:
                 operit = await asyncio.wait_for(asyncio.to_thread(self._operit_health_sync), timeout=3)
             except asyncio.TimeoutError:
                 operit = {"available": False, "error": "Operit health check timed out"}
+        else:
+            operit = None
         health = await asyncio.to_thread(self._read_health_db_sync, 1)
         return jsonify({
             "success": True,
@@ -410,16 +442,16 @@ class PhoneAgentPlugin(Star):
             if not self._web_write_allowed():
                 return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
             payload = await request.get_json(silent=True)
-            reminder_id = _text(payload.get("reminder_id"), 40) if isinstance(payload, dict) else ""
+            if not isinstance(payload, dict) or not self._finite_json(payload):
+                return jsonify({"success": False, "error": "JSON object required"}), 400
+            if not self._enabled() or not self._feature("reminder_tools"):
+                return jsonify({"success": False, "error": "reminders disabled"}), 403
+            reminder_id = _text(payload.get("reminder_id"), 80)
             if _text(payload.get("action"), 20).lower() not in {"cancel", "remove", "delete"} or not reminder_id:
                 return jsonify({"success": False, "error": "action=cancel and reminder_id are required"}), 400
-            item = self._reminders.pop(reminder_id, None)
-            task = self._reminder_tasks.pop(reminder_id, None)
-            if task:
-                task.cancel()
-            self._save_reminders()
-            self._audit("web_reminder_cancelled", reminder_id=reminder_id, success=bool(item))
-            return jsonify({"success": bool(item), "reminder_id": reminder_id, "status": "cancelled" if item else "not_found"})
+            cancelled = self._cancel_reminder(reminder_id)
+            self._audit("web_reminder_cancelled", reminder_id=reminder_id, success=cancelled)
+            return jsonify({"success": cancelled, "reminder_id": reminder_id, "status": "cancelled" if cancelled else "not_found"})
         return jsonify({"success": True, "reminders": self._reminders})
 
     async def _web_audit(self):
@@ -496,6 +528,8 @@ class PhoneAgentPlugin(Star):
     async def _web_device_timeline(self):
         try:
             since = float(request.args.get("since", "0"))
+            if not math.isfinite(since):
+                since = 0.0
         except (TypeError, ValueError):
             since = 0.0
         try:
@@ -526,7 +560,7 @@ class PhoneAgentPlugin(Star):
     def _reminder_view(self, reminder_id: str, item: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": reminder_id,
-            "text": _text(item.get("text"), 500),
+            "text": str(item.get("text", ""))[:500],
             "due": float(item.get("due", 0)),
             "source": item.get("source") if item.get("source") in {"app", "chat"} else "chat",
             "status": item.get("status") or "pending",
@@ -571,7 +605,7 @@ class PhoneAgentPlugin(Star):
         if previous:
             if previous["text"] != text or previous.get("minutes") != minutes:
                 return jsonify({"success": False, "error": "request_id already belongs to a different reminder", "error_code": "request_conflict"}), 409
-            return jsonify({"success": True, "reminder": {key: value for key, value in previous.items() if key != "minutes"}, "idempotent": True})
+            return jsonify({"success": True, "reminder": {key: value for key, value in previous.items() if key not in {"minutes", "finished_at"}}, "idempotent": True})
         if len(self._reminders) >= 500:
             return jsonify({"success": False, "error": "too many pending reminders", "error_code": "reminder_limit"}), 429
         reminder_id = "app-" + uuid.uuid4().hex[:12]
@@ -726,12 +760,23 @@ class PhoneAgentPlugin(Star):
             logger.warning("phone agent policy state file is invalid; ignoring it")
 
     def _save_reminders(self) -> None:
+        path = Path(self._reminder_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        # Keep completed idempotency receipts for 30 days; active ones never expire.
+        cutoff = time.time() - 30 * 86400
+        requests = {key: value for key, value in self._reminder_requests.items()
+                    if value.get("status") == "pending" or value.get("finished_at", time.time()) >= cutoff}
         try:
-            path = Path(self._reminder_path())
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(self._reminders, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as exc:
-            logger.debug("phone agent reminder save failed: %s", exc)
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump({"version": 2, "pending": self._reminders, "requests": requests},
+                          handle, ensure_ascii=False, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            self._reminder_requests = requests
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _load_reminders(self) -> None:
         try:
@@ -741,51 +786,95 @@ class PhoneAgentPlugin(Star):
             values = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(values, dict):
                 return
-            now = datetime.now().timestamp()
-            for reminder_id, item in values.items():
-                if isinstance(item, dict) and float(item.get("due", 0)) > now and item.get("text") and item.get("session"):
-                    self._reminders[str(reminder_id)] = item
-                    self._reminder_tasks[str(reminder_id)] = asyncio.create_task(self._run_reminder(str(reminder_id)))
+            pending = values.get("pending", {}) if values.get("version") == 2 else values
+            receipts = values.get("requests", {}) if values.get("version") == 2 else {}
+            if isinstance(receipts, dict):
+                self._reminder_requests = {key: dict(value) for key, value in receipts.items()
+                                           if isinstance(value, dict) and self._finite_json(value)
+                                           and all(field in value for field in ("id", "text", "due", "status"))}
+            if not isinstance(pending, dict):
+                return
+            for reminder_id, raw in pending.items():
+                if not isinstance(raw, dict) or not raw.get("text") or not self._finite_json(raw):
+                    continue
+                try:
+                    due = float(raw.get("due", 0))
+                except (ValueError, TypeError):
+                    continue
+                if not math.isfinite(due) or due <= 0:
+                    continue
+                item = dict(raw, due=due, source=raw.get("source", "chat"), status="pending")
+                if item["source"] not in {"app", "chat"} or (item["source"] == "chat" and not item.get("session")):
+                    continue
+                self._reminders[str(reminder_id)] = item
+                self._reminder_tasks[str(reminder_id)] = asyncio.create_task(self._run_reminder(str(reminder_id)))
         except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
             logger.warning("phone agent reminders file is invalid; ignoring it")
 
-    async def _run_reminder(self, reminder_id: str) -> None:
-        item = self._reminders.get(reminder_id)
-        if not item:
-            return
+    def _finish_reminder(self, reminder_id: str, status: str) -> dict[str, Any] | None:
+        item = self._reminders.pop(reminder_id, None)
+        if item is None:
+            return None
+        request_id = item.get("request_id")
+        previous = dict(self._reminder_requests.get(request_id, {}))
+        if previous:
+            self._reminder_requests[request_id] = {**previous, "status": status, "finished_at": time.time()}
         try:
-            delay = max(0.0, float(item.get("due", 0)) - datetime.now().timestamp())
-            await asyncio.sleep(delay)
-            if item:
-                sent = False
-                for attempt in range(3):
-                    try:
-                        await self.context.send_message(item["session"], MessageChain().message("提醒：" + str(item["text"])))
-                        sent = True
-                        break
-                    except Exception as exc:
-                        if attempt == 2:
-                            logger.warning("phone agent reminder failed after retries: %s", exc)
-                            item["due"] = datetime.now().timestamp() + 15 * 60
-                            self._save_reminders()
-                            self._reminder_tasks[reminder_id] = asyncio.create_task(self._run_reminder(reminder_id))
-                        else:
-                            await asyncio.sleep(2 ** attempt)
-                if sent:
-                    self._reminders.pop(reminder_id, None)
-                    self._reminder_tasks.pop(reminder_id, None)
-                    self._save_reminders()
-                    self._audit("reminder_sent", reminder_id=reminder_id)
+            self._save_reminders()
+        except OSError:
+            self._reminders[reminder_id] = item
+            if previous:
+                self._reminder_requests[request_id] = previous
+            raise
+        return item
+
+    def _cancel_reminder(self, reminder_id: str) -> bool:
+        item = self._finish_reminder(reminder_id, "cancelled")
+        task = self._reminder_tasks.pop(reminder_id, None)
+        if task and task is not asyncio.current_task():
+            task.cancel()
+        if item:
+            try:
+                self.device_app.timeline_append("reminder", "提醒已取消", str(item["text"]),
+                                                event="reminder_cancelled", reminder_id=reminder_id)
+            except OSError:
+                logger.warning("phone agent could not save cancellation timeline")
+        return item is not None
+
+    async def _run_reminder(self, reminder_id: str) -> None:
+        try:
+            while reminder_id in self._reminders:
+                item = self._reminders[reminder_id]
+                await asyncio.sleep(max(0.0, float(item["due"]) - time.time()))
+                if not self._enabled() or not self._feature("reminder_tools"):
+                    await asyncio.sleep(60)
+                    continue
+                try:
+                    # Catch up recent overdue reminders after a restart. Older
+                    # reminders remain visible as expired, without a late alert.
+                    expired = time.time() - float(item["due"]) > 86400
+                    event = "reminder_expired" if expired else "reminder_due"
                     self.device_app.timeline_append(
-                        "reminder",
-                        "提醒",
-                        str(item["text"])[:300],
-                    )
-                    self._push_phone_notification("提醒", str(item["text"]))
+                        "reminder", "提醒已过期" if expired else "提醒", str(item["text"]),
+                        event=event, notify=not expired, reminder_id=reminder_id,
+                        notification_id="reminder-" + reminder_id if not expired else None)
+                    if not expired and item.get("source", "chat") == "chat" and not item.get("chat_delivered"):
+                        # Existing chat reminders retain their originating chat.
+                        # App reminders deliberately have no chat session.
+                        await asyncio.wait_for(self.context.send_message(
+                            item["session"], MessageChain().message("提醒：" + str(item["text"]))), timeout=30)
+                        item["chat_delivered"] = True
+                    self._finish_reminder(reminder_id, "expired" if expired else "fired")
+                    self._audit("reminder_expired" if expired else "reminder_sent", reminder_id=reminder_id)
+                    return
+                except Exception as exc:
+                    logger.warning("phone agent reminder delivery will retry: %s", _text(exc, 200))
+                    await asyncio.sleep(60)
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            logger.warning("phone agent reminder failed: %s", exc)
+        finally:
+            if self._reminder_tasks.get(reminder_id) is asyncio.current_task():
+                self._reminder_tasks.pop(reminder_id, None)
 
     def _app_aliases(self) -> dict[str, str]:
         defaults = {
@@ -826,8 +915,9 @@ class PhoneAgentPlugin(Star):
         except (TypeError, ValueError):
             return 120.0
 
-    def _control_backend(self) -> str:
-        value = _text(self.config.get("control_backend"), 30).lower()
+    @staticmethod
+    def _normalize_backend(value: Any) -> str:
+        value = _text(value, 30).lower()
         aliases = {
             "phone_buddy": "app",
             "native_app": "app",
@@ -835,7 +925,10 @@ class PhoneAgentPlugin(Star):
             "operitai": "operit",
             "operit_ai": "operit",
         }
-        value = aliases.get(value, value)
+        return aliases.get(value, value)
+
+    def _control_backend(self) -> str:
+        value = self._normalize_backend(self.config.get("control_backend"))
         return value if value in {"operit", "adb", "app"} else "operit"
 
     def _operit_action_prompt(self, action: str, kwargs: dict[str, Any]) -> str:
@@ -1675,22 +1768,25 @@ class PhoneAgentPlugin(Star):
                 "text": text,
                 "session": str(getattr(event, "unified_msg_origin", "")),
                 "due": datetime.now().timestamp() + delay * 60,
+                "source": "chat",
+                "status": "pending",
             }
+            try:
+                self._save_reminders()
+            except OSError:
+                self._reminders.pop(reminder_id, None)
+                return json.dumps({"success": False, "error": "could not persist reminder"})
             self._reminder_tasks[reminder_id] = asyncio.create_task(self._run_reminder(reminder_id))
-            self._save_reminders()
             self._audit("reminder_created", reminder_id=reminder_id, minutes=delay)
             self.device_app.timeline_append(
                 "reminder",
                 f"{delay} 分钟后提醒你",
                 text[:300],
+                event="reminder_created", reminder_id=reminder_id,
             )
             return json.dumps({"success": True, "reminder_id": reminder_id, "minutes": delay}, ensure_ascii=False)
         if action in {"cancel", "remove", "delete"}:
-            item = self._reminders.pop(reminder_id, None)
-            task = self._reminder_tasks.pop(reminder_id, None)
-            if task:
-                task.cancel()
-            self._save_reminders()
+            item = self._cancel_reminder(reminder_id)
             self._audit("reminder_cancelled", reminder_id=reminder_id)
             return json.dumps({"success": bool(item), "reminder_id": reminder_id, "status": "cancelled" if item else "not_found"}, ensure_ascii=False)
         return json.dumps({
@@ -1865,7 +1961,8 @@ class PhoneAgentPlugin(Star):
             status = await asyncio.to_thread(self.device_app.execute, "status", {})
             if status.get("success"):
                 output = status.get("output") or {}
-                self.device_app.record_device_status(output.get("device") or output)
+                if isinstance(output, dict):
+                    self.device_app.record_device_status(output.get("device") or output)
                 return json.dumps({
                     "success": True,
                     "backend": "app",
@@ -2070,10 +2167,10 @@ class PhoneAgentPlugin(Star):
         confirmed: bool = False,
         **_kwargs: Any,
     ) -> str:
-        """Execute one allowlisted phone action through Operit and Shizuku.
+        """Execute one allowlisted phone action through the selected backend.
 
-        Operit is the primary backend and performs screen-aware execution. ADB
-        is only an optional diagnostic fallback when control_backend=adb.
+        App mode uses structured commands through Shizuku. Operit mode performs
+        screen-aware execution. ADB is legacy diagnostics only.
         For phone requests, prefer this tool or operit_task over the generic
         astrbot_execute_shell tool.
 
@@ -2131,6 +2228,12 @@ class PhoneAgentPlugin(Star):
             return json.dumps(result, ensure_ascii=False)
         if self._control_backend() == "operit":
             result = await self._operit_action(action, kwargs)
+            return json.dumps(result, ensure_ascii=False)
+        if self._control_backend() == "app":
+            if action not in COMMAND_ACTIONS:
+                return json.dumps({"success": False, "backend": "app", "error_code": "unsupported_action",
+                                   "error": "App mode does not support arbitrary tap, swipe, text input or workflows; use Operit mode."})
+            result = await asyncio.to_thread(self.device_app.execute, action, kwargs)
             return json.dumps(result, ensure_ascii=False)
         async with self._lock:
             ready, detail = await self._ensure_device()
@@ -2196,7 +2299,7 @@ class PhoneAgentPlugin(Star):
                 "action": normalized,
                 "package": package,
                 "backend": "app",
-                "state": _text((result.get("output") or {}).get("state"), 20),
+                "state": _text(result.get("output", {}).get("state"), 20) if isinstance(result.get("output"), dict) else "",
                 "verified": bool(result.get("success")),
                 "error": _text(result.get("error"), 240) if not result.get("success") else "",
             }

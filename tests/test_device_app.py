@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -65,13 +66,13 @@ class RegisterTests(unittest.TestCase):
     def test_register_stores_endpoint(self):
         result = self.backend.register({
             "device_id": "phone-abcd1234",
-            "base_url": "http://100.113.6.85:8260",
+            "base_url": "http://phone-tailnet.example:8260",
             "app_version": "0.1.0",
         })
         self.assertTrue(result["success"])
         self.assertEqual(result["schema_version"], device_app.COMMAND_SCHEMA_VERSION)
         registration = self.backend.registration()
-        self.assertEqual(registration["base_url"], "http://100.113.6.85:8260")
+        self.assertEqual(registration["base_url"], "http://phone-tailnet.example:8260")
         self.assertEqual([e[0] for e in self.audit.events], ["device_app_registered"])
 
     def test_register_rejects_bad_payload(self):
@@ -82,7 +83,7 @@ class RegisterTests(unittest.TestCase):
     def test_fingerprint_mismatch_rejected(self):
         self.assertFalse(self.backend.register({
             "device_id": "phone-abcd1234",
-            "base_url": "http://100.113.6.85:8260",
+            "base_url": "http://phone-tailnet.example:8260",
             "token_fingerprint": "sha256:deadbeefdeadbeef",
         })["success"])
 
@@ -90,7 +91,7 @@ class RegisterTests(unittest.TestCase):
         fingerprint = self.backend._token_fingerprint()
         self.assertTrue(self.backend.register({
             "device_id": "phone-abcd1234",
-            "base_url": "http://100.113.6.85:8260",
+            "base_url": "http://phone-tailnet.example:8260",
             "token_fingerprint": fingerprint,
         })["success"])
 
@@ -110,6 +111,8 @@ class ExecuteTests(unittest.TestCase):
         self._register()
 
         def fake_http(url, token, method="GET", payload=None, timeout=15.0):
+            if url.endswith("/health"):
+                return {"success": True}
             if url.endswith("/command"):
                 return {
                     "type": "result",
@@ -131,10 +134,12 @@ class ExecuteTests(unittest.TestCase):
     def test_relay_fallback_when_direct_down(self):
         # No registration: direct fails with not_registered, relay takes over.
         responses = []
+        sent_envelope = {}
 
         def fake_relay(url, token, method="GET", payload=None, timeout=15.0):
             if url.endswith("/task") and method == "POST":
                 responses.append("push")
+                sent_envelope.update(json.loads(payload["message"]))
                 return {"success": True, "task_id": "r1"}
             if url.endswith("/result/r1"):
                 return {
@@ -143,7 +148,7 @@ class ExecuteTests(unittest.TestCase):
                         "success": True,
                         "ai_response": json.dumps({
                             "type": "result",
-                            "command_id": "c-x",
+                            "command_id": sent_envelope["command_id"],
                             "success": True,
                             "action": "ping",
                             "output": {"pong": True},
@@ -180,6 +185,108 @@ class ExecuteTests(unittest.TestCase):
         self.assertIsNone(self.backend.last_status()["battery_percent"])
         self.backend.record_device_status(None)
         self.assertIsNotNone(self.backend.last_status())
+
+
+class FailoverTests(unittest.TestCase):
+    def setUp(self):
+        self.config = FakeConfig(app_shared_token="test", app_direct_urls="http://lan.example:8260,http://tailnet.example:8260",
+                                 relay_base_url="https://relay.example", relay_token="test", app_command_timeout_seconds=20)
+        self.backend = device_app.DeviceAppBackend(self.config, RecordingAudit())
+
+    @staticmethod
+    def result(envelope, **updates):
+        return {"type": "result", "schema_version": 1, "command_id": envelope["command_id"],
+                "action": envelope["action"], "success": True, "output": '{"battery_percent":80}', **updates}
+
+    def test_configured_lan_wins_over_old_tailnet_registration_and_survives_restart(self):
+        self.backend.register({"device_id": "test", "base_url": "http://tailnet.example:8260"})
+        self.assertEqual(self.backend.direct_urls(), ["http://lan.example:8260", "http://tailnet.example:8260"])
+        restarted = device_app.DeviceAppBackend(self.config, RecordingAudit())
+        self.assertEqual(restarted.direct_urls(), self.backend.direct_urls())
+
+    def test_lan_offline_uses_tailnet_without_posting_to_lan(self):
+        calls = []
+        def http(url, token, method="GET", payload=None, timeout=15):
+            calls.append((url, method))
+            if "lan.example" in url:
+                return {"success": False, "error": "offline"}
+            if url.endswith("/health"):
+                return {"success": True}
+            return self.result(payload)
+        with patch.object(self.backend, "_http_json", side_effect=http):
+            result = self.backend.execute("status")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["output"], {"battery_percent": 80})
+        self.assertEqual(calls, [("http://lan.example:8260/health", "GET"),
+                                 ("http://tailnet.example:8260/health", "GET"),
+                                 ("http://tailnet.example:8260/command", "POST")])
+
+    def test_explicit_denial_does_not_replay_on_another_route(self):
+        calls = []
+        def http(url, token, method="GET", payload=None, timeout=15):
+            calls.append(url)
+            return {"success": True} if url.endswith("/health") else self.result(payload, success=False, error_code="denied")
+        with patch.object(self.backend, "_http_json", side_effect=http):
+            result = self.backend.execute("close_app", {"package": "a.b"})
+        self.assertEqual(result["error_code"], "denied")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["backend"], "direct")
+
+    def test_transport_failure_reuses_command_id_for_tailnet_and_relay(self):
+        envelopes = []
+        def http(url, token, method="GET", payload=None, timeout=15):
+            if url.endswith("/health"):
+                return {"success": True}
+            if url.endswith("/command"):
+                envelopes.append(payload)
+                return {"success": False, "error": "connection dropped"}
+            if url.endswith("/task"):
+                envelopes.append(json.loads(payload["message"]))
+                return {"success": True, "task_id": "test"}
+            return {"success": True, "result": {"ai_response": json.dumps(self.result(envelopes[-1]))}}
+        with patch.object(self.backend, "_http_json", side_effect=http):
+            result = self.backend.execute("status")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["backend"], "relay")
+        self.assertEqual(len(envelopes), 3)
+        self.assertEqual(len({item["command_id"] for item in envelopes}), 1)
+
+    def test_mismatched_result_is_rejected_and_not_replayed(self):
+        for update in ({"command_id": "another"}, {"action": "home"}, {"type": "other"}, {"schema_version": 2}):
+            def http(url, token, method="GET", payload=None, timeout=15):
+                return {"success": True} if url.endswith("/health") else self.result(payload, **update)
+            with patch.object(self.backend, "_http_json", side_effect=http) as call:
+                result = self.backend.execute("status")
+            self.assertEqual(result["error_code"], "invalid_result")
+            self.assertEqual(call.call_count, 2)
+
+    def test_direct_and_relay_share_one_timeout_budget(self):
+        clock = [0.0]
+        def http(url, token, method="GET", payload=None, timeout=15):
+            self.assertLessEqual(timeout, 20 - clock[0])
+            clock[0] += timeout
+            return {"success": False, "error": "timeout"}
+        with patch.object(device_app.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(self.backend, "_http_json", side_effect=http):
+            self.backend.execute("ping")
+        self.assertLessEqual(clock[0], 20)
+
+    def test_timeline_atomic_restart_and_reminder_event_deduplication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.config["app_state_path"] = str(Path(directory) / "state.json")
+            backend = device_app.DeviceAppBackend(self.config, RecordingAudit())
+            first = backend.timeline_append("reminder", "提醒", "喝水", event="reminder_due", notify=True,
+                                            reminder_id="r1", notification_id="reminder-r1")
+            restarted = device_app.DeviceAppBackend(self.config, RecordingAudit())
+            same = restarted.timeline_append("reminder", "提醒", "喝水", event="reminder_due", notify=True,
+                                             reminder_id="r1", notification_id="reminder-r1")
+            self.assertEqual(first, same)
+            self.assertEqual(len(restarted.timeline_since(0)), 1)
+            with patch.object(device_app.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    restarted.timeline_append("reminder", "bad", "bad")
+            self.assertEqual(restarted.timeline_since(0), [first])
+            self.assertEqual(json.loads(Path(self.config["app_state_path"]).read_text(encoding="utf-8"))["timeline"], [first])
 
 
 if __name__ == "__main__":

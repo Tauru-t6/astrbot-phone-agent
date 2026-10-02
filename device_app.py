@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Device-app backend: structured command transport to the Phone Buddy app.
+"""Structured command transport to AstrBot Phone Agent App.
 
 This module replaces the Operit bridge when control_backend=app. The phone
-runs our own app (D:\\wordkspace\\phone_agent_app\\app) which executes a
+runs AstrBot Phone Agent App, which executes a
 closed set of structured JSON commands through Shizuku, instead of asking an
 on-device agent to interpret natural-language prompts.
 
-Wire contract: docs/APP_PLUGIN_CONTRACT_V1.md. Envelope v1, see
-COMMAND_SCHEMA_VERSION. Every change here must bump that version and update
-the contract doc.
+Wire contract: docs/APP_API_V2.md. Command envelope remains schema v1;
+the dashboard app API has its own version.
 """
 from __future__ import annotations
 
@@ -20,6 +19,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 from pathlib import Path
 from typing import Any
@@ -68,7 +68,7 @@ DANGEROUS_ACTIONS = frozenset({
 
 MAX_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 200
-_HEALTH_TIMEOUT_SECONDS = 6
+_HEALTH_TIMEOUT_SECONDS = 3
 _REGISTER_TIMEOUT_SECONDS = 8
 
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
@@ -194,6 +194,8 @@ class DeviceAppBackend:
             value = float(self._config.get("app_command_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS))
         except (TypeError, ValueError):
             return DEFAULT_COMMAND_TIMEOUT_SECONDS
+        if not math.isfinite(value):
+            return DEFAULT_COMMAND_TIMEOUT_SECONDS
         return max(10.0, min(value, MAX_COMMAND_TIMEOUT_SECONDS))
 
     def relay_url(self) -> str:
@@ -212,7 +214,16 @@ class DeviceAppBackend:
         registered = self.registration() or {}
         announced = registered.get("base_urls") or [registered.get("base_url", "")]
         values = configured + [str(item).strip().rstrip("/") for item in announced if str(item).strip()]
-        return list(dict.fromkeys(item for item in values if item.startswith(("http://", "https://"))))
+        return list(dict.fromkeys(item for item in values if self.valid_base_url(item)))[:8]
+
+    @staticmethod
+    def valid_base_url(value: str) -> bool:
+        try:
+            parts = urlsplit(value)
+            return bool(parts.scheme in {"http", "https"} and parts.hostname and parts.port != 0
+                        and not parts.username and not parts.password and not parts.query and not parts.fragment)
+        except ValueError:
+            return False
 
     # ---------- registration ----------
 
@@ -229,7 +240,7 @@ class DeviceAppBackend:
         token_fingerprint = _text(payload.get("token_fingerprint"), 100)
         if not device_id or not re.fullmatch(r"[A-Za-z0-9._-]+", device_id):
             return {"success": False, "error": "device_id is required"}
-        if not base_url or not base_url.startswith(("http://", "https://")):
+        if not base_url or not self.valid_base_url(base_url) or any(not self.valid_base_url(url) for url in base_urls):
             return {"success": False, "error": "base_url must be an http(s) URL"}
         expected_fingerprint = self._token_fingerprint()
         if (
@@ -291,13 +302,17 @@ class DeviceAppBackend:
             return dict(self._last_status) if self._last_status else None
 
     def _record_result(self, result: dict[str, Any]) -> None:
+        try:
+            finished_at = float(result.get("finished_at") or time.time())
+        except (TypeError, ValueError):
+            finished_at = time.time()
         entry = {
             "command_id": _text(result.get("command_id"), 64),
             "action": _text(result.get("action"), 40),
             "success": bool(result.get("success")),
             "error_code": _text(result.get("error_code"), 40),
             "error": _text(result.get("error"), 200),
-            "finished_at": float(result.get("finished_at") or time.time()),
+            "finished_at": finished_at if math.isfinite(finished_at) else time.time(),
         }
         with self._lock:
             self._recent_results.append(entry)
@@ -333,7 +348,13 @@ class DeviceAppBackend:
                 data = json.loads(response.read(4 * 1024 * 1024).decode("utf-8", errors="replace"))
             return data if isinstance(data, dict) else {"success": False, "error": "device returned invalid JSON"}
         except urllib.error.HTTPError as exc:
-            return {"success": False, "error": f"device HTTP {exc.code}"}
+            try:
+                data = json.loads(exc.read(4 * 1024 * 1024).decode("utf-8"))
+                if isinstance(data, dict) and data.get("type") == "result":
+                    return data
+            except (ValueError, OSError):
+                pass
+            return {"success": False, "error_code": "http_error", "error": f"device HTTP {exc.code}"}
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             return {"success": False, "error": f"device connection failed: {str(exc)[:180]}"}
 
@@ -343,9 +364,13 @@ class DeviceAppBackend:
         if not urls:
             return {"available": False, "error": "phone app has not registered; open the app once"}
         result = {"success": False, "error": "phone app direct endpoints unavailable"}
-        active_url = urls[0]
+        active_url = ""
+        deadline = time.monotonic() + min(self.command_timeout(), 12.0)
         for candidate in urls:
-            result = self._http_json(candidate + "/health", self.shared_token(), timeout=3.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            result = self._http_json(candidate + "/health", self.shared_token(), timeout=min(_HEALTH_TIMEOUT_SECONDS, remaining))
             if result.get("success"):
                 active_url = candidate
                 break
@@ -363,56 +388,86 @@ class DeviceAppBackend:
         if not urls:
             return {"success": False, "error_code": "not_registered", "error": "phone app has not registered"}
         last = {"success": False, "error_code": "direct_unavailable", "error": "phone app direct endpoints unavailable"}
-        for base_url in urls:
-            result = self._http_json(base_url + "/command", self.shared_token(), method="POST", payload=envelope, timeout=min(timeout, 15.0))
-            if result.get("command_id"):
-                self._record_result(result)
-                return result
+        deadline = time.monotonic() + timeout
+        for index, base_url in enumerate(urls):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            health = self._http_json(base_url + "/health", self.shared_token(), timeout=min(_HEALTH_TIMEOUT_SECONDS, remaining))
+            if not health.get("success"):
+                last = health
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            routes_left = len(urls) - index + int(self.relay_enabled())
+            attempt_timeout = min(remaining, max(10.0, remaining / routes_left))
+            result = self._http_json(base_url + "/command", self.shared_token(), method="POST", payload=envelope, timeout=attempt_timeout)
+            if result.get("command_id") or result.get("type") == "result" or result.get("success"):
+                # A matching denial is final. A malformed result is also final:
+                # the command may already have run, so do not replay it.
+                return self._normalize_result(result, envelope)
+            if result.get("error_code") in {"denied", "bad_args", "unsupported_action", "unauthorized"}:
+                return {**result, "command_id": envelope["command_id"], "action": envelope["action"]}
             last = result
         return last
+
+    def _normalize_result(self, result: Any, envelope: dict[str, Any]) -> dict[str, Any]:
+        if (not isinstance(result, dict) or result.get("type") != "result"
+                or result.get("schema_version", 1) != COMMAND_SCHEMA_VERSION
+                or result.get("command_id") != envelope["command_id"]
+                or result.get("action") != envelope["action"]
+                or not isinstance(result.get("success"), bool)):
+            return {"success": False, "error_code": "invalid_result", "error": "phone result does not match the command",
+                    "command_id": envelope["command_id"], "action": envelope["action"]}
+        result = dict(result)
+        output = result.get("output")
+        if isinstance(output, str):
+            try:
+                parsed = json.loads(output)
+                if isinstance(parsed, (dict, list)):
+                    result["output"] = parsed
+            except ValueError:
+                pass
+        self._record_result(result)
+        return result
 
     def _relay_submit(self, envelope: dict[str, Any], timeout: float) -> dict[str, Any]:
         if not self.relay_enabled():
             return {"success": False, "error_code": "relay_unconfigured", "error": "relay is not configured"}
+        deadline = time.monotonic() + timeout
         push = self._http_json(
             self.relay_url() + "/task",
             self.relay_token(),
             method="POST",
             payload={"message": json.dumps(envelope, ensure_ascii=False)},
-            timeout=15,
+            timeout=min(15, timeout),
         )
         if not push.get("success"):
             return {"success": False, "error_code": "relay_push_failed", "error": _text(push.get("error"), 200)}
         task_id = str(push.get("task_id", ""))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            wait = 15 if time.time() + 15 < deadline else max(1.0, deadline - time.time())
-            time.sleep(wait)
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             result = self._http_json(
-                f"{self.relay_url()}/result/{task_id}", self.relay_token(), timeout=15
+                f"{self.relay_url()}/result/{task_id}", self.relay_token(), timeout=min(15, remaining)
             )
             payload = result.get("result") or {}
+            if not isinstance(payload, dict):
+                return self._normalize_result(None, envelope)
             raw_message = str(payload.get("ai_response") or "")
             status = _text(payload.get("status"), 20)
             if status in {"pending", "claimed", "running"}:
-                self._http_json(
-                    self.relay_url() + "/renew",
-                    self.relay_token(),
-                    method="POST",
-                    payload={"task_id": task_id},
-                    timeout=8,
-                )
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
                 continue
             if raw_message:
                 try:
                     envelope_result = json.loads(raw_message)
                 except json.JSONDecodeError:
                     envelope_result = {"success": False, "error_code": "bad_result", "error": "phone returned non-JSON result"}
-                if isinstance(envelope_result, dict):
-                    self._record_result(envelope_result)
-                    return envelope_result
+                return self._normalize_result(envelope_result, envelope)
             if not result.get("success"):
                 return {"success": False, "error_code": "relay_lost_task", "error": _text(result.get("error"), 200)}
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
         return {
             "success": False,
             "error_code": "timeout",
@@ -444,23 +499,19 @@ class DeviceAppBackend:
         except ValueError as exc:
             return {"success": False, "action": action, "error_code": "unsupported_action", "error": str(exc)[:200]}
         timeout = self.command_timeout()
+        deadline = time.monotonic() + timeout
         direct = self._direct_command(envelope, timeout)
-        if direct.get("success") or direct.get("error_code") not in {"not_registered", None} and self.relay_enabled() and direct.get("error_code") in {"not_registered"}:
-            # not_registered is a hard failure: the phone cannot be reached via
-            # relay either until it registers, but relay polling does not need
-            # registration, so still fall through to relay.
-            pass
-        if direct.get("success"):
-            direct["backend"] = "direct"
-            self._audit("device_command", action=action, command_id=envelope["command_id"], backend="direct", success=True)
-            return direct
-        if direct.get("error_code") != "not_registered" and not self.relay_enabled():
-            self._audit("device_command", action=action, command_id=envelope["command_id"], backend="direct", success=False, error=_text(direct.get("error"), 160))
+        if direct.get("command_id") or direct.get("success") or not self.relay_enabled():
+            self._audit("device_command", action=action, command_id=envelope["command_id"], backend="direct", success=bool(direct.get("success")), error=_text(direct.get("error"), 160))
             direct["backend"] = "direct"
             return direct
         if direct.get("error_code") != "not_registered":
             self._audit("relay_fallback", action=action, reason=_text(direct.get("error"), 160))
-        relay_result = self._relay_submit(envelope, timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"success": False, "action": action, "command_id": envelope["command_id"], "backend": "direct",
+                    "error_code": "timeout", "error": "command transport budget exhausted"}
+        relay_result = self._relay_submit(envelope, remaining)
         relay_result.setdefault("action", action)
         relay_result["backend"] = "relay"
         self._audit("device_command", action=action, command_id=envelope["command_id"], backend="relay", success=bool(relay_result.get("success")))
@@ -470,6 +521,6 @@ class DeviceAppBackend:
 def _int_or_none(value: Any) -> int | None:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None

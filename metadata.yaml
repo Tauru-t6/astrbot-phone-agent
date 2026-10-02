@@ -2,8 +2,8 @@ name: astrbot_plugin_phone_agent
 display_name: Phone Control
 author: tauru
 description: |
-  AstrBot Android phone control with two modes: Tauru Phone Agent App (structured JSON + Shizuku) or OperitAI (natural-language UI tasks). Direct LAN/Tailscale routing, relay fallback, reminders, timeline sync, and optional health, location, policy, and audit tools.
-version: 0.6.1
+  AstrBot Android phone control with two modes: AstrBot Phone Agent App (structured JSON + Shizuku) or OperitAI (natural-language UI tasks). Direct LAN/Tailscale routing, relay fallback, reminders, timeline sync, and optional health, location, policy, and audit tools.
+version: 0.6.2
 astrbot_version: ">=4.22.0"
 support_platforms:
   - aiocqhttp

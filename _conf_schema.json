@@ -37,22 +37,22 @@
   "control_backend": {
     "type": "text",
     "default": "operit",
-    "description": "Product mode: app = Phone Buddy own frontend with structured Shizuku commands; operit = OperitAI natural-language bridge. Legacy aliases phone_buddy and operitai are accepted. adb is diagnostic-only."
+    "description": "Product mode: app = AstrBot Phone Agent App own frontend with structured Shizuku commands; operit = OperitAI natural-language bridge. Legacy aliases phone_buddy and operitai are accepted. adb is diagnostic-only."
   },
   "app_shared_token": {
     "type": "text",
     "default": "",
-    "description": "Shared bearer token between this plugin and the Phone Buddy app (control_backend=app)"
+    "description": "Shared bearer token between this plugin and the AstrBot Phone Agent App app (control_backend=app)"
   },
   "app_direct_urls": {
     "type": "text",
     "default": "",
-    "description": "Ordered direct Phone Buddy endpoints, comma-separated. Put the home LAN URL first and Tailscale second, for example http://192.168.2.110:8260,http://100.x.y.z:8260"
+    "description": "Comma-separated ordered App endpoints, e.g. http://phone-lan.example:8260,http://phone-tailnet.example:8260. Configured endpoints precede registration."
   },
   "app_command_timeout_seconds": {
     "type": "int",
     "default": 200,
-    "description": "Timeout in seconds for one structured command sent to the Phone Buddy app"
+    "description": "Timeout in seconds for one structured command sent to the AstrBot Phone Agent App app"
   },
   "app_aliases_json": {
     "type": "text",
@@ -158,5 +158,10 @@
     "type": "bool",
     "default": false,
     "description": "Enable phone_audit tool and /audit route"
+  },
+  "app_state_path": {
+    "type": "text",
+    "default": "phone_agent_app_state.json",
+    "description": "Atomic persistent App timeline (latest 100 events)."
   }
 }
