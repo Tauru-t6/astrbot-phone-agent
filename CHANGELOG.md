@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1] - 2026-10-02
+
+### Added
+
+- Added the Tauru Phone Agent App backend with structured JSON commands, app registration, timeline sync, reminders, and direct/relay routing.
+- Added LAN-first direct endpoints with Tailscale fallback through `app_direct_urls`.
+- Reorganized documentation around the two supported modes: `app` and `operit`.
+
 ## [0.5.5] - 2026-09-12
 
 ### 变更

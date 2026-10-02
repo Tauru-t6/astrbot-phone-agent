@@ -37,7 +37,7 @@
   "control_backend": {
     "type": "text",
     "default": "operit",
-    "description": "Phone control backend: operit, adb, or app (the Phone Buddy Android app with structured commands)"
+    "description": "Product mode: app = Phone Buddy own frontend with structured Shizuku commands; operit = OperitAI natural-language bridge. Legacy aliases phone_buddy and operitai are accepted. adb is diagnostic-only."
   },
   "app_shared_token": {
     "type": "text",

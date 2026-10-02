@@ -828,6 +828,14 @@ class PhoneAgentPlugin(Star):
 
     def _control_backend(self) -> str:
         value = _text(self.config.get("control_backend"), 30).lower()
+        aliases = {
+            "phone_buddy": "app",
+            "native_app": "app",
+            "own_frontend": "app",
+            "operitai": "operit",
+            "operit_ai": "operit",
+        }
+        value = aliases.get(value, value)
         return value if value in {"operit", "adb", "app"} else "operit"
 
     def _operit_action_prompt(self, action: str, kwargs: dict[str, Any]) -> str:

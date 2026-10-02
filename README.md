@@ -1,141 +1,124 @@
-# Phone Control · AstrBot 手机控制插件
+# AstrBot Phone Agent
 
-让 AstrBot 通过 [Operit](https://github.com/Mavaebrook/Operit)（安卓 AI 助手）控制你的 Android 手机。在聊天里说"打开哔哩哔哩"、"手机还剩多少电"、"我附近有什么好吃的"，AstrBot 就会调用 Operit 在手机上完成任务。
+把 AstrBot 和 Android 手机连接起来的插件，提供两个产品模式：
 
-> 本插件是一座"桥"：AstrBot 负责理解自然语言和决策，手机上的 Operit 负责实际执行。所有手机操作都有白名单和审计日志，高危操作需要你显式确认。
+| 模式 | Android 端 | 适用场景 |
+| --- | --- | --- |
+| `app` | Tauru Phone Agent App + Shizuku + 结构化命令 | 陪伴聊天、提醒、时间线、设备状态、截图和可预测的手机控制 |
+| `operit` | OperitAI HTTP API | 需要识别屏幕、点击、输入和自然语言推理的 UI 任务 |
 
-## 功能一览
+旧配置别名 `phone_buddy`、`native_app`、`operitai`、`operit_ai` 仍然兼容；新配置请使用 `app` 或 `operit`。
 
-| 功能 | 工具 | 默认状态 |
-|---|---|---|
-| 自然语言手机任务（开关应用、点按、输入等） | `operit_task` 系列、`phone_action` | ✅ 默认开启 |
-| 观察手机状态（前台应用、屏幕文字、电量） | `phone_observe` | 关闭，需显式开启 `enable_observe_tool` |
-| Private Companion 手机上下文桥接 | `companion-context` | 关闭，需显式开启 |
-| App 禁用/恢复、临时限制视频 App | `phone_app_policy`、`phone_sleep_mode` | 🔧 按需开启 |
-| 一次性读取手机位置（可联动百度地图 MCP） | `phone_location` | 🔧 按需开启 |
-| 应用使用时长统计 | `phone_usage` | 🔧 按需开启 |
-| 聊天内提醒 | `phone_reminder` | 🔧 按需开启 |
-| 操作审计查询 | `phone_audit` | 🔧 按需开启 |
-| 小米健康数据（步数/睡眠/心率/血氧） | `phone_health` | 🔧 按需开启 |
-
-可选功能通过插件配置里的 `enable_*` 开关控制，不开就不注册对应工具。`phone_observe` 默认关闭；Private Companion 的 `companion-context` 也默认关闭，避免主动消息生成时自动读取手机屏幕。
-
-## 工作原理
+## Architecture
 
 ```text
-聊天平台 → AstrBot → Tailscale → 手机 Operit HTTP → Operit Agent + Shizuku
-                └→（Tailscale 断线时自动降级）→ 公网 relay 队列 → 手机定时轮询领取 → 回传结果
+Chat platform -> AstrBot -> astrbot-phone-agent
+                              |-- app: structured HTTP -> Tauru Phone Agent App
+                              |                  \-> Relay fallback
+                              \-- operit: natural-language HTTP -> OperitAI
 ```
 
-- **主链路（实时）**：服务器经 Tailscale 直连手机上的 Operit HTTP 服务，随叫随到。
-- **兜底链路（relay）**：手机开不了 VPN 时（公司网络、运营商限制等），插件自动把任务放进你自己服务器上的公网队列；手机上的 Operit 定时工作流轮询领取、执行并回传结果。轮询间隔受 Android WorkManager 限制，最小 15 分钟。
-- 两条链路自动切换：主链路失败才走兜底，恢复后自动切回。切换行为会记录在审计日志（`relay_fallback`）里。
-- Relay 任务领取有 5 分钟租约，手机执行较慢时会自动续租；手机中断后任务会重新进入队列。设置 `RELAY_REQUIRE_DEVICE_ID=1` 并让手机请求带 `X-Relay-Device-ID`，可避免多台手机互相领取任务；默认保持旧工作流兼容。
+## Mode A: Tauru Phone Agent App
 
-## 安装
+App 模式是项目自己的 Android 前端。手机端通过 Shizuku 执行白名单命令，插件只下发结构化 JSON，不把自然语言直接交给手机执行。
 
-### 前置条件
+直连地址按顺序尝试：手机内网地址、手机 Tailscale 地址，最后才进入 Relay。例如：
 
-1. **手机端**：安装 [Operit](https://github.com/Mavaebrook/Operit) 和 Shizuku，在 Operit 里授予 Shizuku 权限、配置一个可用的聊天模型，并开启"外部 HTTP 调用"（设置 → 数据和权限，记下监听地址和 Bearer Token）。
-2. **服务器端**：AstrBot 4.22 或更高版本。
-3. **网络**（二选一或都用）：
-   - 服务器与手机加入同一 Tailscale tailnet（推荐，实时控制）；
-   - 或按本文"Relay 兜底"一节自建公网队列（不需要 VPN）。
+```
+http://192.168.2.110:8260,http://PHONE_TAILSCALE_IP:8260
+```
 
-### 从插件市场安装（推荐）
+Android 前端仓库和 Release：
 
-在 AstrBot WebUI 的插件市场搜索 **Phone Control**，一键安装。
+<https://github.com/Tauru-t6/astrbot-phone-agent-app>
 
-### 从 GitHub 安装
+安装 App 后启动 Shizuku、授权手机搭子，并在 App 设置中配置 AstrBot 地址、插件地址、共享命令 Token 和可选 Relay。
+
+服务器侧最小配置：
+
+```json
+{
+  "enabled": true,
+  "control_backend": "app",
+  "app_shared_token": "与 App 完全相同的随机 Token",
+  "app_direct_urls": "http://192.168.2.110:8260,http://PHONE_TAILSCALE_IP:8260",
+  "relay_base_url": "https://你的 Relay 域名",
+  "relay_token": "你的 Relay Token",
+  "allowed_user_ids": "允许控制手机的 AstrBot 用户 ID",
+  "enable_observe_tool": true,
+  "enable_reminder_tools": true,
+  "enable_audit_tool": true
+}
+```
+
+App 模式支持 status、打开/关闭应用、前台应用、锁屏/唤醒、返回/主页、截图、屏幕文字、应用暂停/恢复、使用统计、定位、通知和 ping。提醒、时间线和设备状态也会同步到 App。
+
+App 模式只接受固定命令集合和结构化参数，不执行任意 shell，也不接受自然语言任务。高危动作必须先经过 AstrBot 会话确认，手机端还会再次弹出确认框。
+
+## Mode B: OperitAI
+
+Operit 模式保留原来的 OperitAI 能力，适合识别屏幕、点击、输入和自然语言 UI 任务：
+
+```json
+{
+  "enabled": true,
+  "control_backend": "operit",
+  "operit_base_url": "http://PHONE_TAILSCALE_IP:8094",
+  "operit_token": "Operit External HTTP Bearer Token",
+  "allowed_user_ids": "允许控制手机的 AstrBot 用户 ID"
+}
+```
+
+OperitAI 必须已经配置可用模型、工具调用、Shizuku 权限以及 External HTTP。此模式可以使用 `operit_task`。App 模式下 `operit_task` 会被拒绝，请使用 `phone_action`。
+
+## Install
+
+要求 AstrBot 4.22 或更高版本：
 
 ```bash
-cd <astrbot-data>/plugins/
+cd <astrbot-data>/plugins
 git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_phone_agent
 ```
 
-然后在 WebUI 里重载插件。注意：目录名必须是 `astrbot_plugin_phone_agent`。
+重启 AstrBot 或在 WebUI 重载插件。插件本身不需要额外 Python 依赖。
 
-### 最小配置
+## Optional features
 
-在 AstrBot WebUI → 插件配置中填写：
+| 功能 | 配置项 | 工具 |
+| --- | --- | --- |
+| 观察屏幕 | `enable_observe_tool` | `phone_observe` |
+| 使用统计 | `enable_usage_tool` | `phone_usage` |
+| 提醒 | `enable_reminder_tools` | `phone_reminder`、App 提醒 API |
+| 定位 | `enable_location_tool` | `phone_location` |
+| 应用限制 | `enable_policy_tools` | `phone_app_policy`、`phone_sleep_mode` |
+| 审计 | `enable_audit_tool` | `phone_audit` |
+| 小米健康库 | `enable_health_tools` | `phone_health` |
 
-| 配置项 | 说明 |
-|---|---|
-| `operit_base_url` | 手机 Operit 地址（Tailscale IP + 端口，如 `http://100.x.y.z:8094`） |
-| `operit_token` | Operit 外部 HTTP 的 Bearer Token |
-| `allowed_user_ids` | 允许使用手机功能的用户 ID，逗号分隔。**留空则所有功能拒绝调用，务必填写** |
-| `enable_observe_tool` | 是否允许 `phone_observe` 调用 Operit 查看当前 App，默认 `false` |
-| `max_background_tasks` | 后台 Operit 任务并发上限，默认 `2` |
+启用手机控制前请设置 `allowed_user_ids`，不要把控制入口开放给所有聊天用户。
 
-配置完成后在聊天里发一句"打开设置"，能收到手机执行结果就是通了。输入文字、点击按钮、发送消息、删除、支付等可能产生副作用的任务会先要求确认。
+## Relay fallback
 
-## Relay 兜底（可选）
+`deploy/relay/` 提供标准库实现的 Relay 队列，包含 Bearer 鉴权、任务租约、可选设备隔离、请求限流和请求体大小限制。生产环境请放在 HTTPS 反代后，Token 只放服务器配置，不要提交到 GitHub。
 
-Tailscale 断开时也想让手机继续接任务？三步配置：
+## WebUI
 
-### 第一步：服务器上启动 relay 队列
+Phone Control 页面可查看后端状态、App 注册、直连/Relay 诊断、提醒、应用限制、后台任务和不含正文的审计记录。Token 只显示“已配置”，不会回显。
 
-relay 服务在本仓库 `deploy/relay/` 目录（纯 Python 标准库，无依赖）：
+## Security
+
+- App 模式只接受固定命令集合和结构化参数。
+- 高危操作双重确认。
+- 包名严格校验。
+- 定位只在明确请求时执行，不后台采集。
+- 审计不记录 Token 和聊天正文。
+- 不要提交 Operit Token、Relay Token、API Key、SSH 凭据或服务器配置。
+
+## Development
 
 ```bash
-sudo mkdir -p /opt/phone-agent-relay
-sudo cp deploy/relay/relay_server.py /opt/phone-agent-relay/
-
-# 安装 systemd 服务（把模板里的 __RELAY_TOKEN__ 替换成随机 token）
-sudo sed "s/__RELAY_TOKEN__/$(openssl rand -hex 16)/" deploy/relay/phone-agent-relay.service \
-  | sudo tee /etc/systemd/system/phone-agent-relay.service
-sudo systemctl daemon-reload && sudo systemctl enable --now phone-agent-relay
+python -m pytest tests -q
+python -m py_compile main.py device_app.py
 ```
 
-然后用 nginx/Caddy 反代或 CDN 加速域名把 `127.0.0.1:8791` 暴露到公网，**必须 HTTPS**。
+协议文档位于 Android 仓库的 `docs/APP_PLUGIN_CONTRACT_V1.md`。
 
-### 第二步：手机上配置 Operit 定时工作流
-
-在 Operit 工作流编辑器里创建：
-
-1. **触发器**：`schedule` 类型，间隔 15 分钟（WorkManager 最小周期）。
-2. **执行节点**（`http_request` 工具）：`GET https://<你的域名>/poll`，请求头 `Authorization: Bearer <relay token>`。启用设备隔离时，再加 `X-Relay-Device-ID: phone-1`。
-3. **条件节点**：响应 JSON 里 `task` 不为 null 才继续，否则结束。
-4. **执行节点**（`send_message_to_ai` 工具）：内容引用 `task.message`，让 Operit 在手机上执行任务。
-5. **执行节点**（`http_request` 工具）：`POST https://<你的域名>/result`，body 为 `{"task_id": "<task.id>", "success": true, "ai_response": "<AI 回复>"}`；启用设备隔离时同样带 `X-Relay-Device-ID`。
-
-### 第三步：插件配置
-
-| 配置项 | 值 |
-|---|---|
-| `relay_base_url` | `https://<你的域名>` |
-| `relay_token` | 与 relay 服务相同的 token |
-| `max_background_tasks` | 后台 Operit 任务并发上限，默认 `2`；元数据保存在 `tasks_path` |
-| `tasks_path` | 后台任务元数据文件，默认 `phone_agent_tasks.json` |
-
-之后 AstrBot 会在 Tailscale 失联时自动降级到 relay，恢复后自动切回直连。
-
-## 可选功能说明
-
-- **健康数据**（`enable_health_tools`）：需另行部署 `xiaomi-health-sync`（小米运动健康 → SQLite 同步工具），把生成的 `health.db` 路径填到 `health_db_path`。插件只读查询，不上传任何小米凭据。
-- **位置**（`enable_location_tool`）：返回 GCJ02 原始坐标和转换后的 BD09 坐标。BD09 可直接传给百度地图 MCP 的 `map_reverse_geocode`、`map_search_places` 等工具，实现"我在哪 / 附近有什么 / 怎么去"。高精度定位和地址反查需要你在聊天里显式确认。
-- **App 策略**（`enable_policy_tools`）：通过 Shizuku 执行 `pm suspend`，禁用后自动核验实际状态，支持定时自动恢复；系统包和 Operit 自身受保护，不会被误禁。
-- **Private Companion 桥接**（`companion-context.enabled`）：默认关闭。开启后才会向 Private Companion 的主动消息生成注入健康或屏幕摘要；屏幕摘要还需要同时开启主插件的 `enable_observe_tool` 和桥接的 `include_screen`。
-
-## WebUI 里还能做什么
-
-Phone Control 页面支持连接测试、配置编辑、健康摘要、临时 App 限制、一次性定位、后台任务取消/重试、提醒取消、审计查看和 15 秒自动刷新。页面中的 Token 只显示是否已配置。
-
-Relay 默认限制普通请求每分钟 120 次、创建任务每分钟 30 次，可通过 `RELAY_RATE_LIMIT` 和 `RELAY_TASK_RATE_LIMIT` 调整。
-
-## 安全说明
-
-- 所有手机操作白名单化，包名严格校验，坐标限幅。
-- 每次操作写入审计日志（不含消息正文与 Token），可用 `phone_audit` 查询。
-- 位置、外发消息等高危操作需要用户显式确认。
-- `operit_token`、`relay_token` 等同于手机控制权，请勿泄露；relay 暴露公网必须启用 HTTPS。
-
-## 文档
-
-- [完整中文教程](README.zh-CN.md)（Tailscale、Shizuku、健康数据全流程）
-- [English Guide](README.en.md)
-- [更新日志](CHANGELOG.md)
-
-## 致谢
-
-本项目由 GPT-5.6 与 GLM-5.3 协作完成，作者本人没有代码基础——如果你发现写得不对的地方，欢迎提 issue 指正。
