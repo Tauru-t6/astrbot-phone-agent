@@ -2,12 +2,22 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 
 PLUGIN_DIR = Path(__file__).parents[1]
+logger_stub = types.SimpleNamespace(debug=lambda *args, **kwargs: None,
+                                    info=lambda *args, **kwargs: None,
+                                    warning=lambda *args, **kwargs: None,
+                                    error=lambda *args, **kwargs: None)
+astrbot_module = types.ModuleType("astrbot")
+astrbot_api = types.ModuleType("astrbot.api")
+astrbot_api.logger = logger_stub
+sys.modules.setdefault("astrbot", astrbot_module)
+sys.modules.setdefault("astrbot.api", astrbot_api)
 SPEC = importlib.util.spec_from_file_location("device_app_test", PLUGIN_DIR / "device_app.py")
 device_app = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -33,6 +43,10 @@ class FakeConfig(dict):
 class EnvelopeTests(unittest.TestCase):
     def setUp(self):
         self.backend = device_app.DeviceAppBackend(FakeConfig(app_shared_token="t"), RecordingAudit())
+
+    def test_default_state_is_under_managed_plugin_data_directory(self):
+        expected = Path("data/plugin_data/astrbot_plugin_phone_agent/phone_agent_app_state.json")
+        self.assertEqual(self.backend._timeline_path(), expected)
 
     def test_envelope_shape_and_idempotent_id(self):
         envelope = self.backend.build_envelope("open_app", {"package": "tv.danmaku.bili"})

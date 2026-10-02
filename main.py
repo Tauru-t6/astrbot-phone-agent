@@ -50,6 +50,7 @@ ALLOWED_ACTIONS = {
 }
 
 LOCATION_ACTIVITY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+")
+PLUGIN_DATA_DIR = Path("data") / "plugin_data" / "astrbot_plugin_phone_agent"
 POLICY_ACTIONS = {"disable", "enable", "suspend", "unsuspend"}
 PROTECTED_POLICY_PACKAGES = frozenset({
     "com.android.settings",
@@ -666,7 +667,15 @@ class PhoneAgentPlugin(Star):
         return _text(self.config.get("health_db_path"), 500)
 
     def _audit_path(self) -> str:
-        return _text(self.config.get("audit_log_path"), 500) or "phone_agent_audit.jsonl"
+        return str(self._plugin_data_path("audit_log_path", "phone_agent_audit.jsonl"))
+
+    def _plugin_data_path(self, key: str, default_name: str) -> Path:
+        raw = _text(self.config.get(key), 500)
+        path = Path(raw) if raw else Path(default_name)
+        base = PLUGIN_DATA_DIR.parts
+        if not path.is_absolute() and path.parts[:len(base)] == base:
+            return path
+        return path if path.is_absolute() else PLUGIN_DATA_DIR / path
 
     def _audit(self, operation: str, **fields: Any) -> None:
         record = {"time": datetime.now().isoformat(timespec="seconds"), "operation": operation, **fields}
@@ -679,10 +688,10 @@ class PhoneAgentPlugin(Star):
             logger.debug("phone agent audit write failed: %s", exc)
 
     def _reminder_path(self) -> str:
-        return _text(self.config.get("reminders_path"), 500) or "phone_agent_reminders.json"
+        return str(self._plugin_data_path("reminders_path", "phone_agent_reminders.json"))
 
     def _task_path(self) -> str:
-        return _text(self.config.get("tasks_path"), 500) or "phone_agent_tasks.json"
+        return str(self._plugin_data_path("tasks_path", "phone_agent_tasks.json"))
 
     def _save_operit_tasks(self) -> None:
         try:
@@ -714,7 +723,7 @@ class PhoneAgentPlugin(Star):
             logger.warning("phone agent task file is invalid; ignoring it")
 
     def _policy_state_path(self) -> str:
-        return _text(self.config.get("policy_state_path"), 500) or "phone_agent_policies.json"
+        return str(self._plugin_data_path("policy_state_path", "phone_agent_policies.json"))
 
     def _save_policy_state(self) -> None:
         try:

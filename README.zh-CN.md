@@ -311,13 +311,13 @@ App 模式配置：
 | `enabled` | 总开关，默认 `true` |
 | `app_command_timeout_seconds` | App 命令总超时默认 200 秒，运行时限制在 10–300 秒 |
 | `operit_timeout_seconds` | Operit 单次请求等待默认 120 秒 |
-| `app_state_path` | 时间线状态，默认 `phone_agent_app_state.json` |
-| `reminders_path` | 提醒和幂等回执，默认 `phone_agent_reminders.json` |
-| `tasks_path` | 后台任务元数据，默认 `phone_agent_tasks.json` |
-| `policy_state_path` | 限制策略及到期时间，默认 `phone_agent_policies.json` |
-| `audit_log_path` | 动作元数据日志，默认 `phone_agent_audit.jsonl` |
+| `app_state_path` | 时间线状态，默认 `data/plugin_data/astrbot_plugin_phone_agent/phone_agent_app_state.json` |
+| `reminders_path` | 提醒和幂等回执，默认 `data/plugin_data/astrbot_plugin_phone_agent/phone_agent_reminders.json` |
+| `tasks_path` | 后台任务元数据，默认 `data/plugin_data/astrbot_plugin_phone_agent/phone_agent_tasks.json` |
+| `policy_state_path` | 限制策略及到期时间，默认 `data/plugin_data/astrbot_plugin_phone_agent/phone_agent_policies.json` |
+| `audit_log_path` | 动作元数据日志，默认 `data/plugin_data/astrbot_plugin_phone_agent/phone_agent_audit.jsonl` |
 
-相对状态路径以 AstrBot 服务工作目录为准；需要备份或迁移时先确认 unit 的 `WorkingDirectory`，不要假定状态都在插件代码目录。
+这些默认路径统一位于 AstrBot 的 `data/plugin_data/astrbot_plugin_phone_agent/` 下，便于插件数据迁移和备份。自定义相对路径也会放在这个目录下；只有绝对路径才会写到外部位置。提醒、时间线和任务文件可能含个人文本，不要提交到 Git。
 
 Operit 模式最少需要配置：
 
@@ -712,7 +712,7 @@ unset PHONE_RELAY_TOKEN
   "relay_base_url": "https://relay.example",
   "relay_token": "与Relay服务和手机消费端一致的Token",
   "max_background_tasks": 2,
-  "tasks_path": "phone_agent_tasks.json"
+  "tasks_path": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_tasks.json"
 }
 ```
 

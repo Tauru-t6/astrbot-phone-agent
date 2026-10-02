@@ -607,7 +607,7 @@ App location returns native WGS84 under the structured command result's `output`
 
 `phone_app_policy(minutes=0)` keeps a restriction until explicit restoration. Timed restore is an attempt on expiry; an offline phone can miss it, and the code does not continuously retry at that point. Failed batch restrictions trigger rollback attempts, with results reported. Policy files survive restarts.
 
-`tasks_path` stores the most recent 100 Operit task metadata entries. Cancellation stops local waiting, not necessarily a phone request already sent. Retry starts the full task under a new ID and may repeat side effects; it does not resume at an interrupted UI step. Completed App reminder request receipts remain for 30 days, while only 100 timeline entries are kept.
+`tasks_path` stores the most recent 100 Operit task metadata entries. By default, task metadata, reminders, policy state, audit records, and the App timeline live below `data/plugin_data/astrbot_plugin_phone_agent/`; relative custom paths are resolved below that directory, while absolute paths are honored. This keeps plugin data in AstrBot's managed data area for migration and backup. Cancellation stops local waiting, not necessarily a phone request already sent. Retry starts the full task under a new ID and may repeat side effects; it does not resume at an interrupted UI step. Completed App reminder request receipts remain for 30 days, while only 100 timeline entries are kept.
 
 The audit log avoids message bodies and tokens, but reminder, timeline and background task state can contain user text. Preserve these private files during upgrades and exclude them from public source archives.
 

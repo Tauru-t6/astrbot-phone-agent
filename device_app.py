@@ -24,15 +24,21 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover - isolated import checks
-    import logging
-
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 
 COMMAND_SCHEMA_VERSION = 1
+PLUGIN_DATA_DIR = Path("data") / "plugin_data" / "astrbot_plugin_phone_agent"
+
+
+def plugin_data_path(value: Any, default_name: str) -> Path:
+    """Resolve plugin state below AstrBot's managed data directory by default."""
+    raw = str(value or "").strip()
+    path = Path(raw) if raw else Path(default_name)
+    base = PLUGIN_DATA_DIR.parts
+    if not path.is_absolute() and path.parts[:len(base)] == base:
+        return path
+    return path if path.is_absolute() else PLUGIN_DATA_DIR / path
 
 # Closed command set. The app rejects anything not in this table; adding a
 # new action requires a contract-doc update and an app-side implementation
@@ -139,7 +145,7 @@ class DeviceAppBackend:
         return item
 
     def _timeline_path(self) -> Path:
-        return Path(str(self._config.get("app_state_path") or "phone_agent_app_state.json"))
+        return plugin_data_path(self._config.get("app_state_path"), "phone_agent_app_state.json")
 
     def _save_timeline(self, items: list[dict[str, Any]]) -> None:
         path = self._timeline_path()

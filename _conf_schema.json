@@ -66,17 +66,17 @@
   },
   "audit_log_path": {
     "type": "text",
-    "default": "phone_agent_audit.jsonl",
-    "description": "Local metadata-only action audit log"
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_audit.jsonl",
+    "description": "Local metadata-only action audit log. Relative paths are resolved below AstrBot's managed plugin data directory."
   },
   "reminders_path": {
     "type": "text",
-    "default": "phone_agent_reminders.json",
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_reminders.json",
     "description": "Persistent phone-agent reminder file"
   },
   "policy_state_path": {
     "type": "text",
-    "default": "phone_agent_policies.json",
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_policies.json",
     "description": "Persistent app-policy state used to restore temporary restrictions after restart"
   },
   "adb_full_port_scan": {
@@ -126,7 +126,7 @@
   },
   "tasks_path": {
     "type": "text",
-    "default": "phone_agent_tasks.json",
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_tasks.json",
     "description": "Persistent metadata file for background Operit tasks"
   },
   "enable_observe_tool": {
@@ -161,7 +161,7 @@
   },
   "app_state_path": {
     "type": "text",
-    "default": "phone_agent_app_state.json",
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_app_state.json",
     "description": "Atomic persistent App timeline (latest 100 events)."
   }
 }

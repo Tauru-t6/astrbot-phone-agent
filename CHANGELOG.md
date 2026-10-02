@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.3] - 2026-10-02
+
+- Store plugin state under `data/plugin_data/astrbot_plugin_phone_agent/` by default for predictable backup and migration.
+- Remove the runtime `logging` fallback from `device_app.py`; the plugin now uses AstrBot's logger API directly.
+- Add coverage for the managed default state directory.
+
 ## [0.6.2] - 2026-10-02
 
 - Completed authenticated App state and reminder routes, atomic persistence,
