@@ -163,5 +163,20 @@
     "type": "text",
     "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_app_state.json",
     "description": "Atomic persistent App timeline (latest 100 events)."
+  },
+  "enable_screenshot_tool": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_screenshot: capture the phone screen in App mode and send the picture into the conversation"
+  },
+  "enable_notification_tool": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable phone_notifications and the /app/notifications route that the App forwards notifications to"
+  },
+  "notification_path": {
+    "type": "text",
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_notifications.json",
+    "description": "Persistent store for notifications forwarded by the App (contains notification text)"
   }
 }

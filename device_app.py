@@ -62,15 +62,39 @@ COMMAND_ACTIONS = frozenset({
     "usage_stats",
     "send_notification",
     "ping",
+    # UI automation, at parity with the OperitAI backend. These mutate on-screen
+    # state, so they are dangerous by default and need on-device confirmation.
+    "tap",
+    "long_press",
+    "swipe",
+    "scroll",
+    "input_text",
+    "key_event",
 })
 
+# Actions that change device state or expose screen content. The app prompts for
+# on-device confirmation unless the user opts that specific action out.
 DANGEROUS_ACTIONS = frozenset({
     "close_app",
     "suspend_app",
     "suspend_video_apps",
     "location",
     "send_notification",
+    "tap",
+    "long_press",
+    "swipe",
+    "scroll",
+    "input_text",
+    "key_event",
+    "screen_text",
+    "screenshot",
 })
+
+# Screenshots ride inside the result envelope as base64, so both ends need an
+# explicit ceiling. _http_json reads at most 4 MiB, which this stays under.
+MAX_SCREENSHOT_BASE64_CHARS = 3_000_000
+# Decoded ceiling enforced on the plugin side before touching the disk.
+MAX_SCREENSHOT_BYTES = 2_200_000
 
 MAX_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 200

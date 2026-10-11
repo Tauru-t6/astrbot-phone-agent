@@ -16,7 +16,7 @@
 | 手机端 | [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) + Shizuku | [OperitAI](https://github.com/Mavaebrook/Operit) + Shizuku |
 | 执行方式 | 固定指令集合、结构化 JSON | 手机端 Agent 解析自然语言并操作 UI |
 | 手机端模型 | 执行指令不需要额外模型；App 聊天走 AstrBot | 需要可用模型及工具调用 |
-| 任意界面任务 | 暂不支持通用点击、滑动、输入和自由文本任务 | `operit_task`，支持屏幕相关的多步任务 |
+| 结构化界面操作 | `phone_action` 支持点击、长按、滑动、滚动、输入文字和按键 | 通过 `operit_task` 由手机端模型自行决定操作 |
 | 网络 | 有序局域网 / Tailscale 直连 → Relay | Operit HTTP 直连 → Relay 工作流 |
 | 新增前端能力 | 聊天、任务记录、提醒、时间线、连接设置；名称与头像由用户设置 | 使用 Operit 自己的界面 |
 
@@ -29,7 +29,9 @@
 | 自然语言手机任务 | `operit_task` | OperitAI 模式；App 模式明确拒绝自由文本执行 |
 | 后台任务查询、取消、重试 | `operit_task_status` / `operit_task_cancel` / `operit_task_retry` | 保留 Operit 后台任务、并发限制与任务元数据持久化 |
 | 白名单手机操作 | `phone_action` | 两模式支持各自执行端的动作，App 不会误走 ADB |
-| 观察前台与屏幕 | `phone_observe` | `enable_observe_tool`；Operit 可读屏，App 当前返回设备状态 |
+| 观察前台与屏幕 | `phone_observe` | `enable_observe_tool`；Operit 可读屏，App 返回设备状态 |
+| 截图回传聊天 | `phone_screenshot` | `enable_screenshot_tool`；仅 App 模式，图片直接发进当前会话 |
+| 手机通知转发 | `phone_notifications` | `enable_notification_tool`；App 端需授予通知读取权限 |
 | 单应用暂停 / 恢复 | `phone_app_policy` | `enable_policy_tools`；支持核验状态、按分钟恢复 |
 | 临时限制视频应用 / 守夜 | `phone_sleep_mode` | `enable_policy_tools`；可指定目标、豁免及持续时间 |
 | 一次性定位与地图联动 | `phone_location` | `enable_location_tool`；按返回的坐标系连接地图服务 |
@@ -115,6 +117,8 @@ git pull --ff-only
 
 以上地址是占位符。`app_direct_urls` 按逗号分隔顺序尝试，建议内网在前、Tailscale 在后；优先级高于 App 自动注册的地址。所有直连与 Relay 尝试共享命令总时限，明确的设备拒绝不会换路径重放。
 
+**确认机制**：读屏（`screen_text`）、截图（`screenshot`）和全部界面操作（点击、长按、滑动、滚动、输入、按键）默认都需要在手机上确认；定位、关闭/暂停应用、发送通知同理。可以在 App 的「纸笺 → 隐私与自动化」里逐项关闭确认，默认只预先放行截图。
+
 App 端三类凭据各有用途：
 
 | 凭据 | 用途 |
@@ -125,7 +129,7 @@ App 端三类凭据各有用途：
 
 可选 Relay 另用独立 `relay_token`。App 初始不含任何角色名字、头像、服务器地址或密钥。
 
-**当前能力边界**：底层 App 命令包括电量/状态、打开/关闭应用、返回/主页、锁屏/唤醒、截图保存、读屏、应用暂停/恢复、定位、使用统计、通知和 ping。不同 LLM 工具有自己的暴露范围；不能把底层命令存在理解为支持全部自然语言 UI 自动化。`phone_observe` 当前只返回 App 设备状态，通用屏幕推理、任意点击/滑动/输入请使用 OperitAI。
+**当前能力边界**：底层 App 命令包括电量/状态、打开/关闭应用、返回/主页/按键、锁屏/唤醒、截图、读屏、点击/长按/滑动/滚动、输入文字、应用暂停/恢复、定位、使用统计、通知和 ping。App 模式现在可以完成结构化的界面操作（`phone_action` 的 tap / long_press / swipe / scroll / input_text / key_event），与 OperitAI 模式对齐；差别在于 App 模式由插件按坐标下发指令，Operit 模式由手机端模型自己看图决策多步任务。`phone_observe` 仍只返回 App 设备状态，需要"看懂屏幕再决定点哪里"的通用任务请使用 OperitAI，或先用 `phone_screenshot` 把画面发进会话再决定坐标。
 
 App 内的专注 / 批量应用限制按钮尚未具备完整的目标应用与恢复策略配置；插件侧的 `phone_app_policy`、`phone_sleep_mode` 能力仍保留。
 

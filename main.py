@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import functools
 import importlib
 import json
@@ -8,6 +10,7 @@ import math
 import os
 import re
 import sqlite3
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import urllib.error
@@ -23,9 +26,26 @@ from astrbot.api.star import Star
 from quart import jsonify, request
 
 try:
-    from .device_app import COMMAND_ACTIONS, DeviceAppBackend
+    from .device_app import (
+        COMMAND_ACTIONS,
+        DANGEROUS_ACTIONS,
+        MAX_SCREENSHOT_BYTES,
+        DeviceAppBackend,
+        plugin_data_path,
+    )
 except ImportError:  # pragma: no cover - direct-module test harness
-    from device_app import COMMAND_ACTIONS, DeviceAppBackend
+    from device_app import (
+        COMMAND_ACTIONS,
+        DANGEROUS_ACTIONS,
+        MAX_SCREENSHOT_BYTES,
+        DeviceAppBackend,
+        plugin_data_path,
+    )
+
+try:  # pragma: no cover - the test harness stubs only astrbot.api.event
+    from astrbot.api.message_components import Image as _ImageComponent
+except Exception:  # pragma: no cover
+    _ImageComponent = None
 
 
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
@@ -33,8 +53,11 @@ ALLOWED_ACTIONS = {
     "open_app",
     "close_app",
     "tap",
+    "long_press",
     "swipe",
+    "scroll",
     "input_text",
+    "key_event",
     "back",
     "home",
     "lock_screen",
@@ -137,9 +160,11 @@ class PhoneAgentPlugin(Star):
         self._reminder_tasks: dict[str, asyncio.Task[Any]] = {}
         self._reminders: dict[str, dict[str, Any]] = {}
         self._reminder_requests: dict[str, dict[str, Any]] = {}
+        self._notifications: list[dict[str, Any]] = []
         self._load_policy_state()
         self.device_app = DeviceAppBackend(config, self._audit)
         self._load_reminders()
+        self._load_notifications()
         self._register_web_api()
 
     async def terminate(self) -> None:
@@ -170,6 +195,8 @@ class PhoneAgentPlugin(Star):
             "phone_audit": ("audit_tool",),
             "phone_app_policy": ("policy_tools",),
             "phone_sleep_mode": ("policy_tools",),
+            "phone_screenshot": ("screenshot_tool",),
+            "phone_notifications": ("notification_tool",),
         }
         keys = groups.get(name)
         if not keys:
@@ -203,6 +230,8 @@ class PhoneAgentPlugin(Star):
             ("/app/state", self._web_app_state, ["GET"], "AstrBot Phone Agent App state snapshot", None),
             ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create an App reminder", None),
             ("/app/reminders/cancel", self._web_app_reminder_cancel, ["POST"], "Cancel an App reminder", None),
+            ("/app/notifications", self._web_app_notifications, ["GET", "POST"],
+             "Forwarded phone notifications", "notification_tool"),
         )
         for route in routes:
             gate = route[4] if len(route) > 4 else None
@@ -539,11 +568,11 @@ class PhoneAgentPlugin(Star):
             limit = 50
         return jsonify({"success": True, "items": self.device_app.timeline_since(since, limit)})
 
-    def _app_api_write_allowed(self) -> tuple[bool, str]:
+    def _app_api_write_allowed(self, feature: str = "reminder_tools") -> tuple[bool, str]:
         if not self._enabled():
             return False, "phone agent disabled"
-        if not self._feature("reminder_tools"):
-            return False, "reminder_tools feature is disabled"
+        if not self._feature(feature):
+            return False, f"{feature} feature is disabled"
         if not self._web_write_allowed():
             return False, "cross-origin write rejected"
         return True, ""
@@ -2171,6 +2200,7 @@ class PhoneAgentPlugin(Star):
         x2: int = -1,
         y2: int = -1,
         duration_ms: int = 300,
+        key_code: int = 0,
         workflow_action: str = "",
         extras_json: str = "{}",
         confirmed: bool = False,
@@ -2221,6 +2251,7 @@ class PhoneAgentPlugin(Star):
             "x2": x2,
             "y2": y2,
             "duration_ms": duration_ms,
+            "key_code": key_code,
             "workflow_action": workflow_action,
             "extras_json": extras_json,
         }
@@ -2241,7 +2272,8 @@ class PhoneAgentPlugin(Star):
         if self._control_backend() == "app":
             if action not in COMMAND_ACTIONS:
                 return json.dumps({"success": False, "backend": "app", "error_code": "unsupported_action",
-                                   "error": "App mode does not support arbitrary tap, swipe, text input or workflows; use Operit mode."})
+                                   "error": "App mode does not support this action; supported: "
+                                            + ", ".join(sorted(COMMAND_ACTIONS))}, ensure_ascii=False)
             result = await asyncio.to_thread(self.device_app.execute, action, kwargs)
             return json.dumps(result, ensure_ascii=False)
         async with self._lock:
@@ -2250,6 +2282,193 @@ class PhoneAgentPlugin(Star):
                 return json.dumps({"success": False, "action": action, "error": detail}, ensure_ascii=False)
             result = await self._execute(action, kwargs)
         return json.dumps(result, ensure_ascii=False)
+
+    # ---------- forwarded phone notifications ----------
+
+    MAX_NOTIFICATIONS = 200
+
+    def _notification_path(self) -> Path:
+        return plugin_data_path(self.config.get("notification_path"), "phone_agent_notifications.json")
+
+    def _load_notifications(self) -> None:
+        try:
+            path = self._notification_path()
+            if not path.exists():
+                return
+            value = json.loads(path.read_text(encoding="utf-8"))
+            items = value.get("notifications", []) if isinstance(value, dict) else []
+            if isinstance(items, list):
+                self._notifications = [item for item in items if isinstance(item, dict)][: self.MAX_NOTIFICATIONS]
+        except (OSError, ValueError, TypeError):
+            logger.warning("phone agent notification file is invalid; ignoring it")
+
+    def _save_notifications(self) -> None:
+        path = self._notification_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump({"version": 1, "notifications": self._notifications}, handle,
+                          ensure_ascii=False, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    async def _web_app_notifications(self):
+        if not self._enabled():
+            return jsonify({"success": False, "error": "phone agent disabled", "error_code": "disabled"}), 503
+        if request.method == "GET":
+            try:
+                limit = max(1, min(int(request.args.get("limit", "50") or 50), 200))
+            except (TypeError, ValueError):
+                limit = 50
+            return jsonify({"success": True, "notifications": self._notifications[:limit]})
+        allowed, error = self._app_api_write_allowed("notification_tool")
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict) or not self._finite_json(payload):
+            return jsonify({"success": False, "error": "valid JSON object required", "error_code": "invalid_json"}), 400
+        items = payload.get("notifications")
+        if not isinstance(items, list):
+            return jsonify({"success": False, "error": "notifications must be a list", "error_code": "invalid_payload"}), 400
+        added = 0
+        for entry in items[:50]:
+            if not isinstance(entry, dict):
+                continue
+            package = _text(entry.get("package"), 160)
+            title = _text(entry.get("title"), 200)
+            body = _text(entry.get("text"), 500)
+            try:
+                posted = float(entry.get("posted_at"))
+            except (TypeError, ValueError):
+                posted = time.time()
+            if not math.isfinite(posted) or posted <= 0:
+                posted = time.time()
+            if not (package or title or body):
+                continue
+            key = _text(entry.get("key"), 160) or f"{package}|{title}|{int(posted)}"
+            if any(existing.get("key") == key for existing in self._notifications):
+                continue
+            self._notifications.insert(0, {
+                "key": key,
+                "package": package,
+                "title": title,
+                "text": body,
+                "posted_at": posted,
+                "received_at": time.time(),
+                "is_ongoing": bool(entry.get("is_ongoing")),
+            })
+            added += 1
+        if added:
+            self._notifications = self._notifications[: self.MAX_NOTIFICATIONS]
+            try:
+                self._save_notifications()
+            except OSError:
+                return jsonify({"success": False, "error": "could not store notifications",
+                                "error_code": "storage_unavailable"}), 503
+            self._audit("app_notifications_received", count=added)
+        return jsonify({"success": True, "added": added, "total": len(self._notifications)})
+
+    @filter.llm_tool(name="phone_notifications")
+    @_tolerate_nested_args
+    @_feature_gate("phone_notifications")
+    async def phone_notifications(self, event: AstrMessageEvent, limit: int = 20, package: str = "", **_kwargs: Any) -> str:
+        """Read notifications the phone app forwarded to AstrBot.
+
+        Use when the user asks what notifications arrived, whether anyone
+        messaged them, or about missed calls and messages on the phone.
+
+        Args:
+            limit(number): How many recent notifications to return, from 1 to 100. Defaults to 20.
+            package(str): Optional Android package name filter, for example com.tencent.mm.
+        """
+        if not self._enabled() or not self._authorized(event):
+            return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        try:
+            limit = max(1, min(int(limit or 20), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        wanted = _text(package, 160)
+        items = [item for item in self._notifications if not wanted or item.get("package") == wanted]
+        return json.dumps({"success": True, "count": len(items[:limit]), "notifications": items[:limit]},
+                          ensure_ascii=False)
+
+    # ---------- screenshots ----------
+
+    def _screenshot_dir(self) -> Path:
+        directory = Path(tempfile.gettempdir()) / "astrbot_phone_agent"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    async def _deliver_image(self, event: AstrMessageEvent, path: Path, caption: str) -> bool:
+        """Send one local image into the conversation that asked for it."""
+        if _ImageComponent is None:
+            return False
+        session = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not session:
+            return False
+        chain = MessageChain()
+        if caption:
+            chain.message(caption)
+        chain.chain.append(_ImageComponent.fromFileSystem(str(path)))
+        try:
+            return bool(await asyncio.wait_for(self.context.send_message(session, chain), timeout=30))
+        except Exception:
+            logger.warning("phone agent could not deliver the screenshot to the conversation")
+            return False
+
+    @filter.llm_tool(name="phone_screenshot")
+    @_tolerate_nested_args
+    @_feature_gate("phone_screenshot")
+    async def phone_screenshot(self, event: AstrMessageEvent, caption: str = "", **_kwargs: Any) -> str:
+        """Capture the phone screen and send the picture into this conversation.
+
+        Use when the user asks what is on the phone screen, asks for a
+        screenshot, or when answering needs the current screen.
+
+        Args:
+            caption(str): Optional short text to send together with the picture.
+        """
+        if not self._enabled():
+            return json.dumps({"success": False, "error": "phone agent disabled"}, ensure_ascii=False)
+        if not self._authorized(event):
+            return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._control_backend() != "app":
+            return json.dumps({"success": False,
+                               "error": "phone_screenshot currently requires control_backend=app"},
+                              ensure_ascii=False)
+        result = await asyncio.to_thread(self.device_app.execute, "screenshot", {})
+        self._audit("phone_screenshot", success=bool(result.get("success")))
+        if not result.get("success"):
+            return json.dumps({"success": False,
+                               "error": result.get("error") or "screenshot failed",
+                               "error_code": result.get("error_code") or ""}, ensure_ascii=False)
+        output = result.get("output")
+        if not isinstance(output, dict) or not output.get("data_base64"):
+            return json.dumps({"success": False, "error": "phone did not return image data"}, ensure_ascii=False)
+        try:
+            raw = base64.b64decode(str(output["data_base64"]), validate=True)
+        except (ValueError, binascii.Error):
+            return json.dumps({"success": False, "error": "phone returned invalid image data"}, ensure_ascii=False)
+        if not raw or len(raw) > MAX_SCREENSHOT_BYTES:
+            return json.dumps({"success": False, "error": "phone image is empty or too large"}, ensure_ascii=False)
+        path = self._screenshot_dir() / f"screen_{uuid.uuid4().hex[:12]}.jpg"
+        try:
+            path.write_bytes(raw)
+        except OSError:
+            return json.dumps({"success": False, "error": "could not store the screenshot"}, ensure_ascii=False)
+        delivered = await self._deliver_image(event, path, _text(caption, 200))
+        return json.dumps({
+            "success": True,
+            "delivered": delivered,
+            "bytes": len(raw),
+            "width": output.get("width"),
+            "height": output.get("height"),
+            "note": "" if delivered else "captured, but this conversation could not receive the image",
+        }, ensure_ascii=False)
 
     def _protected_policy_error(self, package: str) -> str:
         if package in PROTECTED_POLICY_PACKAGES:

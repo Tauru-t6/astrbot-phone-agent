@@ -54,7 +54,8 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.config = {"enabled": True, "control_backend": "app", "enable_reminder_tools": True,
                        "enable_audit_tool": True, "enable_observe_tool": True}
-        for key in ("reminders_path", "app_state_path", "audit_log_path", "tasks_path", "policy_state_path"):
+        for key in ("reminders_path", "app_state_path", "audit_log_path", "tasks_path", "policy_state_path",
+                    "notification_path"):
             self.config[key] = str(Path(self.temp.name) / (key + ".json"))
         self.plugins = []
         self.create_plugin()
@@ -207,11 +208,106 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
             result = json.loads(await self.plugin.phone_action(object(), action="open_app", package="a.b"))
             self.assertTrue(result["success"])
             app_call.assert_called_once()
-            result = json.loads(await self.plugin.phone_action(object(), action="tap"))
+            # UI automation is now part of the App command set.
+            result = json.loads(await self.plugin.phone_action(object(), action="tap", x=10, y=20))
+            self.assertTrue(result["success"])
+            self.assertEqual(app_call.call_args.args[0], "tap")
+            # Actions the App does not implement are still refused, not silently downgraded.
+            result = json.loads(await self.plugin.phone_action(object(), action="trigger_workflow", confirmed=True))
             self.assertEqual(result["error_code"], "unsupported_action")
             self.config["control_backend"] = "operit"
             await self.plugin.phone_action(object(), action="tap")
             operit.assert_awaited_once()
+
+    async def test_notification_forwarding_dedupes_and_persists(self):
+        self.config["enable_notification_tool"] = True
+        self.create_plugin()
+        batch = {"notifications": [
+            {"key": "k1", "package": "com.tencent.mm", "title": "张三", "text": "在吗", "posted_at": 1000.0},
+            {"key": "k2", "package": "com.android.dialer", "title": "未接来电", "text": "138****0000", "posted_at": 1001.0},
+        ]}
+        response = await self.post("/app/notifications", batch)
+        self.assertEqual(response.status_code, 200)
+        body = await response.get_json()
+        self.assertEqual(body["added"], 2)
+        # Replaying the same keys must not duplicate entries.
+        body = await (await self.post("/app/notifications", batch)).get_json()
+        self.assertEqual(body["added"], 0)
+        self.assertEqual(body["total"], 2)
+        listed = await (await self.client.get("/astrbot_plugin_phone_agent/app/notifications")).get_json()
+        self.assertEqual(len(listed["notifications"]), 2)
+        # A fresh instance loads the store from disk.
+        self.create_plugin()
+        reloaded = await (await self.client.get("/astrbot_plugin_phone_agent/app/notifications")).get_json()
+        self.assertEqual(len(reloaded["notifications"]), 2)
+
+    async def test_notification_route_respects_feature_flag_and_payload_shape(self):
+        # Feature off: writes are refused, and the route is not even registered.
+        self.config["enable_notification_tool"] = False
+        self.create_plugin()
+        response = await self.post("/app/notifications", {"notifications": []})
+        self.assertEqual(response.status_code, 404)
+        self.config["enable_notification_tool"] = True
+        self.create_plugin()
+        self.assertEqual((await self.post("/app/notifications", {"notifications": "nope"})).status_code, 400)
+        self.assertEqual((await self.post("/app/notifications", {"notifications": [{"key": "x", "title": float("nan")}]})).status_code, 400)
+
+    async def test_phone_notifications_tool_filters_by_package(self):
+        self.config["enable_notification_tool"] = True
+        self.create_plugin()
+        await self.post("/app/notifications", {"notifications": [
+            {"key": "k1", "package": "com.tencent.mm", "title": "张三", "text": "在吗", "posted_at": 1000.0},
+            {"key": "k2", "package": "com.android.dialer", "title": "未接来电", "text": "电话", "posted_at": 1001.0},
+        ]})
+        with patch.object(self.plugin, "_authorized", return_value=True):
+            result = json.loads(await self.plugin.phone_notifications(object()))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["count"], 2)
+            filtered = json.loads(await self.plugin.phone_notifications(object(), package="com.tencent.mm"))
+            self.assertEqual(filtered["count"], 1)
+            self.assertEqual(filtered["notifications"][0]["title"], "张三")
+
+    async def test_phone_screenshot_decodes_image_and_survives_missing_delivery(self):
+        import base64 as _b64
+        self.config["enable_screenshot_tool"] = True
+        self.create_plugin()
+        raw = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+        payload = {"success": True, "output": {"format": "jpeg", "width": 8, "height": 6,
+                                              "bytes": len(raw), "data_base64": _b64.b64encode(raw).decode()}}
+        with patch.object(self.plugin, "_authorized", return_value=True), \
+                patch.object(self.plugin.device_app, "execute", return_value=payload) as call:
+            result = json.loads(await self.plugin.phone_screenshot(object(), caption="看看屏幕"))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["bytes"], len(raw))
+            self.assertEqual(result["width"], 8)
+            self.assertEqual(call.call_args.args[0], "screenshot")
+            # The test harness has no Image component, so delivery reports false
+            # rather than claiming the picture arrived.
+            self.assertFalse(result["delivered"])
+            self.assertIn("note", result)
+
+    async def test_phone_screenshot_rejects_bad_or_oversized_data(self):
+        import base64 as _b64
+        self.config["enable_screenshot_tool"] = True
+        self.create_plugin()
+        with patch.object(self.plugin, "_authorized", return_value=True), \
+                patch.object(self.plugin.device_app, "execute",
+                             return_value={"success": True, "output": {"data_base64": "!!!not-base64!!!"}}):
+            result = json.loads(await self.plugin.phone_screenshot(object()))
+            self.assertFalse(result["success"])
+        oversized = _b64.b64encode(b"x" * (2200001)).decode()
+        with patch.object(self.plugin, "_authorized", return_value=True), \
+                patch.object(self.plugin.device_app, "execute",
+                             return_value={"success": True, "output": {"data_base64": oversized}}):
+            result = json.loads(await self.plugin.phone_screenshot(object()))
+            self.assertFalse(result["success"])
+            self.assertIn("too large", result["error"])
+        with patch.object(self.plugin, "_authorized", return_value=True), \
+                patch.object(self.plugin.device_app, "execute",
+                             return_value={"success": False, "error": "no shizuku"}):
+            result = json.loads(await self.plugin.phone_screenshot(object()))
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "no shizuku")
 
     async def test_backend_alias_save_and_selected_connection_test(self):
         response = await self.post("/config", {"control_backend": "phone_buddy", "app_direct_urls": "http://phone.example:8260"})

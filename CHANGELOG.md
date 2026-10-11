@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.7.0]
+
+### Added
+
+- **App-mode UI automation.** `tap`, `long_press`, `swipe`, `scroll`,
+  `input_text` and `key_event` now run through the App backend, bringing it to
+  parity with the OperitAI backend. Previously App mode refused them outright.
+- **`phone_screenshot`.** Captures the phone screen in App mode and sends the
+  picture into the conversation that asked. The app returns a downscaled JPEG
+  inside the result envelope, so it works over both direct and relay transports.
+- **Notification forwarding.** `phone_notifications` reads notifications the
+  app forwards, so the assistant can answer "did anyone message me?".
+  New routes: `GET/POST /app/notifications`.
+- New config keys: `enable_screenshot_tool`, `enable_notification_tool`,
+  `notification_path`.
+
+### Security
+
+- `screen_text`, `screenshot` and every UI-automation action now require
+  on-device confirmation. Reading or capturing the screen was previously
+  unconfirmed while reading the location was not.
+- App: the command server enforces a per-address rate limit and a connection
+  cap, so an unauthenticated peer on the LAN can no longer open unbounded
+  concurrent connections.
+- App: replaced the blanket `android:usesCleartextTraffic` flag with an
+  explicit `networkSecurityConfig`, and dropped the unused
+  `CHANGE_NETWORK_STATE` and `RECEIVE_BOOT_COMPLETED` permissions.
+
+### Changed
+
+- App: users can opt individual actions out of the confirmation dialog under
+  纸笺 → 隐私与自动化. Only `screenshot` is pre-approved by default.
+- App: every quick-action tile now maps to a real capability; the guard tiles
+  drive the plugin's sleep-mode route instead of always failing locally.
+- App: release builds enable R8 and resource shrinking with explicit keep rules
+  for the reflective Shizuku and kotlinx.serialization paths.
+
+### Removed
+
+- App: ~1000 lines of unreachable UI code (`TabIcons`, `CompatTextField`,
+  `ConnectionPill`, `DeviceStatusCard`, `GradientBackground`,
+  `QuickActionTile`, `TimelineCard`, two unused icons) and the unused
+  `logging-interceptor` dependency.
+
 ## [0.6.3] - 2026-10-02
 
 - Store plugin state under `data/plugin_data/astrbot_plugin_phone_agent/` by default for predictable backup and migration.
