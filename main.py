@@ -44,7 +44,12 @@ except ImportError:  # pragma: no cover - direct-module test harness
 
 try:
     from .task_runner import (
+        APPROVAL_PENDING,
+        ApprovalRequest,
+        GRANT_SOURCE_APPROVAL,
         ReadOnlyTaskRunner,
+        RUN_CANCELLED,
+        RUN_WAITING_APPROVAL,
         ScopedGrant,
         TaskExecutor,
         TaskPlanner,
@@ -53,7 +58,12 @@ try:
     )
 except ImportError:  # pragma: no cover - direct-module test harness
     from task_runner import (
+        APPROVAL_PENDING,
+        ApprovalRequest,
+        GRANT_SOURCE_APPROVAL,
         ReadOnlyTaskRunner,
+        RUN_CANCELLED,
+        RUN_WAITING_APPROVAL,
         ScopedGrant,
         TaskExecutor,
         TaskPlanner,
@@ -359,6 +369,10 @@ class PhoneAgentPlugin(Star):
         ("/app/task/run", self._web_app_task_run, ["POST"],
          "Execute a granted task and verify each step", None),
         ("/app/task/cancel", self._web_app_task_cancel, ["POST"], "Cancel a running task", None),
+        ("/app/task/propose", self._web_app_task_propose, ["POST"],
+         "Plan a task and wait for a human decision", None),
+        ("/app/task/approve", self._web_app_task_approve, ["POST"], "Approve a proposed task", None),
+        ("/app/task/reject", self._web_app_task_reject, ["POST"], "Reject a proposed task", None),
         ("/app/grant", self._web_app_grant_create, ["POST"], "Issue a scoped action grant", None),
             ("/app/reminders/cancel", self._web_app_reminder_cancel, ["POST"], "Cancel an App reminder", None),
             ("/app/notifications", self._web_app_notifications, ["GET", "POST"],
@@ -828,6 +842,104 @@ class PhoneAgentPlugin(Star):
             "task_grants": self._task_runs.grants(),
             "task_execute_enabled": self._bool_config("enable_task_execute", False),
         })
+
+    async def _web_app_task_propose(self):
+        """Stage 4: plan a task and stop for a human decision."""
+        allowed, error = self._app_api_write_allowed()
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        if not self._bool_config("enable_task_execute", False):
+            return jsonify({"success": False, "error": "task execution is disabled",
+                            "error_code": "disabled"}), 403
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "valid JSON object required",
+                            "error_code": "invalid_json"}), 400
+        goal = _text(payload.get("goal"), 500)
+        if not goal:
+            return jsonify({"success": False, "error": "goal is required",
+                            "error_code": "invalid_goal"}), 400
+        registration = self.device_app.registration() or {}
+        device_id = _text(registration.get("device_id"), 64)
+        if not device_id:
+            return jsonify({"success": False, "error": "no device registered",
+                            "error_code": "no_device"}), 409
+        subject = _text(payload.get("subject"), 120) or next(iter(sorted(self._allowed_users())), "")
+        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=None)
+        actions = [step.action for step in run.steps if step.action in WRITE_ACTIONS]
+        packages = [step.args.get("package") for step in run.steps if step.args.get("package")]
+        if not actions:
+            return jsonify({"success": False, "error": "the goal has nothing to approve",
+                            "error_code": "nothing_to_approve"}), 409
+        approval = ApprovalRequest.create(
+            run_id=run.run_id, subject=subject, device_id=device_id,
+            actions=actions, packages=packages,
+            ttl_seconds=self._task_float("task_approval_ttl_seconds", 60.0, 10.0, 300.0),
+        )
+        run.transition(RUN_WAITING_APPROVAL)
+        self._task_runs.add_run(run)
+        self._task_runs.add_approval(approval)
+        self._task_runs.save()
+        self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=actions)
+        return jsonify({"success": True, "run": run.to_dict(), "approval": approval.to_dict()}), 200
+
+    async def _web_app_task_approve(self):
+        """Stage 4: a human approved the proposal; issue the grant and run it."""
+        allowed, error = self._app_api_write_allowed()
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        approval_id = _text((payload or {}).get("approval_id"), 64) if isinstance(payload, dict) else ""
+        approval = self._task_runs.approval(approval_id) if approval_id else None
+        if approval is None:
+            return jsonify({"success": False, "error": "approval not found",
+                            "error_code": "not_found"}), 404
+        if not approval.pending():
+            self._task_runs.save()
+            return jsonify({"success": False, "error": "approval is no longer pending",
+                            "error_code": "approval_not_pending",
+                            "approval": approval.to_dict()}), 409
+        run = self._task_runs.run(approval.run_id)
+        if run is None:
+            return jsonify({"success": False, "error": "run not found",
+                            "error_code": "not_found"}), 404
+        approval.decide(True, reason="approved")
+        grant = ScopedGrant.issue(
+            subject=approval.subject, device_id=approval.device_id,
+            actions=list(approval.actions), packages=list(approval.packages),
+            ttl_seconds=120.0, max_steps=max(1, len(approval.actions)),
+            source=GRANT_SOURCE_APPROVAL,
+        )
+        self._task_runs.add_grant(grant)
+        allow_active = bool(isinstance(payload, dict) and payload.get("allow_while_active") is True)
+        run = await self._task_executor.execute(run, grant=grant, allow_active=allow_active)
+        self._task_runs.save()
+        self._audit("task_approved", run_id=run.run_id, approval_id=approval.approval_id,
+                    status=run.status, verified=run.summary.get("verified", 0),
+                    failed=run.summary.get("failed", 0), refused=run.summary.get("refused", ""))
+        return jsonify({"success": True, "run": run.to_dict(), "approval": approval.to_dict()}), 200
+
+    async def _web_app_task_reject(self):
+        allowed, error = self._app_api_write_allowed()
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        approval_id = _text((payload or {}).get("approval_id"), 64) if isinstance(payload, dict) else ""
+        approval = self._task_runs.approval(approval_id) if approval_id else None
+        if approval is None:
+            return jsonify({"success": False, "error": "approval not found",
+                            "error_code": "not_found"}), 404
+        reason = _text((payload or {}).get("reason"), 160) or "rejected"
+        if not approval.decide(False, reason=reason):
+            return jsonify({"success": False, "error": "approval is no longer pending",
+                            "error_code": "approval_not_pending"}), 409
+        run = self._task_runs.run(approval.run_id)
+        if run is not None:
+            run.transition(RUN_CANCELLED, error=reason)
+        self._task_runs.save()
+        self._audit("task_rejected", run_id=approval.run_id, approval_id=approval.approval_id,
+                    reason=reason)
+        return jsonify({"success": True, "approval": approval.to_dict()}), 200
 
     async def _web_app_task_run(self):
         """P1-E stage 3: execute a granted task and verify every step."""

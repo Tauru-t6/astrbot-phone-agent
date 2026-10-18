@@ -458,6 +458,111 @@ class PhoneTaskRun:
 # ---------------------------------------------------------------- store
 
 
+APPROVAL_PENDING = "pending"
+APPROVAL_APPROVED = "approved"
+APPROVAL_REJECTED = "rejected"
+APPROVAL_EXPIRED = "expired"
+APPROVAL_STATUSES = {APPROVAL_PENDING, APPROVAL_APPROVED, APPROVAL_REJECTED, APPROVAL_EXPIRED}
+
+
+@dataclass
+class ApprovalRequest:
+    """Stage 4: a proposed run that waits for a human decision.
+
+    The grant is only issued after approval, so a proposal alone can never touch
+    the phone. Expiry is checked on read; nothing sweeps in the background.
+    """
+
+    approval_id: str
+    run_id: str
+    subject: str
+    device_id: str
+    actions: tuple[str, ...]
+    packages: tuple[str, ...]
+    created_at: float
+    expires_at: float
+    status: str = APPROVAL_PENDING
+    decided_at: float = 0.0
+    reason: str = ""
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        subject: str,
+        device_id: str,
+        actions: list[str] | tuple[str, ...],
+        packages: list[str] | tuple[str, ...] = (),
+        ttl_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> "ApprovalRequest":
+        stamp = _now() if now is None else now
+        return cls(
+            approval_id=uuid.uuid4().hex,
+            run_id=_short(run_id, 64),
+            subject=_short(subject, 120),
+            device_id=_short(device_id, 64),
+            actions=tuple(sorted({_short(item, 40) for item in actions if _short(item, 40)})),
+            packages=tuple(sorted({_short(item, 160) for item in packages if _short(item, 160)})),
+            created_at=stamp,
+            expires_at=stamp + max(5.0, float(ttl_seconds)),
+        )
+
+    def expire_if_due(self, now: float | None = None) -> bool:
+        stamp = _now() if now is None else now
+        if self.status == APPROVAL_PENDING and stamp >= self.expires_at:
+            self.status = APPROVAL_EXPIRED
+            self.decided_at = stamp
+            return True
+        return False
+
+    def pending(self, now: float | None = None) -> bool:
+        stamp = _now() if now is None else now
+        self.expire_if_due(stamp)
+        return self.status == APPROVAL_PENDING
+
+    def decide(self, approved: bool, *, reason: str = "", now: float | None = None) -> bool:
+        if not self.pending(now):
+            return False
+        self.status = APPROVAL_APPROVED if approved else APPROVAL_REJECTED
+        self.decided_at = _now() if now is None else now
+        self.reason = _short(reason, 160)
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "approval_id": self.approval_id,
+            "run_id": self.run_id,
+            "subject": self.subject,
+            "device_id": self.device_id,
+            "actions": list(self.actions),
+            "packages": list(self.packages),
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "status": self.status,
+            "decided_at": self.decided_at,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "ApprovalRequest":
+        status = _short(raw.get("status"), 20)
+        return cls(
+            approval_id=_short(raw.get("approval_id"), 64),
+            run_id=_short(raw.get("run_id"), 64),
+            subject=_short(raw.get("subject"), 120),
+            device_id=_short(raw.get("device_id"), 64),
+            actions=tuple(_short(item, 40) for item in (raw.get("actions") or [])),
+            packages=tuple(_short(item, 160) for item in (raw.get("packages") or [])),
+            created_at=float(raw.get("created_at") or 0.0),
+            expires_at=float(raw.get("expires_at") or 0.0),
+            status=status if status in APPROVAL_STATUSES else APPROVAL_PENDING,
+            decided_at=float(raw.get("decided_at") or 0.0),
+            reason=_short(raw.get("reason"), 160),
+        )
+
+
 class TaskRunStore:
     """Bounded, atomic run history shared by the runner and the web API."""
 
@@ -466,6 +571,7 @@ class TaskRunStore:
         self._max_runs = max(1, int(max_runs))
         self._runs: dict[str, PhoneTaskRun] = {}
         self._grants: dict[str, ScopedGrant] = {}
+        self._approvals: dict[str, ApprovalRequest] = {}
 
     def load(self) -> None:
         try:
@@ -485,6 +591,12 @@ class TaskRunStore:
                 grant = ScopedGrant.from_dict(raw)
                 if grant.active():
                     self._grants[grant.grant_id] = grant
+        for raw in data.get("approvals") or []:
+            if isinstance(raw, dict):
+                approval = ApprovalRequest.from_dict(raw)
+                if approval.approval_id:
+                    approval.expire_if_due()
+                    self._approvals[approval.approval_id] = approval
         self._trim()
 
     def save(self) -> bool:
@@ -494,6 +606,7 @@ class TaskRunStore:
             "version": 1,
             "runs": [run.to_dict() for run in self._ordered()],
             "grants": [grant.to_dict() for grant in self._grants.values() if grant.active()],
+            "approvals": [item.to_dict() for item in self._approvals.values()][-50:],
         }
         temporary = self._path.with_name(self._path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
@@ -533,6 +646,16 @@ class TaskRunStore:
 
     def grants(self) -> list[dict[str, Any]]:
         return [grant.to_dict() for grant in self._grants.values() if grant.active()]
+
+    def add_approval(self, approval: ApprovalRequest) -> None:
+        self._approvals[approval.approval_id] = approval
+
+    def approval(self, approval_id: str) -> ApprovalRequest | None:
+        return self._approvals.get(_short(approval_id, 64))
+
+    def approvals(self, limit: int = 5) -> list[dict[str, Any]]:
+        ordered = sorted(self._approvals.values(), key=lambda item: item.created_at, reverse=True)
+        return [item.to_dict() for item in ordered[: max(1, int(limit))]]
 
     # -- runs
 

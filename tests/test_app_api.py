@@ -379,3 +379,48 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post("/app/task/run", {"goal": "回到桌面"})
         self.assertEqual(response.status_code, 409)
         self.assertEqual((await response.get_json())["error_code"], "grant_required")
+    # -- P1-E stage 4 routes
+
+    def _register(self):
+        self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
+        self.plugin.config["enable_task_execute"] = True
+
+    async def test_propose_waits_for_a_human(self):
+        self._register()
+        response = await self.post("/app/task/propose", {"goal": "回到桌面"})
+        self.assertEqual(response.status_code, 200, await response.get_data(as_text=True))
+        body = await response.get_json()
+        self.assertEqual(body["run"]["status"], "waiting_approval")
+        self.assertIn("home", body["approval"]["actions"])
+        self.assertGreater(body["approval"]["expires_at"], time.time())
+
+    async def test_propose_without_device_is_rejected(self):
+        self.plugin.config["enable_task_execute"] = True
+        response = await self.post("/app/task/propose", {"goal": "回到桌面"})
+        self.assertEqual(response.status_code, 409)
+
+    async def test_reject_cancels_the_run(self):
+        self._register()
+        proposed = await (await self.post("/app/task/propose", {"goal": "回到桌面"})).get_json()
+        approval_id = proposed["approval"]["approval_id"]
+        response = await self.post("/app/task/reject", {"approval_id": approval_id, "reason": "不要"})
+        self.assertEqual(response.status_code, 200)
+        body = await response.get_json()
+        self.assertEqual(body["approval"]["status"], "rejected")
+        run = self.plugin._task_runs.run(proposed["run"]["run_id"])
+        self.assertEqual(run.status, "cancelled")
+
+    async def test_approve_issues_a_grant_and_runs_once(self):
+        self._register()
+        proposed = await (await self.post("/app/task/propose", {"goal": "回到桌面"})).get_json()
+        approval_id = proposed["approval"]["approval_id"]
+        with patch.object(self.plugin._task_executor, "execute", new=AsyncMock(side_effect=lambda run, **kw: run)) as execute:
+            response = await self.post("/app/task/approve", {"approval_id": approval_id})
+            self.assertEqual(response.status_code, 200, await response.get_data(as_text=True))
+            self.assertEqual(execute.await_count, 1)
+            grant = execute.await_args.kwargs["grant"]
+            self.assertIn("home", grant.actions)
+            self.assertEqual(grant.source, "approval")
+            again = await self.post("/app/task/approve", {"approval_id": approval_id})
+            self.assertEqual(again.status_code, 409)
+            self.assertEqual(execute.await_count, 1)
