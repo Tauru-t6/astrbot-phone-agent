@@ -294,6 +294,11 @@
     "default": true,
     "description": "Refuse to run a task while the phone is in active use (interactive screen, a foreground app that is neither a launcher nor the task's own target). Callers may override per request with allow_while_active."
   },
+  "task_approval_ttl_seconds": {
+    "type": "int",
+    "default": 60,
+    "description": "How long a proposed task waits for a human decision before it expires. A proposal alone never touches the phone."
+  },
   "task_runs_path": {
     "type": "text",
     "default": "",
