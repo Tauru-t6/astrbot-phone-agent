@@ -271,6 +271,27 @@ class PhoneAgentPlugin(Star):
         self._register_web_api()
         self._start_night_guard()
         self._start_autonomy_scheduler()
+        self._warm_device_route()
+
+    def _warm_device_route(self) -> None:
+        """Remember the reachable phone URL at startup.
+
+        The URL list can contain addresses that are no longer reachable; probing
+        them on every command cost about 9 s per command before this cache.
+        """
+        if self._control_backend() != "app":
+            return
+
+        async def warm() -> None:
+            try:
+                await asyncio.to_thread(self.device_app.warm)
+            except Exception:
+                return
+
+        try:
+            asyncio.get_running_loop().create_task(warm())
+        except RuntimeError:  # pragma: no cover - no loop in tests
+            return
 
     async def terminate(self) -> None:
         autonomy = self._autonomy_task
@@ -732,6 +753,9 @@ class PhoneAgentPlugin(Star):
             "app_version": _text(payload.get("app_version"), 40),
             # Diagnostic only: why the app could not read a foreground package.
             "foreground_debug": _text(payload.get("foreground_debug"), 160),
+            # Diagnostic only: persistent shell vs one-shot process, and latency.
+            "shell_mode": _text(payload.get("shell_mode"), 20),
+            "last_shell_ms": payload.get("last_shell_ms"),
             "reported_at": payload.get("reported_at"),
         }
         self.device_app.record_device_status(status)

@@ -488,6 +488,14 @@ class DeviceAppBackend:
             "error": "" if result.get("success") else _text(result.get("error"), 200),
         }
 
+    def warm(self) -> str:
+        """Discover the reachable URL once so the first command does not pay for
+        every dead candidate in the list."""
+        result = self.health()
+        if result.get("available") and result.get("base_url"):
+            self._active_url = result["base_url"]
+        return self._active_url
+
     def _direct_command(self, envelope: dict[str, Any], timeout: float) -> dict[str, Any]:
         urls = self.direct_urls()
         if not urls:
