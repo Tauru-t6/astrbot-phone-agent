@@ -840,6 +840,7 @@ class PhoneAgentPlugin(Star):
             # P1-E stage 2: dry-run task history; write steps are simulated.
             "task_runs": self._task_runs.runs(limit=5),
             "task_grants": self._task_runs.grants(),
+            "task_approvals": self._task_runs.approvals(limit=3),
             "task_execute_enabled": self._bool_config("enable_task_execute", False),
         })
 
