@@ -15,10 +15,10 @@
 | 配置值 | `control_backend=app` | `control_backend=operit`，默认值 |
 | 手机端 | [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) + Shizuku | [OperitAI](https://github.com/Mavaebrook/Operit) + Shizuku |
 | 执行方式 | 固定指令集合、结构化 JSON | 手机端 Agent 解析自然语言并操作 UI |
-| 手机端模型 | 执行指令不需要额外模型；App 聊天走 AstrBot | 需要可用模型及工具调用 |
+| 手机端模型 | 执行指令不需要额外模型（聊天在 QQ 侧，App 不承载对话） | 需要可用模型及工具调用 |
 | 结构化界面操作 | `phone_action` 支持点击、长按、滑动、滚动、输入文字和按键 | 通过 `operit_task` 由手机端模型自行决定操作 |
 | 网络 | 有序局域网 / Tailscale 直连 → Relay | Operit HTTP 直连 → Relay 工作流 |
-| 新增前端能力 | 聊天、任务记录、提醒、时间线、连接设置；名称与头像由用户设置 | 使用 Operit 自己的界面 |
+| 前端能力 | 任务记录、提醒、时间线、连接设置、夜间守护与自主关怀诊断；名称与头像由用户设置 | 使用 Operit 自己的界面 |
 
 `adb` 保留为旧配置的诊断后端，不是第三种推荐产品模式。旧值 `phone_buddy`、`native_app`、`own_frontend` 会映射为 `app`；`operitai`、`operit_ai` 会映射为 `operit`。升级不会自动把原来的 Operit 配置切换为 App。
 

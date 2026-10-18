@@ -15,7 +15,7 @@ perform an Android health probe unless explicitly requested by a device route.
 ```json
 {
   "success": true,
-  "api_version": 2,
+  "api_version": 3,
   "server_time": 1760000000.123,
   "backend": "app",
   "features": {"reminders": true, "audit": true},
@@ -28,6 +28,47 @@ perform an Android health probe unless explicitly requested by a device route.
 `timeline` contains the latest 100 events. `notify` is true only for a
 reminder due event. The app polls this list and deduplicates by
 `notification_id`; the plugin does not push an app reminder directly.
+
+## State additions in `api_version: 3`
+
+`GET /app/state` reports `api_version: 3` and carries these extra blocks:
+
+| Field | Meaning |
+| --- | --- |
+| `night_guard` | `enabled`, `window` (`HH:MM-HH:MM`), `in_window`, `dry_run`, `packages` (resolved watch list) and `states` keyed by user (`phase`, `foreground_package`, `owned_suspended`, `enforcement_count`, `last_error`). |
+| `sleep_mode` | `manual_active`, `until`, `suspended` — the on-demand "守夜" restriction, separate from the night guard. |
+| `device_last_status` | Last accepted heartbeat: `battery_percent`, `charging`, `foreground_package`, `screen_interactive`, `shizuku_ready`, `app_version`, `foreground_debug`, `reported_at`, `received_at`. `reported_at` is the phone's own sampling time; a sample older than `night_guard_status_max_age_seconds` must be treated as stale. |
+| `care` | Read-only snapshot written by the optional companion bridge: `mode`, `quiet_hours`, `in_quiet_hours`, `daily_limit`, `eval_daily_limit`, and `users[uid]` = `sent_today`, `remaining`, `eval_today`, `last_sent_at`, `recent[]` (`outcome`, `reason`, `detail`, `at`). `null` until that bridge installs. |
+| `task_runs` | Latest five dry-run task records (see below). |
+| `task_grants` | Active scoped grants. |
+
+`care` is written by the companion plugin, not by the phone plugin; a missing
+block means "unknown", never "disabled".
+
+## Task dry-run
+
+`POST /app/task/plan` accepts:
+
+```json
+{"goal":"帮我把B站暂停一会儿","subject":"1125961157","grant_id":"optional-hex"}
+```
+
+- Requires a registered device (`409 no_device` when there is none) and the
+  `observe_tool` feature.
+- Plans the goal with a deterministic rule set, **observes for real** from the
+  heartbeat cache, and **simulates** every write step. No command reaches the
+  phone.
+- Each simulated step carries
+  `verify = {would_execute, grant_ok, reason, dry_run}`, where `reason` is one
+  of `grant_missing`, `grant_expired`, `grant_subject_mismatch`,
+  `grant_device_mismatch`, `grant_action_not_allowed`, `grant_package_required`
+  or `grant_package_not_allowed`.
+- `run.status` is `done` or `failed` (`observation_stale` when the cached
+  observation is too old); `run.summary` is
+  `{dry_run, planned, observed, simulated, blocked, failed}`.
+
+The response is `{ "success": true, "run": { ... } }`. Runs are persisted under
+`task_runs_path` with a capped history and also appear in `/app/state`.
 
 ## App reminders
 
