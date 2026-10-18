@@ -872,10 +872,18 @@ class PhoneAgentPlugin(Star):
         if not actions:
             return jsonify({"success": False, "error": "the goal has nothing to approve",
                             "error_code": "nothing_to_approve"}), 409
+        try:
+            requested_ttl = (float(payload["ttl_seconds"])
+                             if payload.get("ttl_seconds") is not None else None)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "ttl_seconds must be a number",
+                            "error_code": "invalid_ttl"}), 400
+        ttl = requested_ttl if requested_ttl is not None else self._task_float(
+            "task_approval_ttl_seconds", 180.0, 30.0, 300.0)
         approval = ApprovalRequest.create(
             run_id=run.run_id, subject=subject, device_id=device_id,
             actions=actions, packages=packages,
-            ttl_seconds=self._task_float("task_approval_ttl_seconds", 60.0, 10.0, 300.0),
+            ttl_seconds=max(30.0, min(ttl, 300.0)),
         )
         run.transition(RUN_WAITING_APPROVAL)
         self._task_runs.add_run(run)

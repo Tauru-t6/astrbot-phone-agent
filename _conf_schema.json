@@ -296,7 +296,7 @@
   },
   "task_approval_ttl_seconds": {
     "type": "int",
-    "default": 60,
+    "default": 180,
     "description": "How long a proposed task waits for a human decision before it expires. A proposal alone never touches the phone."
   },
   "task_runs_path": {
