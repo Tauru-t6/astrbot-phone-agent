@@ -585,6 +585,10 @@ class TaskRunStore:
         for raw in data.get("runs") or []:
             if isinstance(raw, dict):
                 run = PhoneTaskRun.from_dict(raw)
+                # A run interrupted by a restart would otherwise sit in
+                # "executing" forever and never report a result.
+                if run.status in {RUN_EXECUTING, RUN_VERIFYING, RUN_RUNNING}:
+                    run.transition(RUN_FAILED, error="interrupted")
                 self._runs[run.run_id] = run
         for raw in data.get("grants") or []:
             if isinstance(raw, dict):

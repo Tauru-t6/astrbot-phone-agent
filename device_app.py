@@ -45,6 +45,7 @@ def plugin_data_path(value: Any, default_name: str) -> Path:
 # shipped before the plugin starts sending it.
 COMMAND_ACTIONS = frozenset({
     "status",
+    "quick_status",
     "open_app",
     "close_app",
     "foreground_app",

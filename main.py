@@ -2111,7 +2111,9 @@ class PhoneAgentPlugin(Star):
         if self._control_backend() != "app":
             return self.device_app.last_status() or {}
         try:
-            result = await asyncio.to_thread(self.device_app.execute, "status", {})
+            # quick_status skips the usage-stats aggregation, which costs ~10 s
+            # and is irrelevant to verifying a step that just ran.
+            result = await asyncio.to_thread(self.device_app.execute, "quick_status", {})
         except Exception:
             return self.device_app.last_status() or {}
         output = result.get("output") if isinstance(result, dict) else None
