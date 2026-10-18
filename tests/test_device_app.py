@@ -298,6 +298,10 @@ class FailoverTests(unittest.TestCase):
 
     def test_mismatched_result_is_rejected_and_not_replayed(self):
         for update in ({"command_id": "another"}, {"action": "home"}, {"type": "other"}, {"schema_version": 2}):
+            # Start each round without a cached success URL: a cached one skips
+            # the health probe by design, which would make this count 1.
+            self.backend._active_url = ""
+
             def http(url, token, method="GET", payload=None, timeout=15):
                 return {"success": True} if url.endswith("/health") else self.result(payload, **update)
             with patch.object(self.backend, "_http_json", side_effect=http) as call:

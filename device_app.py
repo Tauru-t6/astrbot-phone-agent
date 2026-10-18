@@ -99,7 +99,7 @@ MAX_SCREENSHOT_BYTES = 2_200_000
 
 MAX_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 200
-_HEALTH_TIMEOUT_SECONDS = 3
+_HEALTH_TIMEOUT_SECONDS = 1.5
 _REGISTER_TIMEOUT_SECONDS = 8
 
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
@@ -128,6 +128,10 @@ class DeviceAppBackend:
         # and status samples from the previous device can be invalidated.
         self._registration_generation = 0
         self._last_status: dict[str, Any] | None = None
+        # The URL that answered last: try it first and skip its health probe.
+        # Without this every command paid the health timeout for each dead
+        # candidate (three dead addresses = 9 s per command).
+        self._active_url = ""
         self._status_history: list[tuple[float, dict[str, Any]]] = []
         self._recent_results: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
@@ -488,13 +492,18 @@ class DeviceAppBackend:
         urls = self.direct_urls()
         if not urls:
             return {"success": False, "error_code": "not_registered", "error": "phone app has not registered"}
+        if self._active_url and self._active_url in urls:
+            urls = [self._active_url] + [item for item in urls if item != self._active_url]
         last = {"success": False, "error_code": "direct_unavailable", "error": "phone app direct endpoints unavailable"}
         deadline = time.monotonic() + timeout
         for index, base_url in enumerate(urls):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            health = self._http_json(base_url + "/health", self.shared_token(), timeout=min(_HEALTH_TIMEOUT_SECONDS, remaining))
+            if base_url == self._active_url:
+                health = {"success": True}  # it answered a moment ago
+            else:
+                health = self._http_json(base_url + "/health", self.shared_token(), timeout=min(_HEALTH_TIMEOUT_SECONDS, remaining))
             if not health.get("success"):
                 last = health
                 continue
@@ -507,6 +516,7 @@ class DeviceAppBackend:
             if result.get("command_id") or result.get("type") == "result" or result.get("success"):
                 # A matching denial is final. A malformed result is also final:
                 # the command may already have run, so do not replay it.
+                self._active_url = base_url
                 return self._normalize_result(result, envelope)
             if result.get("error_code") in {"denied", "bad_args", "unsupported_action", "unauthorized"}:
                 return {**result, "command_id": envelope["command_id"], "action": envelope["action"]}
