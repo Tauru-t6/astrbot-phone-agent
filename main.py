@@ -540,6 +540,8 @@ class PhoneAgentPlugin(Star):
             "night_guard": self._night_guard_public_view(),
             # P1-D: read-only snapshot written by the companion bridge.
             "care": self._care_status_snapshot(),
+            # P1-E: latest runs so the dashboard can show what executed.
+            "task_runs": self._task_runs.runs(limit=5),
             "tasks": len(self._operit_tasks),
             "reminders": len(self._reminders),
         })

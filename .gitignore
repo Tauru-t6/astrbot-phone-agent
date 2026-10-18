@@ -18,4 +18,6 @@ phone_agent_night_guard.json
 phone_agent_app_state.json
 phone_agent_notifications.json
 relay_state.json
+# Test-harness runtime directory (never part of the plugin).
+data/
 __pycache__/

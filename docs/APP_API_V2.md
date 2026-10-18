@@ -70,6 +70,49 @@ block means "unknown", never "disabled".
 The response is `{ "success": true, "run": { ... } }`. Runs are persisted under
 `task_runs_path` with a capped history and also appear in `/app/state`.
 
+## Task execution (stage 3)
+
+`POST /app/task/run` accepts:
+
+```json
+{"goal":"回到桌面","grant_id":"...","allow_while_active":false}
+```
+
+- Requires `enable_task_execute` (default **false**), a registered device and a
+  valid, unexpired grant; otherwise `403 disabled`, `409 no_device` or
+  `409 grant_required`.
+- The run is synchronous and bounded by `task_run_timeout_seconds` (default 90).
+- Every write step is verified with a **live** observation taken after the
+  command. The periodic heartbeat is far too slow to prove a step worked, so
+  `_task_observe_live` asks the phone for its state directly.
+- Postconditions: `open_app` → foreground equals the package; `close_app` and
+  `suspend_app` → foreground differs (suspend also needs `device_verified`);
+  `unsuspend_app` → device verified; `lock_screen` → `screen_interactive: false`;
+  `home`/`back` → the foreground changed.
+- Step failures never retry: `grant_missing`, `grant_expired`,
+  `grant_step_limit`, `action_not_enabled`, `protected_package`, `command_error`,
+  `timeout`, `foreground_mismatch`, `still_foreground`, `not_verified`,
+  `no_change`, `screen_still_on`, `stale_observation`.
+- `step.verify` is `{reason, detail, command_success, verified, observed_at}`.
+  `command_success` is only the command's own acknowledgement and `verified` is
+  the device's own post-check; **success is `reason == "ok"`**, nothing else.
+- A `suspend_app` that fails rolls back only when the same grant covers
+  `unsuspend_app`; otherwise the summary carries `restore_pending`.
+
+### Idle guard
+
+Unless the caller passes `allow_while_active: true`, a run is refused with
+`refused: "user_active"` when the screen is interactive and the foreground app
+is neither a launcher nor one of the task's own target packages. Nothing is sent
+to the phone in that case. The override is recorded in `run.summary` and the
+audit log so an execution during someone's active session stays traceable.
+
+`POST /app/grant` accepts `{actions, packages, ttl_seconds, max_steps}` and
+returns `{grant_id, expires_at}`. `actions` must name write actions; the
+package-bound ones (`open_app`, `close_app`, `suspend_app`, `unsuspend_app`)
+require `packages`. `ttl_seconds` is clamped to 30–600 and `max_steps` to 1–3.
+`POST /app/task/cancel` accepts `{run_id}` and only flags the run.
+
 ## App reminders
 
 `POST /app/reminders` accepts exactly the following useful fields:

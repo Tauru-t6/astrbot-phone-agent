@@ -998,6 +998,7 @@ class TaskExecutor:
             step.command_id = _short(result.get("command_id"), 64)
             verdict, observation = await self._settle(step, result, before)
             step.verify = {
+                "ok": verdict.ok,
                 "reason": verdict.reason,
                 "detail": verdict.detail,
                 "command_success": verdict.command_success,

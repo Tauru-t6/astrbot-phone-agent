@@ -56,6 +56,13 @@
       <article class="panel stat"><span class="muted">后台任务</span><strong id="taskCount">0</strong><small id="reminderCount">提醒 0</small></article>
     </div>
     <div class="grid two" style="margin-top:14px">
+      <article class="panel"><div class="panel-head"><div><h2>夜间守护</h2><p class="muted">dry-run 只观察，不暂停应用</p></div></div><div id="guardRows" class="rows"></div></article>
+      <article class="panel"><div class="panel-head"><div><h2>自我关怀</h2><p class="muted">只读：模式、配额与最近决策</p></div></div><div id="careRows" class="rows"></div></article>
+    </div>
+    <div class="grid" style="margin-top:14px">
+      <article class="panel"><div class="panel-head"><div><h2>最近任务</h2><p class="muted">试跑与真实执行，含每步核验结论</p></div></div><div id="taskRunRows" class="rows"></div></article>
+    </div>
+    <div class="grid two" style="margin-top:14px">
       <article class="panel"><div class="panel-head"><div><h2>连接状态</h2><p class="muted">只显示状态，不回显密钥</p></div><div class="actions"><button id="testBtn" type="button">测试当前后端</button><button id="locationBtn" type="button">获取定位</button></div></div><div id="statusRows" class="rows"></div><p id="statusNotice" class="notice"></p><pre id="locationPre" hidden></pre><p id="locationNotice" class="notice"></p></article>
       <article class="panel"><div class="panel-head"><div><h2>今日健康摘要</h2><p class="muted">来自 xiaomi-sync 的只读 SQLite</p></div><button id="healthBtn" type="button">刷新健康</button></div><div id="healthRows" class="rows"></div></article>
     </div>
@@ -78,7 +85,27 @@ async function post(name, body){ return bridge.apiPost(name, body); }
 function showBackendFields(){ document.querySelectorAll('[data-backend]').forEach(el=>el.hidden=el.dataset.backend!==$('control_backend').value); }
 function fillConfig(c){ ['control_backend','operit_base_url','app_direct_urls','allowed_user_ids','app_aliases_json','sleep_guard_packages','sleep_guard_exempt_apps'].forEach(k=>{ if($(k)) $(k).value = c[k] ?? ''; }); showBackendFields(); }
 function renderStatus(data){ const isApp=data.control_backend==='app', label=isApp?'AstrBot Phone Agent App':data.control_backend==='adb'?'ADB（旧版诊断）':'OperitAI'; $('backendLabel').textContent=label; const o=(isApp?data.device_app:data.operit)||{}, h=data.health||{}, s=data.sleep_mode||{}, sync=h.sync||{}; $('operitState').textContent=o.available?'在线':'离线'; $('operitState').className=o.available?'good-text':'bad-text'; $('operitVersion').textContent=text(o.app_version||o.version); $('healthState').textContent=!h.available?(h.error?'不可用':'未配置'):h.fresh?'已同步':'可能过期'; $('healthState').className=!h.available||h.fresh?'':'bad-text'; $('healthDate').textContent=sync.finished_at?`数据 ${text(h.latest?.date)} · 同步 ${sync.finished_at}`:text(h.latest?.date); $('sleepState').textContent=s.manual_active?'临时':'按需'; $('sleepUntil').textContent=text(s.until); $('taskCount').textContent=text(data.tasks); $('reminderCount').textContent='提醒 '+text(data.reminders); $('headerStatus').textContent=label+(o.available?' 在线':' 不可用'); $('headerDot').className='dot '+(o.available?'good':'bad'); const rows=[['后端',data.config?.control_backend],['直连地址',isApp?(o.base_url||data.config?.app_direct_urls):data.config?.operit_base_url],['Token',(isApp?data.config?.app_shared_token_configured:data.config?.operit_token_configured)?'已配置':'未配置'],['健康库',h.available?(h.fresh?'已连接':'已连接但可能过期'):(h.error?'不可用':'未配置')],['最近同步',sync.finished_at||'--'],['私人陪伴授权',data.config?.use_private_companion_auth?'已开启':'关闭']]; $('statusRows').innerHTML=rows.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); const latest=h.latest||{}; const health=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]]; $('healthRows').innerHTML=health.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); if(!document.getElementById('settings').classList.contains('active')) fillConfig(data.config||{}); }
-async function refresh(){ try { const data=await get('status'); if(data.success===false) throw Error(data.error||'读取失败'); renderStatus(data); setNotice('statusNotice',''); } catch(e){ $('headerStatus').textContent='状态读取失败'; $('headerDot').className='dot bad'; setNotice('statusNotice',e.message); } }
+function renderAutonomy(data){
+  const t=v=>escapeHtml(text(v==null?'--':v));
+  const row=(k,v)=>`<div class="row"><span class="muted">${k}</span><span class="value">${t(v)}</span></div>`;
+  const ng=data.night_guard||{};
+  $('guardRows').innerHTML=[['开关',ng.enabled?'已开启':'关闭'],['时间窗',ng.window||'--'],['当前',ng.in_window?'窗口内':'窗口外'],['模式',ng.dry_run?'dry-run（只观察）':'真实执行'],['监视应用',(ng.packages||[]).length+' 个']].map(r=>row(r[0],r[1])).join('');
+  const care=data.care||null;
+  const careRows=care?[['状态',care.autonomy_enabled?'已开启':'关闭'],['模式',care.mode==='preview'?'预览（不发送）':care.mode],['安静时段',care.quiet_hours||'--'],['今日配额',(care.sent_today||0)+'/'+(care.daily_limit||0)+'，剩 '+(care.remaining||0)],['今日评估',(care.eval_today||0)+' 次']]:[['状态','未收到关怀快照']];
+  const recent=(care&&care.recent)||[];
+  $('careRows').innerHTML=careRows.map(r=>row(r[0],r[1])).join('')+recent.slice(-2).reverse().map(item=>row(t(item.outcome)+' · '+t(item.reason),item.detail||'')).join('');
+  const runs=data.task_runs||[];
+  $('taskRunRows').innerHTML=runs.length?runs.slice(0,3).map(run=>{
+    const s=run.summary||{}, bits=[];
+    if(s.dry_run) bits.push('试跑');
+    if(s.executed) bits.push('执行 '+s.executed);
+    if(s.verified) bits.push('核验 '+s.verified);
+    if(s.failed) bits.push('失败 '+s.failed);
+    if(s.refused) bits.push('被拒 '+s.refused);
+    return row(t(run.goal||'任务'),(run.status||'')+(bits.length?' · '+bits.join(' · '):''));
+  }).join(''):row('暂无','还没有执行过任务');
+}
+async function refresh(){ try { const data=await get('status'); if(data.success===false) throw Error(data.error||'读取失败'); renderStatus(data); renderAutonomy(data); setNotice('statusNotice',''); } catch(e){ $('headerStatus').textContent='状态读取失败'; $('headerDot').className='dot bad'; setNotice('statusNotice',e.message); } }
 async function loadHealth(){ try { const data=await get('health',{days:'7'}); const h=data.health||{}; const latest=(h.days||[])[0]||{}; $('healthRows').innerHTML=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]].map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); } catch(e){ setNotice('statusNotice',e.message); } }
 async function saveConfig(){ try { let aliases=$('app_aliases_json').value.trim(); if(aliases) JSON.parse(aliases); const body={}; ['control_backend','operit_base_url','app_direct_urls','allowed_user_ids','app_aliases_json'].forEach(k=>body[k]=$(k).value); for(const key of ['operit_token','app_shared_token']) if($(key).value.trim()) body[key]=$(key).value.trim(); const r=await post('config',body); if(r.success===false) throw Error(r.error||'保存失败'); $('operit_token').value=''; $('app_shared_token').value=''; setNotice('saveNotice','已保存',true); await refresh(); } catch(e){ setNotice('saveNotice',e.message); } }
 async function savePolicyDefaults(){ const body={sleep_guard_packages:$('sleep_guard_packages').value,sleep_guard_exempt_apps:$('sleep_guard_exempt_apps').value}; try { const r=await post('config',body); if(r.success===false) throw Error(r.error||'保存失败'); $('sleep_guard_packages').value=r.config?.sleep_guard_packages??body.sleep_guard_packages; $('sleep_guard_exempt_apps').value=r.config?.sleep_guard_exempt_apps??body.sleep_guard_exempt_apps; setNotice('policyConfigNotice','默认列表已保存',true); } catch(e){ setNotice('policyConfigNotice',e.message); } }

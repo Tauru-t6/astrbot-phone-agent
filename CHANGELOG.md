@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.8.1]
+
+### Added
+
+- **Task execution (P1-E stage 3).** `POST /app/task/run` executes a granted
+  task and verifies every step against a **live** observation taken after the
+  command; the 45 s heartbeat is too slow to prove a step worked. Failure
+  reasons never retry, and a failed `suspend_app` rolls back only when the grant
+  covers `unsuspend_app`.
+- **Scoped grants.** `POST /app/grant` issues a bound grant
+  (`subject`/`device`/actions/packages/TTL 30–600 s/steps 1–3);
+  `POST /app/task/cancel` flags a run.
+- **Idle guard.** A run is refused with `user_active` while the screen is on and
+  the foreground app is neither a launcher nor the task's own target. Callers
+  may pass `allow_while_active`, which is recorded in the summary and audit.
+- **Dashboard panels.** The plugin page now shows the night guard, the care
+  snapshot and the latest task runs (`/status` gained `task_runs`).
+
+### Changed
+
+- `step.verify` carries `ok` next to `reason`; `verified` remains the device's
+  own post-check, so success is `ok == true`, not `command_success`.
+
 ## [0.8.0]
 
 ### Added
