@@ -1060,7 +1060,9 @@ class TaskExecutor:
                 break
             if step.action == "observe":
                 counts["executed"] += 1
-                observation = await self._read_observation(live=True)
+                # The run already sampled the phone before the first step; reuse
+                # it instead of paying for a second probe of the same instant.
+                observation = before if before is not None else await self._read_observation(live=True)
                 if observation is None:
                     step.finish(ok=False, verify={"reason": "stale_observation"}, error="stale_observation", now=_now())
                     counts["failed"] += 1
@@ -1104,6 +1106,7 @@ class TaskExecutor:
 
             step.start(command_id="", now=_now())
             step.grant_id = grant.grant_id if grant else ""
+            act_started = _now()
             try:
                 result = await asyncio.wait_for(self._act(step.action, dict(step.args)), timeout=self._step_timeout)
             except asyncio.TimeoutError:
@@ -1121,9 +1124,11 @@ class TaskExecutor:
                 break
 
             counts["executed"] += 1
+            act_ms = round((_now() - act_started) * 1000)
             result = result if isinstance(result, dict) else {"success": False}
             step.command_id = _short(result.get("command_id"), 64)
             verdict, observation = await self._settle(step, result, before)
+            verify_ms = round((_now() - act_started) * 1000) - act_ms
             step.verify = {
                 "ok": verdict.ok,
                 "reason": verdict.reason,
@@ -1131,6 +1136,8 @@ class TaskExecutor:
                 "command_success": verdict.command_success,
                 "verified": verdict.verified,
                 "observed_at": verdict.observed_at,
+                "act_ms": act_ms,
+                "verify_ms": verify_ms,
             }
             step.finished_at = _now()
             step.error = "" if verdict.ok else verdict.reason
