@@ -268,5 +268,35 @@
     "type": "text",
     "default": "",
     "description": "Where to read the companion bridge's read-only care snapshot. Empty uses the default plugin data path; must match companion-context's care_status_path."
+  },
+  "enable_task_execute": {
+    "type": "bool",
+    "default": false,
+    "description": "Execute granted phone tasks instead of only dry-running them. Keep false until the dry-run history looks right."
+  },
+  "task_execute_allowed_actions": {
+    "type": "text",
+    "default": "open_app,home,back",
+    "description": "Comma-separated write actions the executor may run. A grant can still narrow this per run; listing an action here never overrides the grant."
+  },
+  "task_step_timeout_seconds": {
+    "type": "int",
+    "default": 20,
+    "description": "Per-step timeout. A timed-out step is marked unknown and observed, never re-sent."
+  },
+  "task_run_timeout_seconds": {
+    "type": "int",
+    "default": 90,
+    "description": "Total budget for one task run; remaining steps are skipped when it expires."
+  },
+  "task_require_user_idle": {
+    "type": "bool",
+    "default": true,
+    "description": "Refuse to run a task while the phone is in active use (interactive screen, a foreground app that is neither a launcher nor the task's own target). Callers may override per request with allow_while_active."
+  },
+  "task_runs_path": {
+    "type": "text",
+    "default": "",
+    "description": "Persistent task run history (capped). Empty uses the default plugin data path."
   }
 }

@@ -18,6 +18,7 @@ Design notes
   every id needed to reconstruct the chain (run -> step -> grant -> observation
   -> command).
 """
+import asyncio
 import json
 import os
 import time
@@ -32,18 +33,22 @@ GRANT_SOURCE_MANUAL = "manual"
 GRANT_SOURCE_APPROVAL = "approval"
 GRANT_SOURCES = {GRANT_SOURCE_MANUAL, GRANT_SOURCE_APPROVAL}
 
+# Actions bound to one package: a grant for these must name the package.
+PACKAGE_ACTIONS = {"open_app", "close_app", "suspend_app", "unsuspend_app"}
+
 # Actions that change the phone. Read-only observation is not gated by a grant.
-WRITE_ACTIONS = {
-    "open_app",
-    "close_app",
+WRITE_ACTIONS = PACKAGE_ACTIONS | {
     "tap",
     "long_press",
     "input_text",
     "key_event",
     "scroll",
     "swipe",
-    "suspend_app",
-    "unsuspend_app",
+    "home",
+    "back",
+    "lock_screen",
+    "wake_screen",
+    "screenshot",
 }
 
 RUN_PLANNING = "planning"
@@ -60,7 +65,17 @@ STEP_RUNNING = "running"
 STEP_DONE = "done"
 STEP_FAILED = "failed"
 STEP_SKIPPED = "skipped"
-STEP_STATUSES = {STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED, STEP_SKIPPED}
+STEP_EXECUTED_UNVERIFIED = "executed_unverified"
+STEP_UNKNOWN = "unknown"
+STEP_STATUSES = {
+    STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED, STEP_SKIPPED,
+    STEP_EXECUTED_UNVERIFIED, STEP_UNKNOWN,
+}
+
+RUN_EXECUTING = "executing"
+RUN_VERIFYING = "verifying"
+RUN_STATUSES = RUN_STATUSES | {RUN_EXECUTING, RUN_VERIFYING}
+RUN_ACTIVE = RUN_ACTIVE | {RUN_EXECUTING, RUN_VERIFYING}
 
 
 def _now() -> float:
@@ -138,7 +153,7 @@ class ScopedGrant:
         action = _short(action, 40)
         if action not in self.actions:
             return False, "grant_action_not_allowed"
-        if action in WRITE_ACTIONS and not package:
+        if action in PACKAGE_ACTIONS and not package:
             return False, "grant_package_required"
         if package and self.packages and _short(package, 160) not in self.packages:
             return False, "grant_package_not_allowed"
@@ -592,6 +607,12 @@ class TaskPlanner:
             return steps
         if any(word in text for word in ("截图", "截屏", "截个图", "截一张")):
             steps.append(PlannedStep("screenshot", {}, "只读截图"))
+        if any(word in text for word in ("回到桌面", "回桌面", "回主页", "打开桌面")):
+            steps.append(PlannedStep("home", {}, "回到桌面，用前台变化核验"))
+            return steps
+        if any(word in text for word in ("返回上一页", "按返回")):
+            steps.append(PlannedStep("back", {}, "按一次返回，用前台变化核验"))
+            return steps
         package = self.resolve(text)
         if package and any(word in text for word in ("暂停", "禁掉", "关掉", "关闭", "限制", "别让")):
             steps.append(PlannedStep("suspend_app", {"package": package}, "需要 grant 覆盖该包"))
@@ -687,4 +708,335 @@ class ReadOnlyTaskRunner:
         run.touch(stamp)
         self._store.add_run(run)
         self._store.save()
+        return run
+
+
+# ---------------------------------------------------------------- stage 3 executor
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Foreground packages that mean "the phone is idle at its home screen".
+_LAUNCHER_HINTS = ("launcher", ".home", "homescreen", "com.android.settings")
+
+
+def _looks_idle(foreground: str) -> bool:
+    lowered = foreground.lower()
+    return not lowered or any(hint in lowered for hint in _LAUNCHER_HINTS)
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """Outcome of one executed step, including why it passed or failed."""
+
+    ok: bool
+    reason: str
+    detail: str = ""
+    command_success: bool = False
+    verified: bool = False
+    observed_at: float | None = None
+
+
+class TaskExecutor:
+    """Stage 3: execute steps and verify each postcondition with a new observation.
+
+    Two hard rules: a command that returns success is not proof the step worked,
+    and every verification uses an observation that is newer than the command
+    and inside the freshness window. Writes are never retried automatically.
+    """
+
+    def __init__(
+        self,
+        store: TaskRunStore,
+        planner: TaskPlanner,
+        *,
+        observe: Callable[[], Any],
+        act: Callable[[str, dict[str, Any]], Any],
+        observe_live: Callable[[], Any] | None = None,
+        allowed_actions: tuple[str, ...] | set[str] | None = None,
+        protected_packages: tuple[str, ...] | set[str] = (),
+        step_timeout: float = 20.0,
+        run_timeout: float = 90.0,
+        observation_max_age: float = 90.0,
+        observation_wait: float = 3.0,
+        require_user_idle: bool = True,
+    ) -> None:
+        self._store = store
+        self._planner = planner
+        self._observe = observe
+        self._observe_live = observe_live
+        self._act = act
+        self._allowed = {item for item in (allowed_actions or ()) if item}
+        self._protected = {item for item in protected_packages if item}
+        self._step_timeout = max(0.05, float(step_timeout))
+        self._run_timeout = max(5.0, float(run_timeout))
+        self._observation_max_age = max(1.0, float(observation_max_age))
+        self._observation_wait = max(0.5, float(observation_wait))
+        self._require_user_idle = bool(require_user_idle)
+
+    # -- helpers
+
+    async def _read_observation(self, live: bool = False) -> dict[str, Any] | None:
+        """A fresh status sample, or None when the phone has nothing recent.
+
+        ``live`` asks the phone directly instead of reading the heartbeat cache:
+        a heartbeat arrives every 45 s, far too slow to verify a step.
+        """
+        source = self._observe_live if (live and self._observe_live is not None) else self._observe
+        try:
+            status = await source() or {}
+        except Exception:
+            return None
+        stamp = _number(status.get("reported_at"))
+        if stamp is None:
+            return None
+        if _now() - stamp > self._observation_max_age:
+            return None
+        return status
+
+    async def _settle(self, step: RunStep, result: dict[str, Any],
+                      before: dict[str, Any] | None) -> tuple[Verdict, dict[str, Any] | None]:
+        """Poll a live observation until the postcondition holds or time is up."""
+        deadline = _now() + self._observation_wait
+        observation = None
+        verdict = self._verify(step.action, step.args, result, None, before)
+        while True:
+            observation = await self._read_observation(live=True)
+            verdict = self._verify(step.action, step.args, result, observation, before)
+            if verdict.ok or _now() >= deadline:
+                return verdict, observation
+            await asyncio.sleep(0.4)
+
+    def _verify(
+        self,
+        action: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        observation: dict[str, Any] | None,
+        before: dict[str, Any] | None,
+    ) -> Verdict:
+        package = _short(args.get("package"), 160)
+        success = bool(result.get("success"))
+        verified = result.get("verified") is True
+        observed_at = _number((observation or {}).get("reported_at"))
+        foreground = _short((observation or {}).get("foreground_package"), 160)
+        before_foreground = _short((before or {}).get("foreground_package"), 160)
+
+        if observation is None:
+            return Verdict(False, "stale_observation", "", success, verified, None)
+        if action == "open_app":
+            ok = foreground == package
+            return Verdict(ok, "ok" if ok else "foreground_mismatch",
+                           f"expected={package} got={foreground}", success, verified, observed_at)
+        if action == "close_app":
+            ok = foreground != package
+            return Verdict(ok, "ok" if ok else "still_foreground", f"foreground={foreground}", success, verified, observed_at)
+        if action == "suspend_app":
+            ok = success and verified and foreground != package
+            reason = "ok" if ok else ("not_verified" if not verified else "still_foreground")
+            return Verdict(ok, reason, f"foreground={foreground}", success, verified, observed_at)
+        if action == "unsuspend_app":
+            ok = success and verified
+            return Verdict(ok, "ok" if ok else "not_verified", _short(result.get("error"), 120), success, verified, observed_at)
+        if action == "lock_screen":
+            ok = observation.get("screen_interactive") is False
+            return Verdict(ok, "ok" if ok else "screen_still_on", "", success, verified, observed_at)
+        if action in {"home", "back"}:
+            ok = foreground != before_foreground
+            return Verdict(ok, "ok" if ok else "no_change",
+                           f"{before_foreground} -> {foreground}", success, verified, observed_at)
+        if action == "screenshot":
+            payload = result.get("output")
+            ok = success and bool(payload)
+            return Verdict(ok, "ok" if ok else "empty_capture", "", success, verified, observed_at)
+        # Anything else is executed but cannot be judged from the phone state.
+        return Verdict(True, "executed_unverified", "", success, verified, observed_at)
+
+    async def _rollback(self, run: PhoneTaskRun, args: dict[str, Any], grant: ScopedGrant | None) -> bool:
+        """Only suspend_app rolls back; anything else leaves a pending note."""
+        package = _short(args.get("package"), 160)
+        allowed, _reason = (False, "no_grant")
+        if grant is not None:
+            allowed, _reason = grant.check(
+                subject=run.subject, device_id=run.device_id,
+                action="unsuspend_app", package=package, now=_now(),
+            )
+        if not allowed or package in self._protected:
+            return False
+        try:
+            result = await self._act("unsuspend_app", {"package": package})
+        except Exception:
+            return False
+        return bool(isinstance(result, dict) and result.get("success"))
+
+    # -- main loop
+
+    async def _active_guard(self, run: PhoneTaskRun) -> str:
+        """Refuse to touch a phone that someone is actively using.
+
+        Without this, an assistant-triggered run could press Home (or launch an
+        app) in the middle of the user's own session. Screen-off or a launcher
+        foreground counts as idle; the task's own target packages are allowed;
+        anything else is a refusal. Callers may override explicitly, and the
+        override is recorded in the run summary.
+        """
+        observation = await self._read_observation(live=True)
+        if observation is None:
+            return "stale_observation"
+        if observation.get("screen_interactive") is False:
+            return ""
+        foreground = _short(observation.get("foreground_package"), 160)
+        if _looks_idle(foreground):
+            return ""
+        targets = {
+            _short(step.args.get("package"), 160)
+            for step in run.steps
+            if step.args.get("package")
+        }
+        if foreground in targets or foreground == "com.tauru.astrbotphoneagent":
+            return ""
+        return "user_active"
+
+    async def execute(self, run: PhoneTaskRun, *, grant: ScopedGrant | None = None,
+                      now: float | None = None, allow_active: bool = False) -> PhoneTaskRun:
+        started = _now() if now is None else now
+        if self._require_user_idle and not allow_active:
+            refusal = await self._active_guard(run)
+            if refusal:
+                for step in run.steps:
+                    step.skip(refusal, now=started)
+                run.transition(RUN_FAILED, error=refusal, now=started)
+                run.summary = {"dry_run": False, "refused": refusal, "allow_active": False}
+                run.touch(started)
+                self._store.add_run(run)
+                self._store.save()
+                return run
+        run.transition(RUN_EXECUTING, now=started)
+        counts = {"executed": 0, "verified": 0, "unverified": 0, "failed": 0,
+                  "rolled_back": 0, "restore_pending": 0, "cancelled": 0}
+        before = await self._read_observation()
+        steps_used = 0
+        for step in run.steps:
+            if run.cancel_requested:
+                step.skip("cancelled", now=_now())
+                counts["cancelled"] += 1
+                continue
+            if _now() - started > self._run_timeout:
+                step.skip("run_timeout", now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="run_timeout")
+                break
+            if step.action == "observe":
+                counts["executed"] += 1
+                observation = await self._read_observation(live=True)
+                if observation is None:
+                    step.finish(ok=False, verify={"reason": "stale_observation"}, error="stale_observation", now=_now())
+                    counts["failed"] += 1
+                    run.transition(RUN_FAILED, error="stale_observation")
+                    break
+                step.finish(ok=True, verify={"foreground": _short(observation.get("foreground_package"), 160),
+                                             "reported_at": _number(observation.get("reported_at"))}, now=_now())
+                before = observation
+                continue
+
+            if self._allowed and step.action not in self._allowed:
+                step.finish(ok=False, verify={"reason": "action_not_enabled"}, error="action_not_enabled", now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="action_not_enabled")
+                break
+            package = _short(step.args.get("package"), 160)
+            if package and package in self._protected:
+                step.finish(ok=False, verify={"reason": "protected_package"}, error="protected_package", now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="protected_package")
+                break
+            allowed, reason = False, "grant_missing"
+            if grant is not None:
+                allowed, reason = grant.check(
+                    subject=run.subject, device_id=run.device_id,
+                    action=step.action, package=package, now=_now(),
+                )
+            if not allowed:
+                step.grant_id = grant.grant_id if grant else ""
+                step.finish(ok=False, verify={"reason": reason}, error=reason, now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error=reason)
+                break
+            steps_used += 1
+            if grant is not None and steps_used > grant.max_steps:
+                step.grant_id = grant.grant_id
+                step.finish(ok=False, verify={"reason": "grant_step_limit"}, error="grant_step_limit", now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="grant_step_limit")
+                break
+
+            step.start(command_id="", now=_now())
+            step.grant_id = grant.grant_id if grant else ""
+            try:
+                result = await asyncio.wait_for(self._act(step.action, dict(step.args)), timeout=self._step_timeout)
+            except asyncio.TimeoutError:
+                verdict, observation = await self._settle(step, {"success": False}, before)
+                step.status = STEP_DONE if verdict.ok else STEP_UNKNOWN
+                step.verify = {"reason": "timeout", "observed": bool(observation)}
+                step.finished_at = _now()
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="timeout")
+                break
+            except Exception as exc:
+                step.finish(ok=False, verify={"reason": "command_error"}, error=_short(exc, 160), now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="command_error")
+                break
+
+            counts["executed"] += 1
+            result = result if isinstance(result, dict) else {"success": False}
+            step.command_id = _short(result.get("command_id"), 64)
+            verdict, observation = await self._settle(step, result, before)
+            step.verify = {
+                "reason": verdict.reason,
+                "detail": verdict.detail,
+                "command_success": verdict.command_success,
+                "verified": verdict.verified,
+                "observed_at": verdict.observed_at,
+            }
+            step.finished_at = _now()
+            step.error = "" if verdict.ok else verdict.reason
+            if verdict.ok and verdict.reason == "executed_unverified":
+                step.status = STEP_EXECUTED_UNVERIFIED
+                counts["unverified"] += 1
+            elif verdict.ok:
+                step.status = STEP_DONE
+                counts["verified"] += 1
+            else:
+                step.status = STEP_FAILED
+                counts["failed"] += 1
+                if step.action == "suspend_app":
+                    rolled = await self._rollback(run, step.args, grant)
+                    if rolled:
+                        counts["rolled_back"] += 1
+                    else:
+                        counts["restore_pending"] += 1
+                run.transition(RUN_FAILED, error=verdict.reason)
+                break
+            if observation is not None:
+                before = observation
+
+        if run.status in {RUN_EXECUTING, RUN_VERIFYING}:
+            run.transition(RUN_DONE)
+        run.summary = {"dry_run": False, "planned": len(run.steps), **counts, "allow_active": allow_active}
+        run.touch(_now())
+        self._store.add_run(run)
+        self._store.save()
+        return run
+
+    def cancel(self, run_id: str) -> PhoneTaskRun | None:
+        run = self._store.run(run_id)
+        if run is None:
+            return None
+        run.cancel_requested = True
         return run

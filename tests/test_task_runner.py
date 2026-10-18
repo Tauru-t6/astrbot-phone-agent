@@ -1,4 +1,4 @@
-"""P1-E stage 1: scoped grants, observation refs, run/step state, persistence."""
+"""P1-E stage 1-3: scoped grants, observations, run state, real execution."""
 import importlib.util
 import json
 import sys
@@ -259,6 +259,10 @@ class PlannerTests(unittest.TestCase):
         steps = module.TaskPlanner().plan("截个图看看")
         self.assertEqual([step.action for step in steps], ["observe", "screenshot"])
 
+    def test_home_goal_plans_a_verifiable_step(self):
+        steps = module.TaskPlanner().plan("回到桌面")
+        self.assertEqual([step.action for step in steps], ["observe", "home"])
+
 
 class ReadOnlyRunnerTests(unittest.TestCase):
     def setUp(self):
@@ -322,6 +326,196 @@ class ReadOnlyRunnerTests(unittest.TestCase):
         restored.load()
         self.assertIsNotNone(restored.run(run.run_id))
         self.assertEqual(restored.run(run.run_id).summary["dry_run"], True)
+
+
+class ExecutorTests(unittest.IsolatedAsyncioTestCase):
+    """Stage 3: a command that returns success is not proof the step worked."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = module.TaskRunStore(Path(self.temp.name) / "runs.json")
+        self.status = {"foreground_package": "com.android.launcher", "reported_at": time.time(),
+                       "screen_interactive": True}
+        self.results = {}
+        self.calls = []
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def make_device(self):
+        status, results, calls = self.status, self.results, self.calls
+
+        class Device:
+            async def observe(self):
+                return dict(status)
+
+            async def act(self, action, args):
+                calls.append((action, dict(args)))
+                effect = results.get(action)
+                if callable(effect):
+                    effect()
+                    return {"success": True, "verified": True}
+                return effect if isinstance(effect, dict) else {"success": True, "verified": True}
+
+        return Device()
+
+    def build(self, actions, *, allowed=None, step_timeout=2.0):
+        device = self.make_device()
+        executor = module.TaskExecutor(
+            self.store, module.TaskPlanner(),
+            observe=device.observe, act=device.act, observe_live=device.observe,
+            allowed_actions=allowed, observation_wait=0.3,
+            step_timeout=step_timeout, observation_max_age=90.0,
+        )
+        run = module.PhoneTaskRun.new("goal", subject=USER, device_id=DEVICE, now=time.time())
+        for action in actions:
+            args = {"package": VIDEO} if action in {"open_app", "close_app", "suspend_app", "unsuspend_app"} else {}
+            run.add_step(action, args)
+        return executor, run
+
+    def grant(self, actions=("open_app",), packages=(), max_steps=3):
+        return module.ScopedGrant.issue(
+            subject=USER, device_id=DEVICE, actions=list(actions), packages=list(packages),
+            ttl_seconds=120, max_steps=max_steps, now=time.time(),
+        )
+
+    async def test_open_app_passes_only_when_foreground_changes(self):
+        def launch():
+            self.status["foreground_package"] = VIDEO
+            self.status["reported_at"] = time.time() + 1
+
+        self.results["open_app"] = launch
+        executor, run = self.build(["observe", "open_app"])
+        run = await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.steps[1].status, module.STEP_DONE)
+        self.assertEqual(run.summary["verified"], 1)
+        self.assertEqual(run.status, module.RUN_DONE)
+
+    async def test_open_app_failure_is_reported_without_retry(self):
+        executor, run = self.build(["observe", "open_app"])
+        run = await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.steps[1].status, module.STEP_FAILED)
+        self.assertEqual(run.steps[1].verify["reason"], "foreground_mismatch")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(run.status, module.RUN_FAILED)
+
+    async def test_suspend_requires_device_verification(self):
+        self.results["suspend_app"] = {"success": True, "verified": False}
+        executor, run = self.build(["observe", "suspend_app"],
+                                   allowed={"suspend_app"}, step_timeout=1.0)
+        run = await executor.execute(run, grant=self.grant(actions=["suspend_app"]))
+        self.assertEqual(run.steps[1].status, module.STEP_FAILED)
+        self.assertEqual(run.steps[1].verify["reason"], "not_verified")
+
+    async def test_suspend_rolls_back_when_grant_allows_it(self):
+        self.results["suspend_app"] = {"success": True, "verified": False}
+        self.results["unsuspend_app"] = {"success": True, "verified": True}
+        executor, run = self.build(["observe", "suspend_app"], allowed={"suspend_app"})
+        run = await executor.execute(run, grant=self.grant(actions=["suspend_app", "unsuspend_app"]))
+        self.assertEqual([call[0] for call in self.calls], ["suspend_app", "unsuspend_app"])
+        self.assertEqual(run.summary["rolled_back"], 1)
+
+    async def test_suspend_without_unsuspend_grant_marks_restore_pending(self):
+        self.results["suspend_app"] = {"success": True, "verified": False}
+        executor, run = self.build(["observe", "suspend_app"], allowed={"suspend_app"})
+        run = await executor.execute(run, grant=self.grant(actions=["suspend_app"]))
+        self.assertEqual(run.summary["restore_pending"], 1)
+        self.assertEqual([call[0] for call in self.calls], ["suspend_app"])
+
+    async def test_action_outside_allowlist_never_runs(self):
+        executor, run = self.build(["observe", "open_app"], allowed={"home"})
+        run = await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.steps[1].verify["reason"], "action_not_enabled")
+        self.assertEqual(self.calls, [])
+
+    async def test_missing_grant_never_runs(self):
+        executor, run = self.build(["observe", "open_app"])
+        run = await executor.execute(run, grant=None)
+        self.assertEqual(run.steps[1].verify["reason"], "grant_missing")
+        self.assertEqual(self.calls, [])
+
+    async def test_step_budget_is_enforced(self):
+        def launch():
+            self.status["foreground_package"] = VIDEO
+            self.status["reported_at"] = time.time() + 1
+
+        def go_home():
+            self.status["foreground_package"] = "com.android.launcher"
+            self.status["reported_at"] = time.time() + 2
+
+        self.results["open_app"] = launch
+        self.results["home"] = go_home
+        executor, run = self.build(["observe", "open_app", "home"], allowed={"open_app", "home"})
+        run = await executor.execute(run, grant=self.grant(actions=["open_app", "home"], max_steps=1))
+        self.assertEqual(run.steps[2].verify["reason"], "grant_step_limit")
+
+    async def test_timeout_marks_unknown_and_does_not_resend(self):
+        async def slow(action, args):
+            self.calls.append((action, dict(args)))
+            await __import__("asyncio").sleep(0.5)
+            return {"success": True}
+
+        device = self.make_device()
+        executor = module.TaskExecutor(
+            self.store, module.TaskPlanner(), observe=device.observe, act=slow,
+            observe_live=device.observe,
+            allowed_actions={"open_app"}, observation_wait=0.2, step_timeout=0.05,
+        )
+        run = module.PhoneTaskRun.new("goal", subject=USER, device_id=DEVICE, now=time.time())
+        run.add_step("observe", {})
+        run.add_step("open_app", {"package": VIDEO})
+        run = await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.steps[1].status, module.STEP_UNKNOWN)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_lock_screen_requires_screen_off(self):
+        self.results["lock_screen"] = {"success": True, "verified": True}
+        executor, run = self.build(["observe", "lock_screen"], allowed={"lock_screen"})
+        run = await executor.execute(run, grant=self.grant(actions=["lock_screen"]))
+        self.assertEqual(run.steps[1].verify["reason"], "screen_still_on")
+
+    async def test_stale_observation_fails_before_execution(self):
+        self.status["reported_at"] = time.time() - 600
+        executor, run = self.build(["observe", "open_app"], allowed={"open_app"})
+        run = await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.summary["refused"], "stale_observation")
+        self.assertEqual(self.calls, [])
+
+
+    async def test_refuses_when_the_user_is_using_the_phone(self):
+        self.status["foreground_package"] = "com.tencent.mobileqq"
+        executor, run = self.build(["observe", "home"], allowed={"home"})
+        run = await executor.execute(run, grant=self.grant(actions=["home"]))
+        self.assertEqual(run.status, module.RUN_FAILED)
+        self.assertEqual(run.summary["refused"], "user_active")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(run.steps[0].status, module.STEP_SKIPPED)
+
+    async def test_explicit_override_allows_running_while_active(self):
+        def go_home():
+            self.status["foreground_package"] = "com.android.launcher"
+
+        self.status["foreground_package"] = "com.tencent.mobileqq"
+        self.results["home"] = go_home
+        executor, run = self.build(["observe", "home"], allowed={"home"})
+        run = await executor.execute(run, grant=self.grant(actions=["home"]), allow_active=True)
+        self.assertEqual(run.status, module.RUN_DONE)
+        self.assertTrue(run.summary["allow_active"])
+
+    async def test_launcher_foreground_counts_as_idle(self):
+        def launch():
+            self.status["reported_at"] = time.time() + 1
+
+        self.results["home"] = launch
+        executor, run = self.build(["observe", "home"], allowed={"home"})
+        run = await executor.execute(run, grant=self.grant(actions=["home"]))
+        self.assertNotEqual(run.summary.get("refused"), "user_active")
+
+    async def test_screen_off_counts_as_idle(self):
+        self.status["screen_interactive"] = False
+        executor, run = self.build(["observe", "home"], allowed={"home"})
+        run = await executor.execute(run, grant=self.grant(actions=["home"]))
+        self.assertNotEqual(run.summary.get("refused"), "user_active")
 
 
 if __name__ == "__main__":

@@ -45,14 +45,20 @@ except ImportError:  # pragma: no cover - direct-module test harness
 try:
     from .task_runner import (
         ReadOnlyTaskRunner,
+        ScopedGrant,
+        TaskExecutor,
         TaskPlanner,
         TaskRunStore,
+        WRITE_ACTIONS,
     )
 except ImportError:  # pragma: no cover - direct-module test harness
     from task_runner import (
         ReadOnlyTaskRunner,
+        ScopedGrant,
+        TaskExecutor,
         TaskPlanner,
         TaskRunStore,
+        WRITE_ACTIONS,
     )
 
 try:  # pragma: no cover - the test harness stubs only astrbot.api.event
@@ -225,10 +231,25 @@ class PhoneAgentPlugin(Star):
         # (observe) ever touch the device; write steps are simulated.
         self._task_runs = TaskRunStore(self._task_run_path())
         self._task_runs.load()
+        self._task_planner = TaskPlanner(self._app_aliases())
         self._task_runner = ReadOnlyTaskRunner(
             self._task_runs,
-            TaskPlanner(self._app_aliases()),
+            self._task_planner,
             lambda: self.device_app.last_status() or {},
+        )
+        # P1-E stage 3: real execution, off by default until the operator opts in.
+        self._task_executor = TaskExecutor(
+            self._task_runs,
+            self._task_planner,
+            observe=self._task_observe_cached,
+            observe_live=self._task_observe_live,
+            act=self._task_act,
+            allowed_actions=self._task_allowed_actions(),
+            protected_packages=PROTECTED_POLICY_PACKAGES,
+            step_timeout=self._task_float("task_step_timeout_seconds", 20.0, 5.0, 60.0),
+            run_timeout=self._task_float("task_run_timeout_seconds", 90.0, 10.0, 300.0),
+            observation_max_age=float(self._night_guard_int("night_guard_status_max_age_seconds", 90, 10, 3600)),
+            require_user_idle=self._bool_config("task_require_user_idle", True),
         )
         self._load_reminders()
         self._load_notifications()
@@ -335,6 +356,10 @@ class PhoneAgentPlugin(Star):
             ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create an App reminder", None),
         ("/app/task/plan", self._web_app_task_plan, ["POST"],
          "Plan a task and dry-run it without touching the phone", "observe_tool"),
+        ("/app/task/run", self._web_app_task_run, ["POST"],
+         "Execute a granted task and verify each step", None),
+        ("/app/task/cancel", self._web_app_task_cancel, ["POST"], "Cancel a running task", None),
+        ("/app/grant", self._web_app_grant_create, ["POST"], "Issue a scoped action grant", None),
             ("/app/reminders/cancel", self._web_app_reminder_cancel, ["POST"], "Cancel an App reminder", None),
             ("/app/notifications", self._web_app_notifications, ["GET", "POST"],
              "Forwarded phone notifications", "notification_tool"),
@@ -799,7 +824,107 @@ class PhoneAgentPlugin(Star):
             # P1-E stage 2: dry-run task history; write steps are simulated.
             "task_runs": self._task_runs.runs(limit=5),
             "task_grants": self._task_runs.grants(),
+            "task_execute_enabled": self._bool_config("enable_task_execute", False),
         })
+
+    async def _web_app_task_run(self):
+        """P1-E stage 3: execute a granted task and verify every step."""
+        allowed, error = self._app_api_write_allowed()
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        if not self._bool_config("enable_task_execute", False):
+            return jsonify({"success": False, "error": "task execution is disabled",
+                            "error_code": "disabled"}), 403
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "valid JSON object required",
+                            "error_code": "invalid_json"}), 400
+        goal = _text(payload.get("goal"), 500)
+        if not goal:
+            return jsonify({"success": False, "error": "goal is required",
+                            "error_code": "invalid_goal"}), 400
+        registration = self.device_app.registration() or {}
+        device_id = _text(registration.get("device_id"), 64)
+        if not device_id:
+            return jsonify({"success": False, "error": "no device registered",
+                            "error_code": "no_device"}), 409
+        grant_id = _text(payload.get("grant_id"), 64)
+        grant = self._task_runs.grant(grant_id) if grant_id else None
+        if grant is None:
+            return jsonify({"success": False, "error": "a valid grant_id is required",
+                            "error_code": "grant_required"}), 409
+        subject = _text(payload.get("subject"), 120) or next(iter(sorted(self._allowed_users())), "")
+        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+        allow_active = bool(payload.get("allow_while_active") is True)
+        run = await self._task_executor.execute(run, grant=grant, allow_active=allow_active)
+        self._audit(
+            "task_execute",
+            goal=goal[:120],
+            subject=subject,
+            status=run.status,
+            allow_active=allow_active,
+            verified=run.summary.get("verified", 0),
+            failed=run.summary.get("failed", 0),
+            refused=run.summary.get("refused", ""),
+        )
+        return jsonify({"success": True, "run": run.to_dict()}), 200
+
+    async def _web_app_task_cancel(self):
+        allowed, error = self._app_api_write_allowed()
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        run_id = _text((payload or {}).get("run_id"), 64) if isinstance(payload, dict) else ""
+        run = self._task_executor.cancel(run_id) if run_id else None
+        if run is None:
+            return jsonify({"success": False, "error": "run not found", "error_code": "not_found"}), 404
+        return jsonify({"success": True, "run": run.to_dict()}), 200
+
+    async def _web_app_grant_create(self):
+        allowed, error = self._app_api_write_allowed()
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "valid JSON object required",
+                            "error_code": "invalid_json"}), 400
+        raw_actions = payload.get("actions")
+        actions = raw_actions if isinstance(raw_actions, list) else re.split(r"[,\s]+", str(raw_actions or ""))
+        actions = [item for item in (_text(value, 40) for value in actions) if item in WRITE_ACTIONS]
+        if not actions:
+            return jsonify({"success": False, "error": "actions must name at least one write action",
+                            "error_code": "invalid_actions"}), 400
+        raw_packages = payload.get("packages")
+        packages = raw_packages if isinstance(raw_packages, list) else re.split(r"[,\s]+", str(raw_packages or ""))
+        packages = [item for item in (_text(value, 160) for value in packages) if PACKAGE_RE.fullmatch(item)]
+        try:
+            ttl = max(30, min(int(payload.get("ttl_seconds") or 120), 600))
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "ttl_seconds must be an integer",
+                            "error_code": "invalid_ttl"}), 400
+        try:
+            max_steps = max(1, min(int(payload.get("max_steps") or 1), 3))
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "max_steps must be an integer",
+                            "error_code": "invalid_steps"}), 400
+        registration = self.device_app.registration() or {}
+        device_id = _text(registration.get("device_id"), 64)
+        if not device_id:
+            return jsonify({"success": False, "error": "no device registered",
+                            "error_code": "no_device"}), 409
+        subject = _text(payload.get("subject"), 120) or next(iter(sorted(self._allowed_users())), "")
+        grant = ScopedGrant.issue(
+            subject=subject,
+            device_id=device_id,
+            actions=actions,
+            packages=packages,
+            ttl_seconds=ttl,
+            max_steps=max_steps,
+        )
+        self._task_runs.add_grant(grant)
+        self._task_runs.save()
+        self._audit("grant_issued", subject=subject, actions=actions, packages=packages, ttl_seconds=ttl)
+        return jsonify({"success": True, "grant": grant.to_dict()}), 200
 
     async def _web_app_task_plan(self):
         """P1-E stage 2: plan a goal and dry-run it without touching the phone."""
@@ -1831,6 +1956,51 @@ class PhoneAgentPlugin(Star):
 
     def _task_run_path(self) -> str:
         return str(self._plugin_data_path("task_runs_path", "phone_agent_task_runs.json"))
+
+    def _task_float(self, key: str, default: float, low: float, high: float) -> float:
+        try:
+            return max(low, min(float(self.config.get(key, default)), high))
+        except (TypeError, ValueError):
+            return default
+
+    def _task_allowed_actions(self) -> set[str]:
+        raw = _text(self.config.get("task_execute_allowed_actions", "open_app,home,back"), 240)
+        return {item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()}
+
+    async def _task_act(self, action: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Run one device action on behalf of the task executor."""
+        if action in {"suspend_app", "unsuspend_app"}:
+            return await self._apply_app_policy(
+                _text(args.get("package"), 160),
+                "disable" if action == "suspend_app" else "enable",
+            )
+        if self._control_backend() == "app":
+            return await asyncio.to_thread(self.device_app.execute, action, args)
+        return await self._execute(action, args)
+
+    async def _task_observe_cached(self) -> dict[str, Any]:
+        """Heartbeat-backed observation used for planning."""
+        return self.device_app.last_status() or {}
+
+    async def _task_observe_live(self) -> dict[str, Any]:
+        """Ask the phone for its state right now; a heartbeat is too slow to
+        verify a step that just ran."""
+        if self._control_backend() != "app":
+            return self.device_app.last_status() or {}
+        try:
+            result = await asyncio.to_thread(self.device_app.execute, "status", {})
+        except Exception:
+            return self.device_app.last_status() or {}
+        output = result.get("output") if isinstance(result, dict) else None
+        if not isinstance(output, dict) or not output:
+            return self.device_app.last_status() or {}
+        return {
+            "foreground_package": _text(output.get("foreground_package"), 160),
+            "screen_interactive": output.get("screen_interactive"),
+            "battery_percent": output.get("battery_percent"),
+            "reported_at": time.time(),
+            "source": "live",
+        }
 
     def _save_policy_state(self) -> None:
         # P1-A: persist source + deadline per package so a restart restores the
