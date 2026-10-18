@@ -87,6 +87,37 @@ cd <astrbot-data>/plugins/astrbot_plugin_phone_agent
 git pull --ff-only
 ```
 
+### Windows 部署
+
+插件本体是纯 Python（只用 `pathlib`、`asyncio`、`json`），没有 POSIX 专用调用，可以跑在 Windows 上。差别只在"怎么装 AstrBot、怎么重启、可选服务怎么托管"这三件事：
+
+```powershell
+# 1. 安装并启动 AstrBot（二选一）
+uv tool install astrbot
+astrbot
+
+# 或 pip
+python -m pip install astrbot
+astrbot
+```
+
+2. 插件目录是 `<astrbot-data>\plugins\astrbot_plugin_phone_agent`，配置在 `<astrbot-data>\config\`（`astrbot_plugin_phone_agent_config.json` 等）。用 Git 安装时 `git clone` 后同样要保持"目录内直接是 `main.py`"，不要多套一层。
+3. **重启**：没有 systemd，结束控制台进程（Ctrl+C 或任务管理器结束 `python.exe`）后重新运行 `astrbot`。要开机自启就用「任务计划程序」建一个"登录时运行 `astrbot.exe`"的任务，或用 NSSM 注册成服务。
+4. **Relay**（可选）：`deploy/relay/relay_server.py` 可直接运行，只是 `.service` 文件不适用。用环境变量传参：
+
+```powershell
+$env:RELAY_TOKEN = "<随机串>"
+$env:RELAY_HOST  = "127.0.0.1"
+$env:RELAY_PORT  = "8791"
+$env:RELAY_STATE = "D:\astrbot-data\phone_agent_relay_state.json"
+python deploy\relay\relay_server.py
+```
+
+5. **小米健康同步**（可选）：`deploy/xiaomi-sync/` 里的 `.sh` 和 systemd timer 只适用于 Linux；Windows 下用「任务计划程序」定时调用同一个 Python 入口，参数 `--days 7`、`--data-dir <路径>` 与 shell 脚本里一致。
+6. ADB 诊断后端需要 `adb.exe` 在 `PATH` 中；App / Operit 两种模式与服务器操作系统无关，手机端照旧。
+
+配置里的路径建议写正斜杠（`D:/astrbot-data/...`）或双反斜杠，`pathlib` 两种都能识别。
+
 ## 通用授权
 
 先填写 `allowed_user_ids`，多个聊天平台用户 ID 用逗号分隔。默认没有白名单且没有开启可选授权扩展时，手机工具拒绝调用。
