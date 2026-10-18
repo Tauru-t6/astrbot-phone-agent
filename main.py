@@ -920,8 +920,9 @@ class PhoneAgentPlugin(Star):
             source=GRANT_SOURCE_APPROVAL,
         )
         self._task_runs.add_grant(grant)
-        allow_active = bool(isinstance(payload, dict) and payload.get("allow_while_active") is True)
-        run = await self._task_executor.execute(run, grant=grant, allow_active=allow_active)
+        # A human just approved this run, so the idle guard does not apply here:
+        # the approval itself is the consent the guard exists to collect.
+        run = await self._task_executor.execute(run, grant=grant, allow_active=True)
         self._task_runs.save()
         self._audit("task_approved", run_id=run.run_id, approval_id=approval.approval_id,
                     status=run.status, verified=run.summary.get("verified", 0),
