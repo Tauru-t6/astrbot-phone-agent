@@ -24,6 +24,28 @@
 - **User release hook.** A private chat message with a release phrase
   ("解开", "解除限制") restores only the packages the guard suspended and
   enters a cooldown. It never unlocks packages from other sources.
+- **Per-source policy leases.** Each suspension source keeps its own deadline
+  and timer, persisted atomically and restored on restart. A manual stop no
+  longer cancels the night guard's countdown, and a restore the device does not
+  confirm keeps its lease instead of losing the only record of it.
+- **Decision budget ledger.** Every autonomy evaluation reserves a slot under
+  one lock, records a `reservation_id` with its state, gives the slot back when
+  no message is produced, and refuses to send when the budget file cannot be
+  written.
+- **Autonomy scheduler.** The phone plugin ticks `evaluate_care()` when a fresh
+  heartbeat and a recorded private session exist, and serves a read-only `care`
+  snapshot (mode, quiet hours, quota, recent decisions) through `/app/state`.
+- **Scoped task dry-run.** `ScopedGrant`, `ObservationRef` and `RunStep` records
+  plus `POST /app/task/plan`, which observes for real, simulates every write and
+  reports what a granted run would have done.
+
+### Changed
+
+- **Care decisions accept plain text.** The host's persona prompt produces a
+  natural line rather than JSON, so a non-JSON answer is now treated as the
+  message. It still passes preview, quiet hours, the daily budget and the
+  post-model checks; an explicit `{"intent":"no_action"}` still means "do not
+  disturb", and a broken JSON attempt is still rejected.
 
 ### Fixed
 
