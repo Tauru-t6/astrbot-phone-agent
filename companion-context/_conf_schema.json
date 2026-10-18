@@ -44,6 +44,21 @@
     "default": 3,
     "description": "Maximum autonomous relationship messages per user per day"
   },
+  "decision_eval_daily_limit": {
+    "type": "int",
+    "default": 24,
+    "description": "Maximum model evaluations per user per day; bounds the cost of repeated no_action"
+  },
+  "decision_eval_min_interval_seconds": {
+    "type": "int",
+    "default": 300,
+    "description": "Minimum gap between autonomy evaluations for the same user"
+  },
+  "decision_reservation_ttl_seconds": {
+    "type": "int",
+    "default": 300,
+    "description": "How long a held send slot stays reserved before it is treated as unknown"
+  },
   "quiet_hours": {
     "type": "text",
     "default": "00:30-08:00",
@@ -123,5 +138,15 @@
     "type": "int",
     "default": 900,
     "description": "Reuse a health snapshot for this many seconds"
+  },
+  "decision_budget_path": {
+    "type": "text",
+    "default": "",
+    "description": "Persistent decision budget file (per-user daily send/eval counts). Empty uses the default plugin data path."
+  },
+  "care_status_path": {
+    "type": "text",
+    "default": "",
+    "description": "Read-only care snapshot served to the app through the phone plugin's /app/state. Empty uses the default plugin data path; must match the phone plugin's care_status_path."
   }
 }

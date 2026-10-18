@@ -10,9 +10,12 @@ phone_agent_reminders.json
 phone_agent_policies.json
 phone_agent_tasks.json
 
-# runtime artifacts
+# runtime artifacts (B10: cover all state files so real runtime data is never committed)
 phone_agent_audit.jsonl
 phone_agent_reminders.json
 phone_agent_policies.json
+phone_agent_night_guard.json
+phone_agent_app_state.json
+phone_agent_notifications.json
 relay_state.json
 __pycache__/

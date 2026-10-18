@@ -27,7 +27,10 @@ MAX_TASKS = 64
 TASK_TTL_SECONDS = 24 * 3600
 RESULT_TTL_SECONDS = 24 * 3600
 CLAIM_LEASE_SECONDS = 5 * 60
-MAX_BODY_BYTES = 64 * 1024
+# B08: must match the plugin's device_app._http_json 4 MiB read ceiling so a
+# structured command or result envelope is never silently truncated. A body
+# above the limit is rejected with 413 (see do_POST) — never cropped JSON.
+MAX_BODY_BYTES = 4 * 1024 * 1024
 DEVICE_HEADER = "X-Relay-Device-ID"
 MAX_DEVICE_ID_LENGTH = 128
 # Device identity is required by default so a second phone cannot submit a
@@ -91,7 +94,7 @@ def push_task(payload: dict) -> dict:
         task_id = uuid.uuid4().hex[:12]
         task = {
             "id": task_id,
-            "message": str(payload.get("message", ""))[:2000],
+            "message": str(payload.get("message", "")),
             "created_at": now,
             "status": "pending",
         }
@@ -128,7 +131,7 @@ def submit_result(task_id: str, success: bool, ai_response: str, error: str = ""
             "task_id": task_id,
             "message": task["message"],
             "success": bool(success),
-            "ai_response": str(ai_response)[-6000:],
+            "ai_response": str(ai_response),
             "error": str(error)[:500],
             "finished_at": now,
         }

@@ -20,7 +20,17 @@ api.AstrBotConfig = dict
 api.logger = logging.getLogger(__name__)
 event_api = types.ModuleType("astrbot.api.event")
 event_api.AstrMessageEvent = object
-event_api.filter = types.SimpleNamespace(llm_tool=lambda **_: lambda function: function)
+
+
+class _NoOpFilter:
+    class EventMessageType:
+        PRIVATE_MESSAGE = "private"
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: (lambda function: function)
+
+
+event_api.filter = _NoOpFilter()
 
 
 class Chain:
@@ -95,9 +105,26 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.plugin.device_app, "health", side_effect=AssertionError("must not probe")):
             response = await asyncio.wait_for(self.client.get("/astrbot_plugin_phone_agent/app/state"), 1)
         data = await response.get_json()
-        self.assertEqual(data["api_version"], 2)
-        self.assertEqual(data["features"], {"reminders": True, "audit": True})
+        self.assertEqual(data["api_version"], 3)
+        self.assertEqual(data["features"], {
+            "reminders": True, "audit": True,
+            "policy": False, "observe": True, "screenshot": False, "notifications": False,
+        })
         self.assertEqual(data["reminders"], [])
+
+    async def test_app_state_exposes_night_guard_and_device_status(self):
+        """G2: /app/state must include night_guard, device_last_status, and sleep_mode."""
+        self.plugin.device_app.record_device_status(
+            {"foreground_package": "tv.danmaku.bili", "battery_percent": 42,
+             "shizuku_ready": True, "screen_interactive": True, "reported_at": time.time()})
+        response = await asyncio.wait_for(self.client.get("/astrbot_plugin_phone_agent/app/state"), 1)
+        data = await response.get_json()
+        self.assertIn("night_guard", data)
+        self.assertIn("device_last_status", data)
+        self.assertIn("sleep_mode", data)
+        self.assertEqual(data["device_last_status"]["battery_percent"], 42)
+        self.assertEqual(data["device_last_status"]["foreground_package"], "tv.danmaku.bili")
+        self.assertTrue(data["night_guard"]["dry_run"])
 
     async def test_create_cancel_and_idempotency_survive_restart(self):
         payload, reminder = await self.add(text="喝水\n休息一下")

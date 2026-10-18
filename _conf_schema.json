@@ -178,5 +178,95 @@
     "type": "text",
     "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_notifications.json",
     "description": "Persistent store for notifications forwarded by the App (contains notification text)"
+  },
+  "enable_night_guard": {
+    "type": "bool",
+    "default": false,
+    "description": "Enable the deterministic night guard: observe the foreground app during the night window, send one private-chat reminder, then suspend the still-watched video package after a grace period. All actions are audited; dry-run is the safe first deployment."
+  },
+  "night_guard_start": {
+    "type": "text",
+    "default": "00:30",
+    "description": "Night window start time, HH:MM local time. A start later than the end crosses midnight, e.g. 00:30-08:00."
+  },
+  "night_guard_end": {
+    "type": "text",
+    "default": "08:00",
+    "description": "Night window end time, HH:MM local time."
+  },
+  "night_guard_check_interval_seconds": {
+    "type": "int",
+    "default": 300,
+    "description": "How often the night guard observes the foreground app, from 60 to 3600 seconds."
+  },
+  "night_guard_status_max_age_seconds": {
+    "type": "int",
+    "default": 90,
+    "description": "Foreground status older than this is stale and never triggers a warning or suspension, from 30 to 600 seconds."
+  },
+  "night_guard_grace_minutes": {
+    "type": "int",
+    "default": 10,
+    "description": "Minutes between the reminder and the re-check that decides suspension, from 1 to 120."
+  },
+  "night_guard_suspend_minutes": {
+    "type": "int",
+    "default": 30,
+    "description": "Automatic restore delay after a night-guard suspension, from 5 to 480 minutes. 0 restores when the night window ends."
+  },
+  "night_guard_consecutive_hits": {
+    "type": "int",
+    "default": 2,
+    "description": "Consecutive fresh observations of the same target package required before warning, from 1 to 10."
+  },
+  "night_guard_max_enforcements_per_night": {
+    "type": "int",
+    "default": 2,
+    "description": "Maximum suspensions the guard performs per user per night, from 1 to 10."
+  },
+  "night_guard_warning_cooldown_minutes": {
+    "type": "int",
+    "default": 60,
+    "description": "After a user release, the guard stays quiet for this long, from 5 to 1440 minutes."
+  },
+  "night_guard_packages": {
+    "type": "text",
+    "default": "",
+    "description": "Comma-separated app aliases or package names the night guard watches (video apps). Empty disables the guard even when the switch is on."
+  },
+  "night_guard_exempt_packages": {
+    "type": "text",
+    "default": "",
+    "description": "Comma-separated packages never touched by the night guard."
+  },
+  "night_guard_private_only": {
+    "type": "bool",
+    "default": true,
+    "description": "Only send night-guard reminders to a recorded private chat session; never a group chat."
+  },
+  "night_guard_dry_run": {
+    "type": "bool",
+    "default": true,
+    "description": "Dry-run mode observes, audits and sends the reminder but never suspends. Keep this on for the first deployment night."
+  },
+  "night_guard_state_path": {
+    "type": "text",
+    "default": "data/plugin_data/astrbot_plugin_phone_agent/phone_agent_night_guard.json",
+    "description": "Persistent night-guard state: per-user phase, owned suspended packages and audit timestamps only. No tokens or message text."
+  },
+  "enable_autonomy_scheduler": {
+    "type": "bool",
+    "default": true,
+    "description": "Let the phone plugin tick the companion bridge's care evaluation. It only decides when to ask; the bridge decides whether to send."
+  },
+  "autonomy_check_interval_seconds": {
+    "type": "int",
+    "default": 300,
+    "description": "Seconds between autonomy ticks. Each tick is skipped unless a fresh device heartbeat and a recorded private session exist."
+  },
+  "care_status_path": {
+    "type": "text",
+    "default": "",
+    "description": "Where to read the companion bridge's read-only care snapshot. Empty uses the default plugin data path; must match companion-context's care_status_path."
   }
 }

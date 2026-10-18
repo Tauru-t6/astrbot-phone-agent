@@ -42,6 +42,19 @@ except ImportError:  # pragma: no cover - direct-module test harness
         plugin_data_path,
     )
 
+try:
+    from .task_runner import (
+        ReadOnlyTaskRunner,
+        TaskPlanner,
+        TaskRunStore,
+    )
+except ImportError:  # pragma: no cover - direct-module test harness
+    from task_runner import (
+        ReadOnlyTaskRunner,
+        TaskPlanner,
+        TaskRunStore,
+    )
+
 try:  # pragma: no cover - the test harness stubs only astrbot.api.event
     from astrbot.api.message_components import Image as _ImageComponent
 except Exception:  # pragma: no cover
@@ -81,6 +94,47 @@ PROTECTED_POLICY_PACKAGES = frozenset({
     "com.ai.assistance.operit",
     "com.tauru.astrbotphoneagent",
 })
+
+# Deterministic night guard. The LLM never decides whether to suspend; it only
+# sees the warning event if a companion bridge forwards one. Phases follow the
+# handoff state machine: watching -> warned -> enforced -> user_released.
+NG_PHASE_WATCHING = "watching"
+NG_PHASE_WARNED = "warned"
+NG_PHASE_ENFORCED = "enforced"
+NG_PHASE_RELEASED = "user_released"
+NG_PHASES = {NG_PHASE_WATCHING, NG_PHASE_WARNED, NG_PHASE_ENFORCED, NG_PHASE_RELEASED}
+NG_DEFAULT_PACKAGES = "哔哩哔哩,快手极速版,优酷,抖音,抖音极速版"
+NG_WINDOW_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+# P1-A: a policy lease is one source's claim on a suspended package. Each lease
+# owns its own deadline and its own timer, so releasing one source (a manual
+# stop, the night guard's window ending) never cancels another source's
+# countdown. Leases persist as {"version": 2, "packages": {pkg: {source: {...}}}}.
+POLICY_STATE_VERSION = 2
+POLICY_LEGACY_SOURCE = "manual"
+
+
+class _PolicyLease:
+    """One source's claim on a suspended package (P1-A).
+
+    A plain class rather than a dataclass: the plugin module is loaded by path
+    in tests, so ``__module__`` is not in ``sys.modules`` and the dataclass
+    decorator cannot resolve string annotations there.
+    """
+
+    __slots__ = ("source", "until", "task")
+
+    def __init__(self, source: str, until: float | None = None) -> None:
+        self.source = source
+        self.until = until
+        self.task: asyncio.Task[Any] | None = None
+
+    def __repr__(self) -> str:  # keep test failures readable
+        return f"_PolicyLease(source={self.source!r}, until={self.until!r})"
+NG_RELEASE_RE = re.compile(
+    r"(解开|解除(限制|管控|暂停|视频限制)?|恢复(视频|应用|视频应用)?|"
+    r"让我(继续|用)|(继续|接着)刷|unsuspend|release|unlock)"
+)
 
 
 def _text(value: Any, limit: int = 240) -> str:
@@ -148,11 +202,15 @@ class PhoneAgentPlugin(Star):
         self._lock = asyncio.Lock()
         self._active_serial: str | None = None
         self._guard_suspended: set[str] = set()
+        # B02/P1-A: per-source leases. A package stays suspended while at least
+        # one source holds a lease; the actual unsuspend is only sent when the
+        # last owner releases. Each lease carries its own deadline and timer so
+        # a manual stop never cancels the night guard's countdown (and vice
+        # versa), and a restart restores both ownership and remaining time.
+        self._policy_leases: dict[str, dict[str, _PolicyLease]] = {}
         self._manual_guard_until: datetime | None = None
         self._manual_guard_packages: set[str] | None = None
         self._manual_guard_exempt: set[str] = set()
-        self._policy_expiry_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._policy_state: dict[str, float | None] = {}
         self._operit_tasks: dict[str, dict[str, Any]] = {}
         self._operit_task_handles: dict[str, asyncio.Task[Any]] = {}
         self._max_background_tasks = 2
@@ -163,16 +221,61 @@ class PhoneAgentPlugin(Star):
         self._notifications: list[dict[str, Any]] = []
         self._load_policy_state()
         self.device_app = DeviceAppBackend(config, self._audit)
+        # P1-E stage 2: run records are persisted, but only read-only steps
+        # (observe) ever touch the device; write steps are simulated.
+        self._task_runs = TaskRunStore(self._task_run_path())
+        self._task_runs.load()
+        self._task_runner = ReadOnlyTaskRunner(
+            self._task_runs,
+            TaskPlanner(self._app_aliases()),
+            lambda: self.device_app.last_status() or {},
+        )
         self._load_reminders()
         self._load_notifications()
+        self._night_guard_task: asyncio.Task[Any] | None = None
+        self._night_guard_states: dict[str, dict[str, Any]] = {}
+        self._night_guard_lock = asyncio.Lock()
+        self._load_night_guard_state()
+        self._autonomy_task: asyncio.Task[Any] | None = None
         self._register_web_api()
+        self._start_night_guard()
+        self._start_autonomy_scheduler()
 
     async def terminate(self) -> None:
-        tasks = [*self._reminder_tasks.values(), *self._policy_expiry_tasks.values(), *self._operit_task_handles.values()]
-        for task in tasks:
+        autonomy = self._autonomy_task
+        self._autonomy_task = None
+        if autonomy is not None:
+            autonomy.cancel()
+            await asyncio.gather(autonomy, return_exceptions=True)
+        task = self._night_guard_task
+        self._night_guard_task = None
+        if task is not None:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._save_night_guard_state()
+        self._task_runs.save()
+        lease_tasks = [
+            lease.task
+            for leases in self._policy_leases.values()
+            for lease in leases.values()
+            if lease.task is not None
+        ]
+        tasks = [*self._reminder_tasks.values(), *lease_tasks, *self._operit_task_handles.values()]
+        for item in tasks:
+            item.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Temporary leases cannot outlive the event loop, so release exactly the
+        # sources that own them at shutdown. Permanent manual locks stay in the
+        # state file and are reloaded on the next startup instead.
+        temporary = [
+            (package, source)
+            for package, leases in list(self._policy_leases.items())
+            for source, lease in list(leases.items())
+            if lease.until is not None
+        ]
+        for package, source in temporary:
+            await self._execute_app_policy(package, "enable", source=source)
 
     def _bool_config(self, key: str, default: bool) -> bool:
         value = self.config.get(key, default)
@@ -224,11 +327,14 @@ class PhoneAgentPlugin(Star):
             ("/audit", self._web_audit, ["GET"], "List phone action audit", "audit_tool"),
             ("/device/register", self._web_device_register, ["POST"], "Register the phone app device endpoint", None),
             ("/device/status", self._web_device_status, ["GET"], "Phone app device status and recent commands", None),
+            ("/device/status", self._web_device_status_post, ["POST"], "Phone app periodic status heartbeat", None),
             ("/device/command", self._web_device_command, ["POST"], "Send one structured command to the phone app", None),
             ("/device/test", self._web_device_test, ["POST"], "Ping the phone app through the current backend", None),
             ("/device/timeline", self._web_device_timeline, ["GET"], "Timeline items for the phone app sync", None),
             ("/app/state", self._web_app_state, ["GET"], "AstrBot Phone Agent App state snapshot", None),
             ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create an App reminder", None),
+        ("/app/task/plan", self._web_app_task_plan, ["POST"],
+         "Plan a task and dry-run it without touching the phone", "observe_tool"),
             ("/app/reminders/cancel", self._web_app_reminder_cancel, ["POST"], "Cancel an App reminder", None),
             ("/app/notifications", self._web_app_notifications, ["GET", "POST"],
              "Forwarded phone notifications", "notification_tool"),
@@ -406,6 +512,9 @@ class PhoneAgentPlugin(Star):
                 "error": health.get("error"),
             },
             "sleep_mode": {"manual_active": self._manual_guard_active(), "until": self._manual_guard_until.isoformat(timespec="minutes") if self._manual_guard_until else None, "suspended": sorted(self._guard_suspended)},
+            "night_guard": self._night_guard_public_view(),
+            # P1-D: read-only snapshot written by the companion bridge.
+            "care": self._care_status_snapshot(),
             "tasks": len(self._operit_tasks),
             "reminders": len(self._reminders),
         })
@@ -442,9 +551,26 @@ class PhoneAgentPlugin(Star):
             self._manual_guard_until = None
             self._manual_guard_packages = None
             self._manual_guard_exempt = set()
-            await self._restore_guard_apps()
-            self._audit("web_sleep_mode_stopped")
-            self.device_app.timeline_append("reminder", "守夜模式解除", "受限应用已全部恢复")
+            outcome = await self._restore_guard_apps()
+            self._audit(
+                "web_sleep_mode_stopped",
+                released=outcome["released"],
+                still_suspended=outcome["still_suspended"],
+                restore_pending=outcome["restore_pending"],
+            )
+            if outcome["still_suspended"] or outcome["restore_pending"]:
+                # v4: releasing the manual intent is not the same as the device
+                # being restored. Report what actually happened per package.
+                parts: list[str] = []
+                if outcome["released"]:
+                    parts.append(f"已恢复 {len(outcome['released'])} 个")
+                if outcome["still_suspended"]:
+                    parts.append(f"{len(outcome['still_suspended'])} 个仍被其他限制持有")
+                if outcome["restore_pending"]:
+                    parts.append(f"{len(outcome['restore_pending'])} 个待重试")
+                self.device_app.timeline_append("reminder", "守夜模式解除（部分）", "，".join(parts))
+            else:
+                self.device_app.timeline_append("reminder", "守夜模式解除", "受限应用已全部恢复")
         return jsonify({"success": True, "mode": "active" if self._manual_guard_active() else "off", "until": self._manual_guard_until.isoformat(timespec="minutes") if self._manual_guard_until else None, "suspended": sorted(self._guard_suspended)})
 
     async def _web_health(self):
@@ -535,6 +661,47 @@ class PhoneAgentPlugin(Star):
             "accepted_actions": sorted(COMMAND_ACTIONS),
         })
 
+    async def _web_device_status_post(self):
+        """Phone app heartbeat: fresh foreground state for the night guard.
+
+        The GET view stays dashboard-oriented; this write endpoint only accepts
+        a bounded device-status object, never screen text or tokens.
+        """
+        if not self._web_write_allowed():
+            return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict) or not self._finite_json(payload):
+            return jsonify({"success": False, "error": "valid JSON object required"}), 400
+        registration = self.device_app.registration()
+        device_id = _text(payload.get("device_id"), 64)
+        if not device_id or not registration:
+            return jsonify({"success": False, "error": "device has not registered"}), 400
+        if device_id != registration.get("device_id"):
+            return jsonify({"success": False, "error": "device_id does not match the registered device"}), 400
+        foreground = _text(payload.get("foreground_package"), 160)
+        if foreground and not PACKAGE_RE.fullmatch(foreground):
+            foreground = ""
+        status = {
+            "battery_percent": payload.get("battery_percent"),
+            "charging": payload.get("charging"),
+            "foreground_package": foreground,
+            "screen_on_seconds_today": payload.get("screen_on_seconds_today"),
+            "screen_interactive": payload.get("screen_interactive"),
+            "shizuku_ready": payload.get("shizuku_ready"),
+            "app_version": _text(payload.get("app_version"), 40),
+            # Diagnostic only: why the app could not read a foreground package.
+            "foreground_debug": _text(payload.get("foreground_debug"), 160),
+            "reported_at": payload.get("reported_at"),
+        }
+        self.device_app.record_device_status(status)
+        self._audit(
+            "device_status_received",
+            device_id=device_id,
+            foreground_package=foreground or "",
+            screen_interactive=status["screen_interactive"],
+        )
+        return jsonify({"success": True, "received": True})
+
     async def _web_device_command(self):
         if not self._web_write_allowed():
             return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
@@ -601,16 +768,79 @@ class PhoneAgentPlugin(Star):
             return jsonify({"success": False, "error": "phone agent disabled", "error_code": "disabled"}), 503
         reminders = [self._reminder_view(key, item) for key, item in self._reminders.items()
                      if item.get("status", "pending") == "pending"]
+        # G2: expose night_guard and device_last_status in the App polling path
+        # so the UI can show guard phase, device battery/screen, and sleep mode
+        # without hitting the heavier /status dashboard endpoint.
         return jsonify({
             "success": True,
-            "api_version": 2,
+            "api_version": 3,
             "server_time": round(time.time(), 3),
             "backend": self._control_backend(),
-            "features": {"reminders": self._feature("reminder_tools"), "audit": self._feature("audit_tool")},
+            "features": {
+                "reminders": self._feature("reminder_tools"),
+                "audit": self._feature("audit_tool"),
+                "policy": self._feature("policy_tools"),
+                "observe": self._feature("observe_tool"),
+                "screenshot": self._feature("screenshot_tool"),
+                "notifications": self._feature("notification_tool"),
+            },
             "reminders": reminders,
             "recent_commands": self.device_app.recent_results(),
             "timeline": self.device_app.timeline_since(0, 100),
+            "device_last_status": self.device_app.last_status(),
+            "night_guard": self._night_guard_public_view(),
+            "sleep_mode": {
+                "manual_active": self._manual_guard_active(),
+                "until": self._manual_guard_until.isoformat(timespec="minutes") if self._manual_guard_until else None,
+                "suspended": sorted(self._guard_suspended),
+            },
+            # P1-D: read-only care snapshot written by the companion bridge.
+            "care": self._care_status_snapshot(),
+            # P1-E stage 2: dry-run task history; write steps are simulated.
+            "task_runs": self._task_runs.runs(limit=5),
+            "task_grants": self._task_runs.grants(),
         })
+
+    async def _web_app_task_plan(self):
+        """P1-E stage 2: plan a goal and dry-run it without touching the phone."""
+        allowed, error = self._app_api_write_allowed("observe_tool")
+        if not allowed:
+            return jsonify({"success": False, "error": error, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "valid JSON object required",
+                            "error_code": "invalid_json"}), 400
+        goal = _text(payload.get("goal"), 500)
+        if not goal:
+            return jsonify({"success": False, "error": "goal is required",
+                            "error_code": "invalid_goal"}), 400
+        registration = self.device_app.registration() or {}
+        device_id = _text(registration.get("device_id"), 64)
+        if not device_id:
+            return jsonify({"success": False, "error": "no device registered",
+                            "error_code": "no_device"}), 409
+        subject = _text(payload.get("subject"), 120) or next(iter(sorted(self._allowed_users())), "")
+        grant = None
+        grant_id = _text(payload.get("grant_id"), 64)
+        if grant_id:
+            grant = self._task_runs.grant(grant_id)
+            if grant is None:
+                return jsonify({"success": False, "error": "grant not found or expired",
+                                "error_code": "grant_unusable"}), 409
+        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+        run = self._task_runner.execute(
+            run,
+            grant=grant,
+            max_observation_age=self._night_guard_int("night_guard_status_max_age_seconds", 90, 10, 3600),
+        )
+        self._audit(
+            "task_plan_dry_run",
+            goal=goal[:120],
+            subject=subject,
+            simulated=run.summary.get("simulated", 0),
+            blocked=run.summary.get("blocked", 0),
+        )
+        return jsonify({"success": True, "run": run.to_dict()}), 200
 
     async def _web_app_reminder_create(self):
         allowed, error = self._app_api_write_allowed()
@@ -716,6 +946,851 @@ class PhoneAgentPlugin(Star):
         except Exception as exc:
             logger.debug("phone agent audit write failed: %s", exc)
 
+    def _night_guard_public_view(self) -> dict[str, Any]:
+        running = self._night_guard_task is not None and not self._night_guard_task.done()
+        states: dict[str, dict[str, Any]] = {}
+        for user_id, state in self._night_guard_states.items():
+            states[user_id] = {
+                "phase": state.get("phase"),
+                "foreground_package": state.get("foreground_package"),
+                "owned_suspended": sorted(state.get("owned_suspended") or []),
+                "warning_sent_at": state.get("warning_sent_at"),
+                "enforced_until": state.get("enforced_until"),
+                "enforcement_count": state.get("enforcement_count", 0),
+                "last_error": _text(state.get("last_error"), 200),
+            }
+        return {
+            "enabled": running,
+            "window": f"{self._night_guard_window()[0]:02d}:{self._night_guard_window()[1]:02d}-"
+                      f"{self._night_guard_window()[2]:02d}:{self._night_guard_window()[3]:02d}",
+            "in_window": self._night_guard_in_window(),
+            "dry_run": self._night_guard_dry_run(),
+            "packages": sorted(self._night_guard_packages()),
+            "states": states,
+        }
+
+    # ==================== night guard ====================
+
+    def _night_guard_enabled(self) -> bool:
+        return (
+            self._enabled()
+            and self._bool_config("enable_night_guard", False)
+            and self._feature("policy_tools")
+        )
+
+    def _night_guard_dry_run(self) -> bool:
+        return self._bool_config("night_guard_dry_run", True)
+
+    @staticmethod
+    def _parse_hhmm(value: Any, fallback: tuple[int, int]) -> tuple[int, int]:
+        text = str(value or "").strip()
+        match = NG_WINDOW_RE.fullmatch(text)
+        if not match:
+            return fallback
+        return int(match.group(1)), int(match.group(2))
+
+    def _night_guard_window(self) -> tuple[int, int, int, int]:
+        start = self._parse_hhmm(self.config.get("night_guard_start", "00:30"), (0, 30))
+        end = self._parse_hhmm(self.config.get("night_guard_end", "08:00"), (8, 0))
+        return start[0], start[1], end[0], end[1]
+
+    @staticmethod
+    def _minutes_of_day(hour: int, minute: int) -> int:
+        return hour * 60 + minute
+
+    def _night_guard_in_window(self, now: datetime | None = None) -> bool:
+        start_h, start_m, end_h, end_m = self._night_guard_window()
+        start = self._minutes_of_day(start_h, start_m)
+        end = self._minutes_of_day(end_h, end_m)
+        current = self._minutes_of_day((now or datetime.now()).hour, (now or datetime.now()).minute)
+        if start == end:
+            return False
+        if start < end:
+            return start <= current < end
+        # A window crossing midnight is [start, 24:00) union [00:00, end).
+        return current >= start or current < end
+
+    def _night_guard_minutes_to_end(self, now: datetime | None = None) -> int:
+        start_h, start_m, end_h, end_m = self._night_guard_window()
+        start = self._minutes_of_day(start_h, start_m)
+        end = self._minutes_of_day(end_h, end_m)
+        now = now or datetime.now()
+        current = self._minutes_of_day(now.hour, now.minute)
+        if start < end:
+            return max(0, end - current) if start <= current < end else 0
+        if current >= start:
+            return (24 * 60 - current) + end
+        if current < end:
+            return end - current
+        return 0
+
+    def _night_guard_packages(self) -> set[str]:
+        raw = self.config.get("night_guard_packages", NG_DEFAULT_PACKAGES)
+        values = raw if isinstance(raw, list) else re.split(r"[,\s]+", str(raw or ""))
+        packages = {self._resolve_package(value) for value in values}
+        exempt_raw = self.config.get("night_guard_exempt_packages", "")
+        exempt_values = exempt_raw if isinstance(exempt_raw, list) else re.split(r"[,\s]+", str(exempt_raw or ""))
+        exempt = {self._resolve_package(value) for value in exempt_values}
+        return {
+            item for item in packages
+            if PACKAGE_RE.fullmatch(item) and item not in exempt
+            and not self._protected_policy_error(item)
+        }
+
+    def _start_night_guard(self) -> None:
+        if self._night_guard_task is not None and not self._night_guard_task.done():
+            return
+        if not self._night_guard_enabled():
+            return
+        self._night_guard_task = asyncio.create_task(self._night_guard_loop())
+        logger.info("phone agent night guard started (dry_run=%s)", self._night_guard_dry_run())
+
+    # ---------- autonomy scheduler (P1-D) ----------
+    #
+    # The care decision itself lives in the companion bridge; this loop only
+    # decides *when* to ask. It never fabricates a message and never bypasses
+    # the bridge's own reservation/gating.
+
+    def _autonomy_interval(self) -> int:
+        try:
+            return max(60, min(int(self.config.get("autonomy_check_interval_seconds", 300)), 3600))
+        except (TypeError, ValueError):
+            return 300
+
+    def _companion_care(self) -> Any | None:
+        """Find the companion bridge's evaluate_care(), if it is installed."""
+        for name in (
+            "data.plugins.astrbot_plugin_private_companion.main",
+            "astrbot_plugin_private_companion.main",
+        ):
+            try:
+                module = importlib.import_module(name)
+            except Exception:
+                continue
+            provider = getattr(module, "_phone_companion_context", None)
+            if provider is not None and callable(getattr(provider, "evaluate_care", None)):
+                return provider
+        return None
+
+    def _care_targets(self) -> list[dict[str, Any]]:
+        """Users the scheduler may evaluate: those with a recorded private session."""
+        targets: list[dict[str, Any]] = []
+        for user_id, state in sorted(self._night_guard_states.items()):
+            session = _text(state.get("session"), 240)
+            if session and ":FriendMessage:" in session:
+                targets.append({"user_id": user_id, "umo": session})
+        return targets
+
+    def _care_device_fresh(self) -> bool:
+        status = self.device_app.last_status() or {}
+        reported = status.get("reported_at")
+        if not isinstance(reported, (int, float)):
+            return False
+        max_age = self._night_guard_int("night_guard_status_max_age_seconds", 90, 10, 3600)
+        return 0 <= time.time() - float(reported) <= max_age
+
+    async def _autonomy_tick(self) -> None:
+        provider = self._companion_care()
+        if provider is None:
+            return
+        # Care is about the phone, so it only runs on a live observation.
+        if not self._care_device_fresh():
+            return
+        for target in self._care_targets():
+            try:
+                result = await provider.evaluate_care(target["user_id"], target["umo"], "owner")
+            except Exception as exc:
+                logger.warning("phone agent autonomy tick failed: %s", _text(exc, 160))
+                continue
+            if result.get("evaluated"):
+                logger.info(
+                    "phone agent autonomy tick: user=%s outcome=%s reason=%s",
+                    target["user_id"], result.get("outcome", ""), result.get("reason", ""),
+                )
+
+    async def _autonomy_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._autonomy_interval())
+                try:
+                    await self._autonomy_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("phone agent autonomy tick failed: %s", _text(exc, 200))
+        except asyncio.CancelledError:
+            return
+
+    def _start_autonomy_scheduler(self) -> None:
+        if self._autonomy_task is not None and not self._autonomy_task.done():
+            return
+        if not self._bool_config("enable_autonomy_scheduler", True):
+            return
+        self._autonomy_task = asyncio.create_task(self._autonomy_loop())
+        logger.info("phone agent autonomy scheduler started (interval=%ss)", self._autonomy_interval())
+
+    def _care_status_snapshot(self) -> dict[str, Any]:
+        """Read the companion's read-only care snapshot, if it exists."""
+        try:
+            path = Path(self._care_status_path())
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+
+    def _care_status_path(self) -> str:
+        raw = _text(self.config.get("care_status_path", ""), 500)
+        if raw:
+            path = Path(raw)
+            if path.is_absolute():
+                return str(path)
+            return str(PLUGIN_DATA_DIR / path.name)
+        return str(self._plugin_data_path("care_status_path", "phone_agent_care_status.json"))
+
+    def _night_guard_state_path(self) -> str:
+        return str(self._plugin_data_path("night_guard_state_path", "phone_agent_night_guard.json"))
+
+    def _save_night_guard_state(self) -> None:
+        # B07: atomic write (temp + fsync + os.replace) matching the pattern
+        # used by _save_reminders and device_app._save_timeline. A crash
+        # between truncation and write must not produce a corrupt state file.
+        path = Path(self._night_guard_state_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        users = {}
+        for user_id, state in self._night_guard_states.items():
+            users[user_id] = {
+                key: state.get(key)
+                for key in (
+                    "session", "phase", "foreground_package", "first_seen_at",
+                    "last_observed_at", "warning_sent_at", "warning_deadline",
+                    "consecutive_hits", "owned_suspended", "enforced_until",
+                    "released_until", "enforcement_count", "night_id",
+                    "warned_date", "last_error",
+                )
+            }
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump({"version": 1, "users": users}, handle,
+                          ensure_ascii=False, indent=2, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception as exc:
+            logger.warning("phone agent night guard state save failed: %s", exc)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_night_guard_state(self) -> None:
+        try:
+            path = Path(self._night_guard_state_path())
+            if not path.exists():
+                return
+            values = json.loads(path.read_text(encoding="utf-8"))
+            users = values.get("users", {}) if isinstance(values, dict) else {}
+            if not isinstance(users, dict):
+                return
+            for raw_user, raw_state in users.items():
+                user_id = _text(raw_user, 120)
+                if not user_id or not isinstance(raw_state, dict):
+                    continue
+                phase = raw_state.get("phase")
+                state = dict(raw_state)
+                state["phase"] = phase if phase in NG_PHASES else NG_PHASE_WATCHING
+                owned = [
+                    package for package in (state.get("owned_suspended") or [])
+                    if isinstance(package, str) and PACKAGE_RE.fullmatch(package)
+                ]
+                state["owned_suspended"] = sorted(set(owned))
+                state.setdefault("consecutive_hits", 0)
+                state.setdefault("enforcement_count", 0)
+                # B06: migrate old enforced_date to night_id; repair WARNED
+                # states that have no valid deadline (deadlock guard).
+                if "night_id" not in state:
+                    state["night_id"] = state.pop("enforced_date", "")
+                if state["phase"] == NG_PHASE_WARNED:
+                    deadline = state.get("warning_deadline")
+                    if not (isinstance(deadline, (int, float)) and math.isfinite(deadline) and deadline > 0):
+                        state["phase"] = NG_PHASE_WATCHING
+                        state["warning_sent_at"] = None
+                        state["warning_deadline"] = None
+                        state["consecutive_hits"] = 0
+                self._night_guard_states[user_id] = state
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            logger.warning("phone agent night guard state file is invalid; ignoring it")
+
+    def _night_guard_user_id(self, event: AstrMessageEvent) -> str:
+        return self._event_user_id(event)
+
+    def _night_guard_session(self, user_id: str) -> str:
+        state = self._night_guard_states.get(user_id)
+        session = _text((state or {}).get("session"), 240)
+        if self._bool_config("night_guard_private_only", True) and ":FriendMessage:" not in session:
+            return ""
+        return session
+
+    def _night_guard_ensure_state(self, user_id: str, session: str) -> dict[str, Any]:
+        state = self._night_guard_states.get(user_id)
+        if state is None:
+            state = {
+                "session": session,
+                "phase": NG_PHASE_WATCHING,
+                "foreground_package": "",
+                "first_seen_at": None,
+                "last_observed_at": None,
+                "warning_sent_at": None,
+                "warning_deadline": None,
+                "consecutive_hits": 0,
+                "owned_suspended": [],
+                "enforced_until": None,
+                "released_until": None,
+                "enforcement_count": 0,
+                "night_id": "",
+                "warned_date": "",
+                "last_error": "",
+            }
+            self._night_guard_states[user_id] = state
+        else:
+            state["session"] = session
+        return state
+
+    async def _night_guard_observe(self) -> dict[str, Any]:
+        """Fresh foreground state, or an explicit skip reason. Never guesses."""
+        status = self.device_app.last_status()
+        max_age = self._night_guard_int("night_guard_status_max_age_seconds", 90, 30, 600)
+        if isinstance(status, dict):
+            reported_at = status.get("reported_at")
+            # B04: reported_at is None when the phone clock was skewed or the
+            # field was missing. That sample is NOT fresh — do not fall back
+            # to received_at for freshness decisions.
+            if reported_at is not None:
+                try:
+                    age = time.time() - float(reported_at)
+                    fresh = math.isfinite(age) and 0 <= age <= max_age
+                except (TypeError, ValueError):
+                    fresh = False
+            else:
+                fresh = False
+            if fresh:
+                return {
+                    "fresh": True,
+                    "foreground_package": _text(status.get("foreground_package"), 160),
+                    "shizuku_ready": bool(status.get("shizuku_ready")),
+                    "screen_interactive": status.get("screen_interactive"),
+                    "reported_at": reported_at,
+                }
+        # No heartbeat yet or it went stale: probe the phone once.
+        if self._control_backend() != "app":
+            return {"fresh": False, "error": "night guard requires control_backend=app"}
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.device_app.execute, "status", {}),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            return {"fresh": False, "error": "phone status probe timed out"}
+        if not result.get("success"):
+            return {"fresh": False, "error": _text(result.get("error"), 200)}
+        output = result.get("output")
+        if not isinstance(output, dict):
+            return {"fresh": False, "error": "phone returned no status payload"}
+        self.device_app.record_device_status(output.get("device") or output)
+        return {
+            "fresh": True,
+            "foreground_package": _text(output.get("foreground_package"), 160),
+            "shizuku_ready": bool(output.get("shizuku_ready")),
+            "screen_interactive": output.get("screen_interactive"),
+        }
+
+    def _night_guard_int(self, key: str, default: int, low: int, high: int) -> int:
+        try:
+            return max(low, min(int(self.config.get(key, default)), high))
+        except (TypeError, ValueError):
+            return default
+
+    async def _night_guard_restore_owned(self, user_id: str, state: dict[str, Any], reason: str) -> tuple[list[str], list[str], list[str]]:
+        """Restore only the packages this guard suspended. Never global unlocks.
+
+        Returns (restored, still_suspended, still_pending):
+        - restored: our lease was released AND the device confirmed the app is
+          usable again.
+        - still_suspended: our lease was released, but another source (for
+          example a manual lock) still holds the package. The guard must not
+          report it as restored, and must not release that other owner either.
+        - still_pending: the device did not confirm; keep the package in
+          owned_suspended so the next tick retries (B03).
+        """
+        restored: list[str] = []
+        still_suspended: list[str] = []
+        still_pending: list[str] = []
+        for package in sorted(set(state.get("owned_suspended") or [])):
+            result = await self._execute_app_policy(package, "enable", source="night_guard")
+            if result.get("success") and result.get("mode") == "still_suspended":
+                still_suspended.append(package)
+                state["owned_suspended"] = sorted(
+                    set(state.get("owned_suspended") or []) - {package}
+                )
+            elif result.get("success"):
+                restored.append(package)
+                state["owned_suspended"] = sorted(
+                    set(state.get("owned_suspended") or []) - {package}
+                )
+            else:
+                still_pending.append(package)
+            self._audit(
+                "night_guard_restore",
+                user_id=user_id,
+                package=package,
+                reason=reason,
+                success=bool(result.get("success")),
+                verified=bool(result.get("verified")),
+                still_suspended=bool(result.get("still_suspended")),
+                restore_pending=bool(result.get("restore_pending")),
+                error=_text(result.get("error"), 180),
+            )
+        # B03: only clear enforced_until when every package was released.
+        if not still_pending:
+            state["enforced_until"] = None
+        if still_pending:
+            state["last_error"] = f"{len(still_pending)} package(s) still pending restore"
+        else:
+            state["last_error"] = ""
+        self._save_night_guard_state()
+        return restored, still_suspended, still_pending
+
+    async def _night_guard_send_warning(self, user_id: str, state: dict[str, Any], package: str) -> bool:
+        session = self._night_guard_session(user_id)
+        if not session:
+            state["last_error"] = "no private chat session recorded for the target user"
+            self._save_night_guard_state()
+            self._audit("night_guard_warning_skipped", user_id=user_id, reason=state["last_error"])
+            return False
+        grace = self._night_guard_int("night_guard_grace_minutes", 10, 1, 120)
+        app_name = package
+        for alias, mapped in self._app_aliases().items():
+            if mapped == package:
+                app_name = alias
+                break
+        text = (
+            f"已经很晚了，还在刷{app_name}。先放下手机，早点睡；"
+            f"{grace}分钟后我再看一次。"
+        )
+        try:
+            await asyncio.wait_for(
+                self.context.send_message(session, MessageChain().message(text)),
+                timeout=30,
+            )
+        except Exception as exc:
+            state["last_error"] = _text(exc, 200)
+            self._save_night_guard_state()
+            self._audit("night_guard_warning_failed", user_id=user_id, error=state["last_error"])
+            return False
+        now = time.time()
+        state["warning_sent_at"] = now
+        state["warning_deadline"] = now + grace * 60
+        state["phase"] = NG_PHASE_WARNED
+        state["warned_date"] = date.today().isoformat()
+        state["last_error"] = ""
+        self._save_night_guard_state()
+        self._audit("night_guard_warning_sent", user_id=user_id, package=package, session=session)
+        return True
+
+    async def _night_guard_enforce(self, user_id: str, state: dict[str, Any], package: str) -> bool:
+        suspend_minutes = self._night_guard_int("night_guard_suspend_minutes", 30, 0, 480)
+        window_left = self._night_guard_minutes_to_end()
+        if suspend_minutes <= 0 or suspend_minutes > window_left > 0:
+            suspend_minutes = window_left
+        if suspend_minutes <= 0:
+            self._audit("night_guard_suspend_skipped", user_id=user_id, package=package, reason="night window already ending")
+            state["phase"] = NG_PHASE_WATCHING
+            state["warning_sent_at"] = None
+            state["warning_deadline"] = None
+            state["consecutive_hits"] = 0
+            self._save_night_guard_state()
+            return False
+        if self._night_guard_dry_run():
+            self._audit("night_guard_dry_run_suspend_skipped", user_id=user_id, package=package)
+            state["phase"] = NG_PHASE_WATCHING
+            state["warning_sent_at"] = None
+            state["warning_deadline"] = None
+            state["consecutive_hits"] = 0
+            self._save_night_guard_state()
+            return False
+        result = await self._execute_app_policy(package, "disable", suspend_minutes, source="night_guard")
+        if not (
+            result.get("success")
+            and result.get("verified")
+            and result.get("package") == package
+        ):
+            state["last_error"] = _text(result.get("error"), 200) or "suspension was not verified on the phone"
+            self._save_night_guard_state()
+            self._audit(
+                "night_guard_suspend_failed",
+                user_id=user_id,
+                package=package,
+                verified=bool(result.get("verified")),
+                error=state["last_error"],
+            )
+            return False
+        now = time.time()
+        owned = sorted(set(state.get("owned_suspended") or []) | {package})
+        state["owned_suspended"] = owned
+        state["enforced_until"] = now + suspend_minutes * 60
+        state["enforcement_count"] = int(state.get("enforcement_count") or 0) + 1
+        state["night_id"] = self._night_guard_night_id()
+        state["phase"] = NG_PHASE_ENFORCED
+        state["consecutive_hits"] = 0
+        state["last_error"] = ""
+        self._save_night_guard_state()
+        self._audit(
+            "night_guard_enforced",
+            user_id=user_id,
+            package=package,
+            minutes=suspend_minutes,
+            verified=True,
+        )
+        session = self._night_guard_session(user_id)
+        if session:
+            try:
+                await asyncio.wait_for(
+                    self.context.send_message(
+                        session,
+                        MessageChain().message(f"你还在刷，我先替你把{package}暂停 {suspend_minutes} 分钟。想继续用就说“解除限制”。"),
+                    ),
+                    timeout=30,
+                )
+            except Exception as exc:
+                logger.debug("phone agent night guard enforce notice failed: %s", _text(exc, 160))
+        return True
+
+    def _night_guard_night_id(self, now: datetime | None = None) -> str:
+        """A stable id for one night, surviving the midnight boundary.
+
+        For a window that crosses midnight (start > end), the night id is the
+        calendar date at the window's start. 23:30–06:00 starting on Oct 16
+        yields "2026-10-16" for both 23:59 and 03:00. For a same-day window,
+        the night id is the current calendar date.
+        """
+        now = now or datetime.now()
+        start_h, start_m, end_h, end_m = self._night_guard_window()
+        start = self._minutes_of_day(start_h, start_m)
+        end = self._minutes_of_day(end_h, end_m)
+        current = self._minutes_of_day(now.hour, now.minute)
+        if start > end and current < end:
+            # After midnight in a cross-midnight window: the night started yesterday.
+            return (now - timedelta(days=1)).date().isoformat()
+        return now.date().isoformat()
+
+    async def _night_guard_tick_user(self, user_id: str, state: dict[str, Any]) -> None:
+        now = time.time()
+        # B01: re-check authorization every tick. A user removed from the
+        # allowlist must not receive new guard actions. Existing owned
+        # packages are still restored (cleanup duty survives revocation).
+        allowed = self._allowed_users()
+        if not allowed or user_id not in allowed:
+            if state.get("owned_suspended"):
+                _, _, still_pending = await self._night_guard_restore_owned(
+                    user_id, state, "authorization_revoked")
+                if still_pending:
+                    # B03: keep the ENFORCED phase so the next tick retries the
+                    # restore — cleanup duty survives authorization revocation.
+                    return
+            state["phase"] = NG_PHASE_WATCHING
+            state["warning_sent_at"] = None
+            state["warning_deadline"] = None
+            state["consecutive_hits"] = 0
+            self._save_night_guard_state()
+            return
+
+        # B06: reset enforcement count by night_id, not calendar date, so a
+        # cross-midnight window does not double the budget at 00:00.
+        current_night_id = self._night_guard_night_id()
+        if state.get("night_id") != current_night_id:
+            state["night_id"] = current_night_id
+            state["enforcement_count"] = 0
+        phase = state.get("phase")
+
+        # B06: repair stale state loaded from disk — WARNED without a valid
+        # deadline can never progress. Demote to WATCHING so evidence rebuilds.
+        if phase == NG_PHASE_WARNED:
+            deadline = state.get("warning_deadline")
+            if not (isinstance(deadline, (int, float)) and math.isfinite(deadline) and deadline > 0):
+                state["phase"] = NG_PHASE_WATCHING
+                state["warning_sent_at"] = None
+                state["warning_deadline"] = None
+                state["consecutive_hits"] = 0
+                self._save_night_guard_state()
+                phase = NG_PHASE_WATCHING
+
+        # Automatic restore when the guard's own suspension expires.
+        if phase == NG_PHASE_ENFORCED:
+            enforced_until = state.get("enforced_until")
+            expired = False
+            if isinstance(enforced_until, (int, float)) and math.isfinite(enforced_until):
+                expired = now >= float(enforced_until)
+            if not self._night_guard_in_window():
+                expired = True
+            if expired:
+                restored, still_suspended, still_pending = await self._night_guard_restore_owned(
+                    user_id, state, "expired_or_window_end")
+                if still_pending:
+                    # B03: device offline or restore failed — stay in ENFORCED
+                    # and retry on the next tick. Do NOT transition to WATCHING.
+                    self._audit("night_guard_restore_partial", user_id=user_id,
+                                restored=restored, still_suspended=still_suspended,
+                                pending=still_pending)
+                else:
+                    state["phase"] = NG_PHASE_WATCHING
+                    state["warning_sent_at"] = None
+                    state["warning_deadline"] = None
+                    self._save_night_guard_state()
+                    if restored:
+                        self._audit("night_guard_auto_restored", user_id=user_id, packages=restored)
+            return
+
+        if not self._night_guard_in_window():
+            # Night over: release anything the guard still owns, then go quiet.
+            if state.get("owned_suspended"):
+                _, _, still_pending = await self._night_guard_restore_owned(user_id, state, "night_window_end")
+                if still_pending:
+                    # B03: keep trying to restore even after the window ends.
+                    # The packages were suspended by this guard; cleanup duty
+                    # survives the window boundary.
+                    self._audit("night_guard_restore_pending_after_window", user_id=user_id, pending=still_pending)
+                    return
+            state["phase"] = NG_PHASE_WATCHING
+            state["warning_sent_at"] = None
+            state["warning_deadline"] = None
+            state["consecutive_hits"] = 0
+            self._save_night_guard_state()
+            return
+
+        released_until = state.get("released_until")
+        if isinstance(released_until, (int, float)) and math.isfinite(released_until) and now < float(released_until):
+            return
+
+        if not self._night_guard_session(user_id):
+            state["last_error"] = "target user has no recorded private chat session"
+            self._save_night_guard_state()
+            return
+
+        max_enforcements = self._night_guard_int("night_guard_max_enforcements_per_night", 2, 1, 10)
+        if int(state.get("enforcement_count") or 0) >= max_enforcements:
+            return
+
+        observation = await self._night_guard_observe()
+        if not observation.get("fresh"):
+            state["last_error"] = _text(observation.get("error"), 200)
+            self._save_night_guard_state()
+            self._audit("night_guard_observation_skipped", user_id=user_id, error=state["last_error"])
+            return
+        foreground = observation.get("foreground_package") or ""
+        state["last_observed_at"] = now
+        state["last_error"] = ""
+        targets = self._night_guard_packages()
+        hit = foreground if foreground in targets else ""
+
+        # B05: screen off or Shizuku unavailable means the user is not
+        # actively using the phone — never count this as continued use.
+        screen_on = observation.get("screen_interactive")
+        shizuku_ok = observation.get("shizuku_ready")
+        if hit and (screen_on is not True or shizuku_ok is not True):
+            self._audit(
+                "night_guard_observation_screen_off",
+                user_id=user_id,
+                package=hit,
+                screen_interactive=screen_on,
+                shizuku_ready=shizuku_ok,
+            )
+            hit = ""
+
+        if phase == NG_PHASE_WARNED:
+            if not hit:
+                # B06: leaving the target app (or screen off) returns to
+                # WATCHING cleanly — no WARNED-without-deadline deadlock.
+                state["phase"] = NG_PHASE_WATCHING
+                state["warning_sent_at"] = None
+                state["warning_deadline"] = None
+                state["consecutive_hits"] = 0
+                state["foreground_package"] = ""
+                self._save_night_guard_state()
+                return
+            deadline = state.get("warning_deadline")
+            grace_passed = isinstance(deadline, (int, float)) and math.isfinite(deadline) and now >= float(deadline)
+            same_package = hit == state.get("foreground_package")
+            if not same_package:
+                # B06: switched to a different target app — rebuild evidence
+                # for the new package from WATCHING, don't stay stuck in WARNED.
+                state["phase"] = NG_PHASE_WATCHING
+                state["foreground_package"] = hit
+                state["warning_sent_at"] = None
+                state["warning_deadline"] = None
+                state["consecutive_hits"] = 1
+                state["first_seen_at"] = now
+                self._save_night_guard_state()
+                return
+            if not grace_passed:
+                self._save_night_guard_state()
+                return
+            # B04: require a sample newer than the grace deadline, not the
+            # same cached read. The observe above may have returned a stale
+            # cache; force a fresh probe and check its timestamp.
+            confirm = await self._night_guard_observe()
+            confirm_fg = confirm.get("foreground_package") if confirm.get("fresh") else None
+            if confirm_fg != hit:
+                state["last_error"] = "pre-suspend re-check did not confirm the same package"
+                self._save_night_guard_state()
+                self._audit("night_guard_suspend_skipped", user_id=user_id, package=hit, reason="recheck_failed")
+                return
+            # B05: re-check screen/shizuku on the confirm sample too.
+            if confirm.get("screen_interactive") is not True or confirm.get("shizuku_ready") is not True:
+                state["last_error"] = "screen off or shizuku unavailable at pre-suspend re-check"
+                self._save_night_guard_state()
+                self._audit("night_guard_suspend_skipped", user_id=user_id, package=hit, reason="screen_or_shizuku_unavailable")
+                return
+            await self._night_guard_enforce(user_id, state, hit)
+            return
+
+        # watching phase
+        required_hits = self._night_guard_int("night_guard_consecutive_hits", 2, 1, 10)
+        if not hit:
+            state["consecutive_hits"] = 0
+            state["foreground_package"] = ""
+            state["first_seen_at"] = None
+            self._save_night_guard_state()
+            return
+        if state.get("foreground_package") != hit:
+            state["foreground_package"] = hit
+            state["consecutive_hits"] = 0
+            state["first_seen_at"] = now
+        state["consecutive_hits"] = int(state.get("consecutive_hits") or 0) + 1
+        self._save_night_guard_state()
+        if state["consecutive_hits"] >= required_hits:
+            cooldown_minutes = self._night_guard_int("night_guard_warning_cooldown_minutes", 60, 5, 1440)
+            last_warning = state.get("warning_sent_at")
+            if isinstance(last_warning, (int, float)) and math.isfinite(last_warning) \
+                    and now - float(last_warning) < cooldown_minutes * 60:
+                return
+            await self._night_guard_send_warning(user_id, state, hit)
+
+    async def _night_guard_loop(self) -> None:
+        try:
+            while True:
+                interval = self._night_guard_int("night_guard_check_interval_seconds", 300, 60, 3600)
+                await asyncio.sleep(interval)
+                try:
+                    await asyncio.wait_for(self._night_guard_tick(), timeout=interval)
+                except asyncio.TimeoutError:
+                    logger.warning("phone agent night guard tick exceeded its budget")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("phone agent night guard tick failed: %s", _text(exc, 200))
+        except asyncio.CancelledError:
+            return
+
+    async def _night_guard_tick(self) -> None:
+        if not self._night_guard_enabled() or not self._night_guard_packages():
+            # v4 §6: disabling the guard must not leave its suspensions behind.
+            # Release whatever it still owns, then stay quiet.
+            await self._night_guard_release_all_owned("guard_disabled")
+            return
+        async with self._night_guard_lock:
+            for user_id in sorted(self._night_guard_states):
+                state = self._night_guard_states.get(user_id)
+                if state is None:
+                    continue
+                await self._night_guard_tick_user(user_id, state)
+
+    async def _night_guard_release_all_owned(self, reason: str) -> None:
+        for user_id in sorted(self._night_guard_states):
+            state = self._night_guard_states.get(user_id)
+            if not state or not state.get("owned_suspended"):
+                continue
+            _, _, still_pending = await self._night_guard_restore_owned(user_id, state, reason)
+            if still_pending:
+                logger.warning(
+                    "phone agent night guard could not release %s for %s (%s)",
+                    still_pending, user_id, reason,
+                )
+                continue
+            state["phase"] = NG_PHASE_WATCHING
+            state["warning_sent_at"] = None
+            state["warning_deadline"] = None
+            state["consecutive_hits"] = 0
+            self._save_night_guard_state()
+
+    def _record_night_guard_session(self, user_id: str, session: str) -> None:
+        """Remember the latest private session per allowed user for reminders."""
+        if not user_id:
+            return
+        # B01: an empty allowlist is a closed door, not an open one. The
+        # companion-auth fallback is evaluated in _authorized before this
+        # runs; reaching here means the caller passed that gate.
+        allowed = self._allowed_users()
+        if not allowed or user_id not in allowed:
+            return
+        if self._bool_config("night_guard_private_only", True) and ":FriendMessage:" not in session:
+            return
+        state = self._night_guard_states.setdefault(user_id, {})
+        if state.get("session") != session:
+            state["session"] = session
+            self._save_night_guard_state()
+
+    async def _night_guard_release(self, user_id: str) -> dict[str, Any]:
+        """User-requested release: restore only guard-owned packages."""
+        async with self._night_guard_lock:
+            state = self._night_guard_states.get(user_id)
+            if state is None or not (state.get("owned_suspended") or state.get("phase") == NG_PHASE_WARNED):
+                return {"success": False, "error": "夜间守护没有需要解除的限制"}
+            phase = state.get("phase")
+            # If only a warning was active (no packages suspended yet), cancel it.
+            if not state.get("owned_suspended"):
+                cooldown_minutes = self._night_guard_int("night_guard_warning_cooldown_minutes", 60, 5, 1440)
+                state["phase"] = NG_PHASE_RELEASED
+                state["released_until"] = time.time() + cooldown_minutes * 60
+                state["warning_sent_at"] = None
+                state["warning_deadline"] = None
+                state["consecutive_hits"] = 0
+                self._save_night_guard_state()
+                self._audit("night_guard_user_released", user_id=user_id, restored=[], had_warning=True)
+                return {"success": True, "restored": [], "message": "已取消提醒"}
+            restored, still_suspended, still_pending = await self._night_guard_restore_owned(user_id, state, "user_release")
+            if still_pending:
+                # B03: do not claim success when packages are still suspended.
+                self._audit("night_guard_user_release_partial", user_id=user_id,
+                            restored=restored, pending=still_pending)
+                return {
+                    "success": False,
+                    "error": "设备离线，部分应用恢复待重试",
+                    "restored": restored,
+                    "pending": still_pending,
+                }
+            cooldown_minutes = self._night_guard_int("night_guard_warning_cooldown_minutes", 60, 5, 1440)
+            state["phase"] = NG_PHASE_RELEASED
+            state["released_until"] = time.time() + cooldown_minutes * 60
+            state["warning_sent_at"] = None
+            state["warning_deadline"] = None
+            state["consecutive_hits"] = 0
+            self._save_night_guard_state()
+            self._audit(
+                "night_guard_user_released",
+                user_id=user_id,
+                restored=restored,
+                still_suspended=still_suspended,
+                had_warning=(phase == NG_PHASE_WARNED),
+            )
+            result = {"success": True, "restored": restored}
+            if still_suspended:
+                # v4 §6: our lease is released, but another source (a manual
+                # lock) keeps these apps suspended — releasing the guard's
+                # intent is not the same as the device being restored.
+                result["still_suspended"] = still_suspended
+                result["message"] = "已解除夜间限制；这些应用仍被你设置的其他限制保持暂停"
+            return result
+
     def _reminder_path(self) -> str:
         return str(self._plugin_data_path("reminders_path", "phone_agent_reminders.json"))
 
@@ -754,18 +1829,38 @@ class PhoneAgentPlugin(Star):
     def _policy_state_path(self) -> str:
         return str(self._plugin_data_path("policy_state_path", "phone_agent_policies.json"))
 
+    def _task_run_path(self) -> str:
+        return str(self._plugin_data_path("task_runs_path", "phone_agent_task_runs.json"))
+
     def _save_policy_state(self) -> None:
-        try:
-            path = Path(self._policy_state_path())
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                package: {"until": until}
-                for package, until in sorted(self._policy_state.items())
-                if package in self._guard_suspended
+        # P1-A: persist source + deadline per package so a restart restores the
+        # ownership map as well as the countdown. Atomic replace keeps a crash
+        # from leaving a half-written file behind.
+        path = Path(self._policy_state_path())
+        payload: dict[str, Any] = {"version": POLICY_STATE_VERSION, "packages": {}}
+        for package, leases in sorted(self._policy_leases.items()):
+            if not leases:
+                continue
+            payload["packages"][package] = {
+                "leases": {
+                    source: {"until": lease.until}
+                    for source, lease in sorted(leases.items())
+                }
             }
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
         except Exception as exc:
-            logger.debug("phone agent policy state save failed: %s", exc)
+            # Losing the file means losing the only record that an app is still
+            # suspended, so this must not stay at debug level.
+            logger.warning("phone agent policy state save failed: %s", exc)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _load_policy_state(self) -> None:
         try:
@@ -775,24 +1870,50 @@ class PhoneAgentPlugin(Star):
             values = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(values, dict):
                 return
+            if values.get("version") == POLICY_STATE_VERSION and isinstance(values.get("packages"), dict):
+                entries = values["packages"]
+            else:
+                # Legacy file: {package: {"until": ts | null}} with no source.
+                # Graceful shutdown already releases temporary policies, so an
+                # entry that survived a restart is in practice a permanent
+                # manual lock; migrating it to "manual" keeps an explicit user
+                # stop able to release it. A crashed night lease still expires
+                # on its recorded deadline, whichever name we file it under.
+                entries = values
             now = datetime.now().timestamp()
-            for raw_package, item in values.items():
+            for raw_package, item in entries.items():
                 package = self._resolve_package(raw_package)
                 if not PACKAGE_RE.fullmatch(package) or self._protected_policy_error(package):
                     continue
-                until: float | None
-                if isinstance(item, dict) and item.get("until") is not None:
-                    try:
-                        until = float(item.get("until"))
-                    except (TypeError, ValueError):
-                        continue
+                if isinstance(item, dict) and isinstance(item.get("leases"), dict):
+                    raw_leases = item["leases"]
                 else:
-                    until = None
+                    raw_leases = {
+                        POLICY_LEGACY_SOURCE: {
+                            "until": item.get("until") if isinstance(item, dict) else None
+                        }
+                    }
+                leases: dict[str, _PolicyLease] = {}
+                for raw_source, spec in raw_leases.items():
+                    source = _text(raw_source, 40).lower() or POLICY_LEGACY_SOURCE
+                    until = spec.get("until") if isinstance(spec, dict) else None
+                    if until is not None:
+                        try:
+                            until = float(until)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(until):
+                            continue
+                    leases[source] = _PolicyLease(source=source, until=until)
+                if not leases:
+                    continue
+                self._policy_leases[package] = leases
                 self._guard_suspended.add(package)
-                self._policy_state[package] = until
-                if until is not None:
-                    self._policy_expiry_tasks[package] = asyncio.create_task(
-                        self._expire_app_policy(package, max(0, until - now))
+                for source, lease in leases.items():
+                    if lease.until is None:
+                        continue
+                    lease.task = asyncio.create_task(
+                        self._expire_policy_lease(package, source, max(0.0, lease.until - now))
                     )
         except (OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
             logger.warning("phone agent policy state file is invalid; ignoring it")
@@ -2460,7 +3581,15 @@ class PhoneAgentPlugin(Star):
             path.write_bytes(raw)
         except OSError:
             return json.dumps({"success": False, "error": "could not store the screenshot"}, ensure_ascii=False)
-        delivered = await self._deliver_image(event, path, _text(caption, 200))
+        # B10: always clean up the temp file, whether delivery succeeds,
+        # fails, or raises. The image data is already in memory if needed.
+        try:
+            delivered = await self._deliver_image(event, path, _text(caption, 200))
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("phone agent could not delete screenshot temp file: %s", path)
         return json.dumps({
             "success": True,
             "delivered": delivered,
@@ -2492,16 +3621,32 @@ class PhoneAgentPlugin(Star):
             return None
         return matches[-1].lower() == "true"
 
-    def _cancel_policy_expiry(self, package: str) -> None:
-        task = self._policy_expiry_tasks.pop(package, None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
+    def _cancel_policy_expiry(self, package: str, source: str | None = None) -> None:
+        leases = self._policy_leases.get(package, {})
+        targets = [source] if source is not None else list(leases)
+        for item in targets:
+            lease = leases.get(item)
+            if lease is None:
+                continue
+            task = lease.task
+            lease.task = None
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
 
-    def _schedule_policy_expiry(self, package: str, minutes: int) -> datetime:
-        self._cancel_policy_expiry(package)
+    def _schedule_policy_expiry(self, package: str, minutes: int, source: str) -> datetime:
+        # P1-A: only this source's deadline is rescheduled. Cancelling every
+        # timer on the package used to drop another source's countdown, leaving
+        # the app suspended with nobody responsible for restoring it.
+        self._cancel_policy_expiry(package, source)
         due = datetime.now() + timedelta(minutes=minutes)
-        self._policy_expiry_tasks[package] = asyncio.create_task(
-            self._expire_app_policy(package, max(0, (due - datetime.now()).total_seconds()))
+        lease = self._policy_leases.setdefault(package, {}).setdefault(
+            source, _PolicyLease(source=source)
+        )
+        lease.until = due.timestamp()
+        lease.task = asyncio.create_task(
+            self._expire_policy_lease(
+                package, source, max(0.0, (due - datetime.now()).total_seconds())
+            )
         )
         return due
 
@@ -2522,14 +3667,32 @@ class PhoneAgentPlugin(Star):
         if self._control_backend() == "app":
             action_name = "suspend_app" if normalized == "disable" else "unsuspend_app"
             result = await asyncio.to_thread(self.device_app.execute, action_name, {"package": package})
+            # B07: parse the device's own output for package and state rather
+            # than treating success==verified. The app's verifiedState() returns
+            # {"package":"...","state":"suspended|unsuspended","verified":true};
+            # an unverified or mismatched result must not be reported as success.
+            output = result.get("output") if isinstance(result.get("output"), dict) else {}
+            device_package = _text(output.get("package"), 160)
+            device_state = _text(output.get("state"), 20).lower()
+            # B07-v3: verified must be exactly boolean True, not a truthy
+            # string like "false". package must be present and match exactly.
+            raw_verified = output.get("verified")
+            device_verified = raw_verified is True
+            expected_state = "suspended" if normalized == "disable" else "unsuspended"
+            verified = (
+                bool(result.get("success"))
+                and device_verified
+                and device_package == package  # must be present and match
+                and device_state == expected_state
+            )
             return {
-                "success": bool(result.get("success")),
+                "success": verified,
                 "action": normalized,
                 "package": package,
                 "backend": "app",
-                "state": _text(result.get("output", {}).get("state"), 20) if isinstance(result.get("output"), dict) else "",
-                "verified": bool(result.get("success")),
-                "error": _text(result.get("error"), 240) if not result.get("success") else "",
+                "state": device_state or ("unknown" if result.get("success") else ""),
+                "verified": verified,
+                "error": _text(result.get("error"), 240) if not verified else "",
             }
         if self._control_backend() == "operit":
             available = await asyncio.to_thread(self._operit_health_sync)
@@ -2566,57 +3729,130 @@ class PhoneAgentPlugin(Star):
             "error": (err or verify_err)[-500:] if not verified else "",
         }
 
-    async def _execute_app_policy(self, package: str, action: str, minutes: int = 0) -> dict[str, Any]:
+    async def _execute_app_policy(self, package: str, action: str, minutes: int = 0, *, source: str = "manual") -> dict[str, Any]:
+        """Apply a policy and track per-source ownership.
+
+        B02/P1-A: each disable adds a lease for `source`; each enable releases
+        only that source. The actual unsuspend is sent only when no owner
+        remains, so the night guard's restore never lifts a manual suspension.
+        A restore the device does not confirm keeps its lease instead of
+        silently dropping the only record that the app is still suspended.
+        """
         action = _text(action, 20).lower()
         if action not in {"disable", "suspend", "enable", "unsuspend", "restore"}:
             return {"success": False, "action": action, "package": self._resolve_package(package), "error": "action must be disable or enable"}
         normalized = "disable" if action in {"disable", "suspend"} else "enable"
         minutes = max(0, min(int(minutes or 0), 1440))
-        result = await self._apply_app_policy(package, normalized)
-        if not result.get("success"):
-            return result
-        package = _text(result.get("package") or package, 160)
+        source = _text(source, 40).lower() or POLICY_LEGACY_SOURCE
+        # Resolve once, so the lease key, the guard set and the device command
+        # all use the same package name (aliases must not create two keys).
+        package = self._resolve_package(package)
         if normalized == "disable":
+            # Register the lease before sending the command, so a crash between
+            # the policy call and the bookkeeping does not lose the owner.
+            lease = self._policy_leases.setdefault(package, {}).setdefault(
+                source, _PolicyLease(source=source)
+            )
+            try:
+                result = await self._apply_app_policy(package, normalized)
+            except Exception as exc:  # a raising backend must not lose the lease
+                result = {"success": False, "action": normalized, "package": package,
+                          "error": _text(exc, 240)}
+            if not result.get("success"):
+                leases = self._policy_leases.get(package, {})
+                if leases.get(source) is lease:
+                    leases.pop(source, None)
+                if not leases:
+                    self._policy_leases.pop(package, None)
+                return result
             self._guard_suspended.add(package)
             if minutes:
-                due = self._schedule_policy_expiry(package, minutes)
-                self._policy_state[package] = due.timestamp()
+                due = self._schedule_policy_expiry(package, minutes, source)
                 result.update({"mode": "temporary", "until": due.isoformat(timespec="minutes")})
             else:
-                self._cancel_policy_expiry(package)
-                self._policy_state[package] = None
+                self._cancel_policy_expiry(package, source)
+                lease.until = None
                 result["mode"] = "disabled"
+            result["lease_released"] = False
+            result["owners"] = sorted(self._policy_leases.get(package, {}))
             self._save_policy_state()
-        else:
-            self._cancel_policy_expiry(package)
+            return result
+        # enable: release this source's lease. Only send the actual unsuspend
+        # when no other source still owns the package.
+        released = self._policy_leases.get(package, {}).pop(source, None)
+        if released is not None:
+            self._cancel_policy_expiry(package, source)
+        remaining = sorted(self._policy_leases.get(package, {}))
+        if remaining:
+            # Other sources still want this package suspended — do NOT enable.
+            self._save_policy_state()
+            return {
+                "success": True,
+                "action": normalized,
+                "package": package,
+                "mode": "still_suspended",
+                "lease_released": released is not None,
+                "still_suspended": True,
+                "remaining_owners": remaining,
+                "note": f"package remains suspended by {len(remaining)} other source(s)",
+            }
+        self._policy_leases.pop(package, None)
+        try:
+            result = await self._apply_app_policy(package, normalized)
+        except Exception as exc:  # keep the restore responsibility on a raise
+            result = {"success": False, "action": normalized, "package": package,
+                      "error": _text(exc, 240)}
+        if result.get("success"):
             self._guard_suspended.discard(package)
-            self._policy_state.pop(package, None)
+            result.update({"mode": "enabled", "lease_released": True, "owners": []})
             self._save_policy_state()
-            result["mode"] = "enabled"
+            return result
+        # The device did not confirm the restore. Keep the lease (with its
+        # recorded deadline) so responsibility for the suspension survives and
+        # a later retry can still release it.
+        lease = self._policy_leases.setdefault(package, {}).setdefault(
+            source, released if released is not None else _PolicyLease(source=source)
+        )
+        lease.task = None
+        self._guard_suspended.add(package)
+        result.update({
+            "mode": "restore_pending",
+            "lease_released": False,
+            "restore_pending": True,
+            "owners": sorted(self._policy_leases.get(package, {})),
+        })
+        self._save_policy_state()
         return result
 
-    async def _expire_app_policy(self, package: str, delay_seconds: float) -> None:
+    async def _expire_policy_lease(self, package: str, source: str, delay_seconds: float) -> None:
         current = asyncio.current_task()
         try:
-            await asyncio.sleep(max(0, delay_seconds))
-            result = await self._apply_app_policy(package, "enable")
-            if result.get("success"):
-                self._guard_suspended.discard(package)
-                self._policy_state.pop(package, None)
-                self._save_policy_state()
+            await asyncio.sleep(max(0.0, delay_seconds))
+            # Route through _execute_app_policy so a package still owned by
+            # another source is not enabled, and so a failed restore keeps its
+            # lease for the next retry.
+            result = await self._execute_app_policy(package, "enable", source=source)
             self._audit(
                 "phone_app_policy_expired",
                 package=package,
+                source=source,
                 success=bool(result.get("success")),
+                mode=result.get("mode", ""),
+                restore_pending=bool(result.get("restore_pending")),
                 error=_text(result.get("error"), 180),
             )
         except asyncio.CancelledError:
             return
         finally:
-            if self._policy_expiry_tasks.get(package) is current:
-                self._policy_expiry_tasks.pop(package, None)
+            lease = self._policy_leases.get(package, {}).get(source)
+            if lease is not None and lease.task is current:
+                lease.task = None
             if (
-                not self._policy_expiry_tasks
+                not any(
+                    item.task
+                    for leases in self._policy_leases.values()
+                    for item in leases.values()
+                )
                 and self._manual_guard_until is not None
                 and datetime.now() >= self._manual_guard_until
             ):
@@ -2650,23 +3886,32 @@ class PhoneAgentPlugin(Star):
             }
         return {"success": True, "mode": "active", "packages": applied}
 
-    async def _restore_guard_apps(self, packages: set[str] | None = None) -> None:
+    async def _restore_guard_apps(self, packages: set[str] | None = None, *, source: str = "manual") -> dict[str, list[str]]:
+        """Release one source's claim on each package.
+
+        v4: releasing a source never cancels another source's timer; the timer
+        belongs to the lease, not to the package. The returned buckets let
+        callers stop claiming "受限应用已全部恢复" when a package is still held
+        by another source or the device did not confirm the unsuspend.
+        """
         targets = set(packages) if packages is not None else set(self._guard_suspended)
-        tasks = []
-        for package in targets:
-            task = self._policy_expiry_tasks.pop(package, None)
-            if task is not None:
-                tasks.append(task)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for package in targets:
-            result = await self._apply_app_policy(package, "enable")
-            if result.get("success"):
-                self._guard_suspended.discard(package)
-                self._policy_state.pop(package, None)
+        released: list[str] = []
+        still_suspended: list[str] = []
+        restore_pending: list[str] = []
+        for package in sorted(targets):
+            result = await self._execute_app_policy(package, "enable", source=source)
+            if not result.get("success"):
+                restore_pending.append(package)
+            elif result.get("mode") == "still_suspended":
+                still_suspended.append(package)
+            else:
+                released.append(package)
         self._save_policy_state()
+        return {
+            "released": released,
+            "still_suspended": still_suspended,
+            "restore_pending": restore_pending,
+        }
 
     @filter.llm_tool(name="phone_sleep_mode")
     @_tolerate_nested_args
@@ -2735,12 +3980,61 @@ class PhoneAgentPlugin(Star):
             "suspended": sorted(self._guard_suspended),
         }, ensure_ascii=False)
 
-    async def terminate(self) -> None:
-        # Keep explicitly permanent policies in effect across plugin restarts.
-        # Only policies with an expiry timestamp are temporary and need cleanup
-        # during shutdown; their expiry tasks cannot survive the event loop.
-        temporary = {
-            package for package in self._guard_suspended
-            if self._policy_state.get(package) is not None
-        }
-        await self._restore_guard_apps(temporary)
+    # ==================== night guard user release ====================
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def on_private_message(self, event: AstrMessageEvent) -> None:
+        """Deterministic night-guard release and session memory.
+
+        Runs on every private chat message. It only reacts to an explicit
+        release phrase; regular chat is never modified. The LLM has no role
+        here: restoring guard-owned packages must stay a one-path decision.
+        """
+        if not self._enabled():
+            return
+        user_id = self._night_guard_user_id(event)
+        session = _text(getattr(event, "unified_msg_origin", ""), 240)
+        if not user_id or not session:
+            return
+        # Defense in depth beyond the PRIVATE_MESSAGE filter: never act on,
+        # or record, a group session for night-guard purposes.
+        if self._bool_config("night_guard_private_only", True) and ":FriendMessage:" not in session:
+            return
+        if not self._night_guard_enabled():
+            return
+        # B01: authorize BEFORE recording the session, so an empty allowlist or
+        # a removed user never seeds the night-guard state file.
+        if not self._authorized(event):
+            return
+        self._record_night_guard_session(user_id, session)
+        message = ""
+        try:
+            components = event.get_messages() or []
+        except Exception:
+            components = []
+        texts = []
+        for component in components:
+            text = getattr(component, "text", None)
+            if isinstance(text, str):
+                texts.append(text)
+        if texts:
+            message = " ".join(texts)
+        if not message:
+            plain = getattr(event.message_obj, "plain_result", None)
+            message = plain if isinstance(plain, str) else ""
+        message = _text(message, 300)
+        if not message or not NG_RELEASE_RE.search(message):
+            return
+        result = await self._night_guard_release(user_id)
+        if result.get("success"):
+            restored = result.get("restored") or []
+            if restored:
+                reply = f"已解除夜间守护的限制（恢复 {len(restored)} 个应用）"
+            else:
+                reply = "已取消提醒；今晚我不会再管你了，早点睡。"
+        else:
+            reply = _text(result.get("error"), 200) or "当前没有需要解除的限制"
+        try:
+            await asyncio.wait_for(event.send(MessageChain().message(reply)), timeout=15)
+        except Exception as exc:
+            logger.debug("phone agent night guard release reply failed: %s", _text(exc, 160))

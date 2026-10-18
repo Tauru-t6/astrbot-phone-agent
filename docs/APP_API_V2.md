@@ -133,3 +133,64 @@ being returned to tools. A matching `success:false` result is final and is not
 replayed through another endpoint or relay. Only transport failures try the
 next URL or relay, reusing the same command ID.
 
+## Device status heartbeat
+
+`POST /device/status` accepts a periodic status heartbeat from the app:
+
+```json
+{
+  "device_id": "phone-abcd1234",
+  "app_version": "0.3.0",
+  "battery_percent": 42,
+  "charging": false,
+  "foreground_package": "tv.danmaku.bilibilihd",
+  "screen_on_seconds_today": 12345,
+  "screen_interactive": true,
+  "shizuku_ready": true,
+  "reported_at": 1760000300.0
+}
+```
+
+The app posts this every 30–60 seconds after the first local status refresh.
+Upload failure updates connection state but does not clear the local snapshot
+or block the command server. The `device_id` must match the registered device;
+otherwise the heartbeat is rejected with HTTP 400.
+
+`screen_interactive` is `true` when the screen is on, `false` when off, and
+absent/null when the state cannot be read — the night guard never treats
+unknown as on. `reported_at` is clamped to the server receive time when the
+phone clock is more than 5 minutes off, so a skewed clock cannot伪造 freshness.
+
+## Night guard
+
+The night guard is a deterministic background state machine, not an LLM loop.
+When `enable_night_guard` is on and the current local time is inside the
+configured `[night_guard_start, night_guard_end)` window (crossing midnight if
+start > end), the plugin periodically observes the foreground app from the
+heartbeat cache and, if it matches a configured `night_guard_packages` entry
+for `night_guard_consecutive_hits` observations in a row, sends one private-chat
+warning. After `night_guard_grace_minutes` it re-checks; if the same package is
+still foreground, it calls the existing verified `_execute_app_policy(disable)`
+path to suspend that single package.
+
+Key safety properties:
+
+- `night_guard_dry_run=true` observes, warns and audits but never suspends.
+  The first production deployment should keep this on for at least one night.
+- The guard only restores packages in its own `owned_suspended` list. It never
+  calls `phone_sleep_mode(stop)` or restores packages suspended by other
+  sources (manual policies, other tasks).
+- `night_guard_private_only=true` (default) rejects group chat sessions; the
+  warning goes to the last recorded private `unified_msg_origin` for the user.
+- State is persisted to `night_guard_state_path`; it contains only package
+  names, timestamps and phase — never tokens, screen text or notification
+  bodies.
+- A private chat message containing a release phrase ("解开", "解除限制",
+  "恢复视频", "让我继续用") triggers an immediate restore of guard-owned
+  packages and enters a cooldown so the guard stays quiet for
+  `night_guard_warning_cooldown_minutes`.
+- The guard requires `control_backend=app`; in Operit mode it skips cleanly.
+
+The `GET /status` response now includes a `night_guard` section with the
+current window, dry-run flag, package list and per-user state summary.
+

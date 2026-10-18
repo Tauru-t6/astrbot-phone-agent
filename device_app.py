@@ -123,7 +123,11 @@ class DeviceAppBackend:
         self._audit = audit
         self._lock = threading.Lock()
         self._registration: dict[str, Any] | None = None
+        # P1-C: bumps when the binding changes identity, so cached observations
+        # and status samples from the previous device can be invalidated.
+        self._registration_generation = 0
         self._last_status: dict[str, Any] | None = None
+        self._status_history: list[tuple[float, dict[str, Any]]] = []
         self._recent_results: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
         self._load_timeline()
@@ -270,8 +274,22 @@ class DeviceAppBackend:
         token_fingerprint = _text(payload.get("token_fingerprint"), 100)
         if not device_id or not re.fullmatch(r"[A-Za-z0-9._-]+", device_id):
             return {"success": False, "error": "device_id is required"}
-        if not base_url or not self.valid_base_url(base_url) or any(not self.valid_base_url(url) for url in base_urls):
+        # A05: allow registration without direct URLs (pure-relay devices).
+        # base_url and base_urls are both empty when the device connects only
+        # through the relay; transport reachability is modeled separately.
+        valid_urls = [url for url in base_urls if self.valid_base_url(url)]
+        if base_url and not self.valid_base_url(base_url):
             return {"success": False, "error": "base_url must be an http(s) URL"}
+        if any(not self.valid_base_url(url) for url in base_urls):
+            return {"success": False, "error": "base_urls must contain http(s) URLs"}
+        if not base_url and not valid_urls:
+            # Relay-only device: accept with empty direct endpoints.
+            base_url = ""
+            base_urls = []
+        else:
+            base_urls = valid_urls
+            if not base_url and base_urls:
+                base_url = base_urls[0]
         expected_fingerprint = self._token_fingerprint()
         if (
             expected_fingerprint
@@ -280,6 +298,13 @@ class DeviceAppBackend:
         ):
             return {"success": False, "error": "token fingerprint mismatch; update app_shared_token on one side"}
         with self._lock:
+            previous = self._registration
+            rebind = previous is None or previous.get("device_id") != device_id
+            if rebind:
+                # P1-C: a new binding must not inherit the old device's status.
+                self._registration_generation += 1
+                self._last_status = None
+                self._status_history = []
             self._registration = {
                 "device_id": device_id,
                 "base_url": base_url,
@@ -305,6 +330,11 @@ class DeviceAppBackend:
         with self._lock:
             return dict(self._registration) if self._registration else None
 
+    def registration_generation(self) -> int:
+        """Monotonic binding id; changes when a different device registers."""
+        with self._lock:
+            return self._registration_generation
+
     def _token_fingerprint(self) -> str:
         import hashlib
 
@@ -313,19 +343,59 @@ class DeviceAppBackend:
 
     # ---------- status cache (from poll payloads / results) ----------
 
+    MAX_STATUS_HISTORY = 20
+
     def record_device_status(self, status: dict[str, Any]) -> None:
         if not isinstance(status, dict) or not status:
             return
+        # P1-C: a sample that names its device must belong to the current
+        # binding. A late heartbeat from the previous phone must not overwrite
+        # the new one's status.
+        reported_device = _text(status.get("device_id"), 64)
+        # B04: keep reported_at (phone's sampling time) separate from
+        # received_at (server receive time). A skewed phone clock or a
+        # missing timestamp must NOT be back-filled with time.time() —
+        # that would make a stale sample look fresh. The consumer checks
+        # reported_at for freshness; received_at is for diagnostics only.
+        phone_reported = self._reported_at(status.get("reported_at"))
         with self._lock:
+            current_device = (self._registration or {}).get("device_id", "")
+            if reported_device and current_device and reported_device != current_device:
+                return
             self._last_status = {
                 "battery_percent": _int_or_none(status.get("battery_percent")),
                 "charging": bool(status.get("charging")),
                 "foreground_package": _text(status.get("foreground_package"), 160),
                 "screen_on_seconds_today": _int_or_none(status.get("screen_on_seconds_today")),
+                "screen_interactive": _opt_bool(status.get("screen_interactive")),
                 "shizuku_ready": bool(status.get("shizuku_ready")),
                 "app_version": _text(status.get("app_version"), 40),
-                "reported_at": time.time(),
+                # App-side reason when the foreground probe returned nothing.
+                "foreground_debug": _text(status.get("foreground_debug"), 160),
+                "reported_at": phone_reported,
+                "received_at": time.time(),
             }
+            self._status_history.append((time.time(), dict(self._last_status)))
+            self._status_history = self._status_history[-self.MAX_STATUS_HISTORY:]
+
+    @staticmethod
+    def _reported_at(value: Any) -> float | None:
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(stamp) or stamp <= 0:
+            return None
+        # A phone clock far from the server's cannot be trusted for freshness.
+        now = time.time()
+        if abs(now - stamp) > 300:
+            return None
+        return stamp
+
+    def status_counts_last_hours(self, hours: float) -> int:
+        cutoff = time.time() - max(0.0, hours) * 3600
+        with self._lock:
+            return sum(1 for received_at, _ in self._status_history if received_at >= cutoff)
 
     def last_status(self) -> dict[str, Any] | None:
         with self._lock:
@@ -554,3 +624,16 @@ def _int_or_none(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None
+
+
+def _opt_bool(value: Any) -> bool | None:
+    """A missing screen_interactive must stay unknown, never silently true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return None

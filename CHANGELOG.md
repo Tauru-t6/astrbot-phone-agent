@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.8.0]
+
+### Added
+
+- **Night guard.** A deterministic background state machine that observes the
+  foreground app during a configured night window, sends one private-chat
+  warning when a video app is detected, and suspends the package after a grace
+  period if the user is still watching. All actions are audited; dry-run mode
+  is the safe first deployment. The LLM never decides whether to suspend.
+  New config keys: `enable_night_guard`, `night_guard_start/end`,
+  `night_guard_check_interval_seconds`, `night_guard_status_max_age_seconds`,
+  `night_guard_grace_minutes`, `night_guard_suspend_minutes`,
+  `night_guard_consecutive_hits`, `night_guard_max_enforcements_per_night`,
+  `night_guard_warning_cooldown_minutes`, `night_guard_packages`,
+  `night_guard_exempt_packages`, `night_guard_private_only`,
+  `night_guard_dry_run`, `night_guard_state_path`.
+- **Device status heartbeat.** `POST /device/status` accepts a periodic
+  foreground/battery/screen status from the app. The night guard reads this
+  cache instead of polling; a stale heartbeat never triggers a suspension.
+- **`screen_interactive`** field in the App status output and heartbeat, so the
+  guard knows whether the screen is on. Unknown is never treated as on.
+- **User release hook.** A private chat message with a release phrase
+  ("解开", "解除限制") restores only the packages the guard suspended and
+  enters a cooldown. It never unlocks packages from other sources.
+
+### Fixed
+
+- **Duplicate `terminate()`.** The class had two `terminate` methods; the second
+  silently overwrote the task-cancellation logic, leaving reminder, policy and
+  operit background tasks running on shutdown. Merged into one method that
+  cancels all tasks and restores only temporary policies.
+- **NotificationRelayService flush.** Replaced the "flush only on next
+  notification" pattern with a scheduled delayed flush. Failed batches are now
+  retried up to 3 times instead of dropped immediately.
+- **Screenshot quick-action copy.** The "保存到系统相册" label was misleading;
+  the screenshot is sent to the conversation, not saved to the gallery.
+- Removed the stale hardcoded `APP_VERSION = "0.2.0"` constant; the app version
+  always comes from `BuildConfig.VERSION_NAME`.
+
 ## [0.7.0]
 
 ### Added

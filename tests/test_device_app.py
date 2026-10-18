@@ -110,6 +110,37 @@ class RegisterTests(unittest.TestCase):
         })["success"])
 
 
+class RebindTests(unittest.TestCase):
+    """P1-C: a new binding must not inherit the previous device's samples."""
+
+    def setUp(self):
+        self.backend = device_app.DeviceAppBackend(FakeConfig(app_shared_token="secret"), RecordingAudit())
+
+    def test_rebind_clears_status_and_bumps_generation(self):
+        self.backend.register({"device_id": "phone-a", "base_url": "http://a:8260"})
+        first = self.backend.registration_generation()
+        self.backend.record_device_status({"battery_percent": 50, "foreground_package": "com.x"})
+        self.assertIsNotNone(self.backend.last_status())
+        self.backend.register({"device_id": "phone-b", "base_url": "http://b:8260"})
+        self.assertIsNone(self.backend.last_status())
+        self.assertEqual(self.backend.status_counts_last_hours(1), 0)
+        self.assertGreater(self.backend.registration_generation(), first)
+
+    def test_same_device_reregister_keeps_status(self):
+        self.backend.register({"device_id": "phone-a", "base_url": "http://a:8260"})
+        generation = self.backend.registration_generation()
+        self.backend.record_device_status({"battery_percent": 50})
+        self.backend.register({"device_id": "phone-a", "base_url": "http://a2:8260"})
+        self.assertEqual(self.backend.registration_generation(), generation)
+        self.assertEqual(self.backend.last_status()["battery_percent"], 50)
+
+    def test_late_sample_from_previous_device_is_ignored(self):
+        self.backend.register({"device_id": "phone-a", "base_url": "http://a:8260"})
+        self.backend.register({"device_id": "phone-b", "base_url": "http://b:8260"})
+        self.backend.record_device_status({"device_id": "phone-a", "battery_percent": 90})
+        self.assertIsNone(self.backend.last_status())
+
+
 class ExecuteTests(unittest.TestCase):
     def setUp(self):
         self.audit = RecordingAudit()
