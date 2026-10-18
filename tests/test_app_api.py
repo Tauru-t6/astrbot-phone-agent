@@ -344,3 +344,38 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.plugin, "_operit_health_sync", side_effect=AssertionError("wrong backend")):
             response = await self.post("/test_backend", {})
             self.assertTrue((await response.get_json())["success"])
+
+    # -- P1-E stage 3 routes
+
+    async def test_grant_requires_a_registered_device(self):
+        response = await self.post("/app/grant", {"actions": ["home"], "ttl_seconds": 60})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual((await response.get_json())["error_code"], "no_device")
+
+    async def test_grant_rejects_non_write_actions(self):
+        self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
+        response = await self.post("/app/grant", {"actions": ["observe"], "ttl_seconds": 60})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual((await response.get_json())["error_code"], "invalid_actions")
+
+    async def test_grant_issues_a_scoped_grant(self):
+        self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
+        response = await self.post("/app/grant",
+                                   {"actions": ["home"], "ttl_seconds": 120, "max_steps": 2})
+        self.assertEqual(response.status_code, 200, await response.get_data(as_text=True))
+        grant = (await response.get_json())["grant"]
+        self.assertTrue(grant["grant_id"])
+        self.assertEqual(grant["max_steps"], 2)
+
+    async def test_task_run_is_disabled_by_default(self):
+        self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
+        response = await self.post("/app/task/run", {"goal": "回到桌面", "grant_id": "x"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual((await response.get_json())["error_code"], "disabled")
+
+    async def test_task_run_requires_a_grant(self):
+        self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
+        self.plugin.config["enable_task_execute"] = True
+        response = await self.post("/app/task/run", {"goal": "回到桌面"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual((await response.get_json())["error_code"], "grant_required")
