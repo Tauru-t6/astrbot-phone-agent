@@ -372,6 +372,35 @@ class PhoneCompanionContext(Star):
                 return value
         return self._pet_name() or "companion"
 
+    async def _deliver(self, umo: str, text: str) -> bool:
+        """Send the decided message ourselves.
+
+        The host path delivers whatever the generation function returns, but the
+        scheduler calls the generation function directly, so nobody else would
+        send it. Without this the care status claimed "sent" while nothing ever
+        reached the chat.
+        """
+        if not text or not umo:
+            return False
+        sender = getattr(self.context, "send_message", None)
+        if not callable(sender):
+            logger.warning("[PhoneCompanionContext] care delivery impossible: no send_message")
+            return False
+        try:
+            from astrbot.api.event import MessageChain
+            from astrbot.api.message_components import Plain
+
+            payload: Any = MessageChain([Plain(text)])
+        except Exception:  # pragma: no cover - older host without message components
+            payload = text
+        try:
+            await sender(umo, payload)
+        except Exception as exc:
+            logger.warning("[PhoneCompanionContext] care delivery failed: %s", _clean(exc, 160))
+            return False
+        logger.info("[PhoneCompanionContext] care delivered to %s: %s", umo, _clean(text, 80))
+        return True
+
     async def evaluate_care(self, user_id: str, umo: str = "", relationship_role: str = "") -> dict[str, Any]:
         """Scheduler entry point (P1-D): run one autonomy evaluation.
 
@@ -395,9 +424,15 @@ class PhoneCompanionContext(Star):
             self._record_care_outcome(user_id, "failed", "scheduler_error", _clean(exc, 120))
             return {"evaluated": False, "reason": "error", "error": _clean(exc, 120)}
         outcome = self._last_outcome.get(user_id, {})
+        delivered = False
+        if text:
+            delivered = await self._deliver(umo, text)
+            if not delivered:
+                self._record_care_outcome(user_id, "failed", "deliver_failed", _clean(text, 80))
         return {
             "evaluated": True,
             "sent": bool(text),
+            "delivered": delivered,
             "outcome": outcome.get("outcome", ""),
             "reason": outcome.get("reason", ""),
         }

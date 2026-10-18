@@ -658,3 +658,32 @@ class BudgetReservationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CareDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """The scheduler path must actually send; a status of "sent" is not proof."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.config = make_config(self.temp.name)
+        self.context = types.SimpleNamespace(send_message=AsyncMock())
+        self.plugin = module.PhoneCompanionContext(self.context, self.config)
+        self.plugin._wrapped = AsyncMock(return_value="手机就剩24%电了，歇会儿？")
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_evaluate_care_delivers_the_message(self):
+        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1125961157")
+        self.assertTrue(result["delivered"])
+        self.context.send_message.assert_awaited_once()
+        umo, payload = self.context.send_message.await_args.args
+        self.assertEqual(umo, "tauru:FriendMessage:1125961157")
+        self.assertIn("歇会儿", str(payload))
+
+    async def test_delivery_failure_is_recorded_not_claimed(self):
+        self.context.send_message = AsyncMock(side_effect=RuntimeError("qq offline"))
+        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1125961157")
+        self.assertFalse(result["delivered"])
+        status = json.loads(Path(self.config["care_status_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(status["users"][USER]["recent"][-1]["reason"], "deliver_failed")
