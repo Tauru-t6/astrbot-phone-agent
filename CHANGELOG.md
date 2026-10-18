@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.8.2]
+
+### Added
+
+- **Approval proposals.** `POST /app/task/propose` plans a task and waits for a
+  human (`task_approvals` in `/app/state`); `POST /app/task/approve` issues the
+  grant and runs it; `POST /app/task/reject` cancels the run. A proposal alone
+  never touches the phone.
+- **`quick_status`.** Foreground plus screen state only, without the usage-stats
+  aggregation that made a full status take ~12 s on a real device.
+- **Per-step timings.** `step.verify` now carries `act_ms` and `verify_ms`.
+
+### Fixed
+
+- **Care messages were never delivered.** The scheduler path generated a message
+  and returned it to nobody: delivery only happened on the host's own path. The
+  bridge now sends through `context.send_message` and records `deliver_failed`
+  instead of claiming success.
+- **Interrupted runs stayed `executing` forever.** A run found in an active
+  state on load is marked `failed/interrupted`.
+- **An approved run was blocked by the idle guard.** Approval is the consent the
+  guard exists to collect, so it no longer applies to an approved run.
+
+### Changed
+
+- **Command dispatch caches the URL that answered** and skips its health probe.
+  Every command used to probe every candidate first, paying the timeout for each
+  dead address (measured: ~9 s per command). Dead candidates now use 1.5 s, and
+  the reachable URL is warmed at startup.
+
 ## [0.8.1]
 
 ### Added
