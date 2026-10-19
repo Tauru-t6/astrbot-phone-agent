@@ -50,7 +50,7 @@ block means "unknown", never "disabled".
 `POST /app/task/plan` accepts:
 
 ```json
-{"goal":"帮我把B站暂停一会儿","subject":"1125961157","grant_id":"optional-hex"}
+{"goal":"帮我把B站暂停一会儿","subject":"1000000001","grant_id":"optional-hex"}
 ```
 
 - Requires a registered device (`409 no_device` when there is none) and the

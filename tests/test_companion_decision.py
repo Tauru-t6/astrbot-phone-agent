@@ -674,16 +674,16 @@ class CareDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_evaluate_care_delivers_the_message(self):
-        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1125961157")
+        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1000000001")
         self.assertTrue(result["delivered"])
         self.context.send_message.assert_awaited_once()
         umo, payload = self.context.send_message.await_args.args
-        self.assertEqual(umo, "tauru:FriendMessage:1125961157")
+        self.assertEqual(umo, "tauru:FriendMessage:1000000001")
         self.assertIn("歇会儿", str(payload))
 
     async def test_delivery_failure_is_recorded_not_claimed(self):
         self.context.send_message = AsyncMock(side_effect=RuntimeError("qq offline"))
-        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1125961157")
+        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1000000001")
         self.assertFalse(result["delivered"])
         status = json.loads(Path(self.config["care_status_path"]).read_text(encoding="utf-8"))
         self.assertEqual(status["users"][USER]["recent"][-1]["reason"], "deliver_failed")
