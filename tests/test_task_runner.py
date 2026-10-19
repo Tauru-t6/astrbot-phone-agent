@@ -520,3 +520,12 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    async def test_empty_observation_is_not_a_change(self):
+        """A failed probe must not read as "the foreground changed"."""
+        self.status["foreground_package"] = ""
+        self.results["home"] = {"success": False, "error": "手机命令执行失败"}
+        executor, run = self.build(["observe", "home"], allowed={"home"})
+        run = await executor.execute(run, grant=self.grant(actions=["home"]))
+        self.assertEqual(run.status, module.RUN_FAILED)
+        self.assertIn(run.steps[1].verify["reason"], {"observation_empty", "command_failed"})

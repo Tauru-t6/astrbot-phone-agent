@@ -956,6 +956,18 @@ class TaskExecutor:
 
         if observation is None:
             return Verdict(False, "stale_observation", "", success, verified, None)
+        # An empty foreground is a failed probe, not evidence of a change. Without
+        # this, "home" compared "" against the previous package and reported
+        # success while nothing had happened.
+        foreground_actions = {"open_app", "close_app", "suspend_app", "home", "back"}
+        if action in foreground_actions and not foreground:
+            return Verdict(False, "observation_empty", "probe returned no package",
+                           success, verified, observed_at)
+        # A command that reported failure cannot be the source of a "done" step.
+        if action in {"open_app", "close_app", "suspend_app", "unsuspend_app", "home", "back",
+                      "lock_screen", "screenshot"} and not success:
+            return Verdict(False, "command_failed", _short(result.get("error"), 120),
+                           success, verified, observed_at)
         if action == "open_app":
             ok = foreground == package
             return Verdict(ok, "ok" if ok else "foreground_mismatch",

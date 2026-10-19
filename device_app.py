@@ -519,7 +519,7 @@ class DeviceAppBackend:
             if remaining <= 0:
                 break
             routes_left = len(urls) - index + int(self.relay_enabled())
-            attempt_timeout = min(remaining, max(10.0, remaining / routes_left))
+            attempt_timeout = min(remaining, max(4.0, min(8.0, remaining / routes_left)))
             result = self._http_json(base_url + "/command", self.shared_token(), method="POST", payload=envelope, timeout=attempt_timeout)
             if result.get("command_id") or result.get("type") == "result" or result.get("success"):
                 # A matching denial is final. A malformed result is also final:
@@ -611,13 +611,15 @@ class DeviceAppBackend:
             "deadline": int(self.command_timeout()),
         }
 
-    def execute(self, action: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    def execute(self, action: str, args: dict[str, Any] | None = None,
+                timeout: float | None = None) -> dict[str, Any]:
         """Run one command: direct first, relay as fallback."""
         try:
             envelope = self.build_envelope(action, args)
         except ValueError as exc:
             return {"success": False, "action": action, "error_code": "unsupported_action", "error": str(exc)[:200]}
-        timeout = self.command_timeout()
+        # Callers that cannot wait (task verification) pass a tighter budget.
+        timeout = min(self.command_timeout(), float(timeout)) if timeout else self.command_timeout()
         deadline = time.monotonic() + timeout
         direct = self._direct_command(envelope, timeout)
         if direct.get("command_id") or direct.get("success") or not self.relay_enabled():

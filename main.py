@@ -2123,7 +2123,7 @@ class PhoneAgentPlugin(Star):
                 "disable" if action == "suspend_app" else "enable",
             )
         if self._control_backend() == "app":
-            return await asyncio.to_thread(self.device_app.execute, action, args)
+            return await asyncio.to_thread(self.device_app.execute, action, args, 8.0)
         return await self._execute(action, args)
 
     async def _task_observe_cached(self) -> dict[str, Any]:
@@ -2138,7 +2138,7 @@ class PhoneAgentPlugin(Star):
         try:
             # quick_status skips the usage-stats aggregation, which costs ~10 s
             # and is irrelevant to verifying a step that just ran.
-            result = await asyncio.to_thread(self.device_app.execute, "quick_status", {})
+            result = await asyncio.to_thread(self.device_app.execute, "quick_status", {}, 8.0)
         except Exception:
             return self.device_app.last_status() or {}
         output = result.get("output") if isinstance(result, dict) else None
