@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.3]
+
+### Fixed
+
+- **A task step could report success while nothing happened.** An empty
+  foreground package was compared against the previous one and read as "the
+  app changed"; a command that returned failure was not blocking the step
+  either. Both now fail the step (`observation_empty`, `command_failed`).
+- **Device commands could hang for minutes.** A dead candidate URL was given the
+  full command budget; each attempt is now capped at 8 s and task calls pass
+  their own 8 s budget.
+- **A stale pinned URL stalled every command.** After the phone's Tailscale
+  address changed, the configured `app_direct_urls` kept pointing at the old IP.
+
+### Changed
+
+- Examples and tests no longer contain a real QQ number.
+
 ## [0.8.2]
 
 ### Added
