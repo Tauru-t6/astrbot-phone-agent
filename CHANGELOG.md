@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.4]
+
+### Changed
+
+- **The plugin listing is bilingual** (Chinese + English), so the market page is
+  readable without switching language.
+- **README gained a "task and approval" section** describing the proposal flow:
+  say what you want, reply 可以 in chat (or approve in the app / on the floating
+  card), and every step is verified against a fresh observation. It also states
+  that approval itself counts as consent, so the idle guard no longer applies to
+  an approved run.
+- **Release archives no longer ship `tests/`** (`.gitattributes` export-ignore),
+  as the reviewer suggested.
+
 ## [0.8.3]
 
 ### Fixed
