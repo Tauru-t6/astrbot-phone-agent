@@ -1,0 +1,6 @@
+# Keep test code out of the archives GitHub generates for a release.
+# The reviewer noted that tests/ shipped next to runtime code in the package.
+tests/ export-ignore
+.github/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
