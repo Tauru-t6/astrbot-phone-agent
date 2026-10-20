@@ -47,6 +47,7 @@ try:
         APPROVAL_PENDING,
         ApprovalRequest,
         GRANT_SOURCE_APPROVAL,
+        PhoneTaskRun,
         ReadOnlyTaskRunner,
         RUN_CANCELLED,
         RUN_WAITING_APPROVAL,
@@ -61,6 +62,7 @@ except ImportError:  # pragma: no cover - direct-module test harness
         APPROVAL_PENDING,
         ApprovalRequest,
         GRANT_SOURCE_APPROVAL,
+        PhoneTaskRun,
         ReadOnlyTaskRunner,
         RUN_CANCELLED,
         RUN_WAITING_APPROVAL,
@@ -70,6 +72,11 @@ except ImportError:  # pragma: no cover - direct-module test harness
         TaskRunStore,
         WRITE_ACTIONS,
     )
+
+try:
+    from .care_scheduler import CareSchedulerMixin
+except ImportError:  # pragma: no cover - direct-module test harness
+    from care_scheduler import CareSchedulerMixin
 
 try:  # pragma: no cover - the test harness stubs only astrbot.api.event
     from astrbot.api.message_components import Image as _ImageComponent
@@ -152,6 +159,12 @@ NG_RELEASE_RE = re.compile(
     r"让我(继续|用)|(继续|接着)刷|unsuspend|release|unlock)"
 )
 
+# Chat-side approval: only a bare affirmative, and only while a proposal is
+# actually pending for this user. Anything longer stays a normal chat message.
+TASK_APPROVE_RE = re.compile(r"^\s*(可以|行|好|允许|确认|批准|同意|嗯|ok|okay)\s*[。.!！?？]?\s*$",
+                             re.IGNORECASE)
+TASK_REJECT_RE = re.compile(r"^\s*(拒绝|不要|不行|取消|算了|别|no)\s*[。.!！?？]?\s*$", re.IGNORECASE)
+
 
 def _text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
@@ -211,7 +224,7 @@ def _feature_gate(tool_name: str):
     return decorator
 
 
-class PhoneAgentPlugin(Star):
+class PhoneAgentPlugin(CareSchedulerMixin, Star):
     def __init__(self, context: Any, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
@@ -1323,104 +1336,6 @@ class PhoneAgentPlugin(Star):
     # The care decision itself lives in the companion bridge; this loop only
     # decides *when* to ask. It never fabricates a message and never bypasses
     # the bridge's own reservation/gating.
-
-    def _autonomy_interval(self) -> int:
-        try:
-            return max(60, min(int(self.config.get("autonomy_check_interval_seconds", 300)), 3600))
-        except (TypeError, ValueError):
-            return 300
-
-    def _companion_care(self) -> Any | None:
-        """Find the companion bridge's evaluate_care(), if it is installed."""
-        for name in (
-            "data.plugins.astrbot_plugin_private_companion.main",
-            "astrbot_plugin_private_companion.main",
-        ):
-            try:
-                module = importlib.import_module(name)
-            except Exception:
-                continue
-            provider = getattr(module, "_phone_companion_context", None)
-            if provider is not None and callable(getattr(provider, "evaluate_care", None)):
-                return provider
-        return None
-
-    def _care_targets(self) -> list[dict[str, Any]]:
-        """Users the scheduler may evaluate: those with a recorded private session."""
-        targets: list[dict[str, Any]] = []
-        for user_id, state in sorted(self._night_guard_states.items()):
-            session = _text(state.get("session"), 240)
-            if session and ":FriendMessage:" in session:
-                targets.append({"user_id": user_id, "umo": session})
-        return targets
-
-    def _care_device_fresh(self) -> bool:
-        status = self.device_app.last_status() or {}
-        reported = status.get("reported_at")
-        if not isinstance(reported, (int, float)):
-            return False
-        max_age = self._night_guard_int("night_guard_status_max_age_seconds", 90, 10, 3600)
-        return 0 <= time.time() - float(reported) <= max_age
-
-    async def _autonomy_tick(self) -> None:
-        provider = self._companion_care()
-        if provider is None:
-            return
-        # Care is about the phone, so it only runs on a live observation.
-        if not self._care_device_fresh():
-            return
-        for target in self._care_targets():
-            try:
-                result = await provider.evaluate_care(target["user_id"], target["umo"], "owner")
-            except Exception as exc:
-                logger.warning("phone agent autonomy tick failed: %s", _text(exc, 160))
-                continue
-            if result.get("evaluated"):
-                logger.info(
-                    "phone agent autonomy tick: user=%s outcome=%s reason=%s",
-                    target["user_id"], result.get("outcome", ""), result.get("reason", ""),
-                )
-
-    async def _autonomy_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self._autonomy_interval())
-                try:
-                    await self._autonomy_tick()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning("phone agent autonomy tick failed: %s", _text(exc, 200))
-        except asyncio.CancelledError:
-            return
-
-    def _start_autonomy_scheduler(self) -> None:
-        if self._autonomy_task is not None and not self._autonomy_task.done():
-            return
-        if not self._bool_config("enable_autonomy_scheduler", True):
-            return
-        self._autonomy_task = asyncio.create_task(self._autonomy_loop())
-        logger.info("phone agent autonomy scheduler started (interval=%ss)", self._autonomy_interval())
-
-    def _care_status_snapshot(self) -> dict[str, Any]:
-        """Read the companion's read-only care snapshot, if it exists."""
-        try:
-            path = Path(self._care_status_path())
-            if not path.exists():
-                return {}
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return {}
-
-    def _care_status_path(self) -> str:
-        raw = _text(self.config.get("care_status_path", ""), 500)
-        if raw:
-            path = Path(raw)
-            if path.is_absolute():
-                return str(path)
-            return str(PLUGIN_DATA_DIR / path.name)
-        return str(self._plugin_data_path("care_status_path", "phone_agent_care_status.json"))
 
     def _night_guard_state_path(self) -> str:
         return str(self._plugin_data_path("night_guard_state_path", "phone_agent_night_guard.json"))
@@ -3627,6 +3542,39 @@ class PhoneAgentPlugin(Star):
         result["backend"] = "operit"
         return json.dumps(result, ensure_ascii=False)
 
+    def _propose_explicit_task(self, goal: str, action: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Create a pending proposal for one known action.
+
+        Tool paths that already resolved what has to happen (a policy
+        suspension) use this instead of relying on a second tool call.
+        """
+        registration = self.device_app.registration() or {}
+        # The phone may be offline right now; the proposal is still useful and
+        # the device is resolved again when the user approves it.
+        device_id = _text(registration.get("device_id"), 64)
+        subject = next(iter(sorted(self._allowed_users())), "")
+        run = PhoneTaskRun.new(goal, subject=subject, device_id=device_id)
+        run.add_step("observe", {})
+        run.add_step(action, dict(args))
+        ttl = self._task_float("task_approval_ttl_seconds", 180.0, 30.0, 300.0)
+        packages = [args["package"]] if args.get("package") else []
+        approval = ApprovalRequest.create(
+            run_id=run.run_id, subject=subject, device_id=device_id,
+            actions=[action], packages=packages, ttl_seconds=ttl,
+        )
+        run.transition(RUN_WAITING_APPROVAL)
+        self._task_runs.add_run(run)
+        self._task_runs.add_approval(approval)
+        self._task_runs.save()
+        self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=[action], source="tool")
+        return {
+            "success": True,
+            "awaiting_approval": True,
+            "approval_id": approval.approval_id,
+            "message": f"已在手机上发起待批准任务：{goal}。回「可以」即可批准，{int(ttl)} 秒内有效。",
+            "expires_in_seconds": int(ttl),
+        }
+
     @filter.llm_tool(name="phone_app_policy")
     @_tolerate_nested_args
     @_feature_gate("phone_app_policy")
@@ -3667,6 +3615,14 @@ class PhoneAgentPlugin(Star):
             minutes = max(0, min(int(minutes or 0), 1440))
         except (TypeError, ValueError):
             return json.dumps({"success": False, "error": "minutes must be an integer from 0 to 1440"}, ensure_ascii=False)
+        # With task execution on, a policy change becomes a proposal. Doing it
+        # here (rather than refusing) means the model cannot lose the request by
+        # forgetting to call the other tool.
+        if self._bool_config("enable_task_execute", False) and normalized == "disable":
+            proposal = self._propose_explicit_task(
+                f"暂停 {package}", "suspend_app", {"package": package},
+            )
+            return json.dumps(proposal, ensure_ascii=False)
         result = await self._execute_app_policy(package, normalized, minutes)
         self._audit(
             "phone_app_policy",
@@ -3733,6 +3689,21 @@ class PhoneAgentPlugin(Star):
             return json.dumps({"success": False, "error": "app policy actions are disabled; enable policy_tools in the plugin config"}, ensure_ascii=False)
         if action == "trigger_workflow" and not confirmed:
             return json.dumps({"success": False, "needs_confirmation": True, "error": "Ask the user for confirmation before triggering an external workflow."}, ensure_ascii=False)
+        # With task execution enabled, anything that changes the phone must go
+        # through a proposal the user approves. Direct execution here used to
+        # hang for two minutes on an unreachable phone and left no approval
+        # record, so the request silently disappeared.
+        if (self._bool_config("enable_task_execute", False)
+                and action in {"open_app", "close_app", "suspend_app", "unsuspend_app",
+                               "suspend_video_apps", "unsuspend_video_apps",
+                               "tap", "long_press", "swipe", "scroll", "input_text",
+                               "key_event", "lock_screen", "wake_screen", "home", "back"}):
+            return json.dumps({
+                "success": False,
+                "error": "use phone_task_propose instead: this action changes the phone and must be "
+                         "approved by the user on the device or in chat",
+                "next_tool": "phone_task_propose",
+            }, ensure_ascii=False)
 
         kwargs = {
             "package": self._resolve_package(package),
@@ -4354,6 +4325,60 @@ class PhoneAgentPlugin(Star):
 
     # ==================== night guard user release ====================
 
+    async def _chat_task_decision(self, user_id: str, message: str) -> str | None:
+        """Approve or reject a pending proposal from a chat reply.
+
+        Returns the reply text, or None when this message is not a decision.
+        Only a bare affirmative/negative counts, and only while a proposal is
+        actually pending for this user.
+        """
+        approval = self._task_runs.pending_for(str(user_id))
+        if approval is None:
+            return None
+        if TASK_APPROVE_RE.match(message):
+            approved = True
+        elif TASK_REJECT_RE.match(message):
+            approved = False
+        else:
+            return None
+        run = self._task_runs.run(approval.run_id)
+        if not approved or run is None:
+            approval.decide(False, reason="chat_reject")
+            if run is not None:
+                run.transition(RUN_CANCELLED, error="chat_reject")
+            self._task_runs.save()
+            self._audit("task_rejected", approval_id=approval.approval_id, reason="chat_reject")
+            return "好，这次不做了，任务已取消。"
+        approval.decide(True, reason="chat_approve")
+        # Resolve the device now: the proposal may have been made while offline.
+        device_id = approval.device_id or _text((self.device_app.registration() or {}).get("device_id"), 64)
+        if not device_id:
+            approval.decide(False, reason="device_offline")
+            self._task_runs.save()
+            return "手机现在没连上，没法执行；把它连上再跟我说一次。"
+        run.device_id = device_id
+        approval.device_id = device_id
+        grant = ScopedGrant.issue(
+            subject=approval.subject, device_id=device_id,
+            actions=list(approval.actions), packages=list(approval.packages),
+            ttl_seconds=120.0, max_steps=max(1, len(approval.actions)),
+            source=GRANT_SOURCE_APPROVAL,
+        )
+        self._task_runs.add_grant(grant)
+        try:
+            run = await self._task_executor.execute(run, grant=grant, allow_active=True)
+        finally:
+            self._task_runs.save()
+        self._audit("task_approved", run_id=run.run_id, approval_id=approval.approval_id,
+                    status=run.status, source="chat",
+                    verified=run.summary.get("verified", 0), failed=run.summary.get("failed", 0))
+        summary = run.summary or {}
+        if run.status == "done":
+            return f"照做了（核验通过 {summary.get('verified', 0)} 步）。"
+        if summary.get("refused"):
+            return f"批准了，但执行被拒绝：{summary['refused']}。"
+        return f"试了，没成功：{_text(run.last_error, 80) or '未知原因'}。"
+
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent) -> None:
         """Deterministic night-guard release and session memory.
@@ -4395,7 +4420,19 @@ class PhoneAgentPlugin(Star):
             plain = getattr(event.message_obj, "plain_result", None)
             message = plain if isinstance(plain, str) else ""
         message = _text(message, 300)
-        if not message or not NG_RELEASE_RE.search(message):
+        if not message:
+            return
+        # A pending proposal can be approved or rejected from chat, so the phone
+        # does not have to be unlocked. Only a bare "可以" counts.
+        if self._bool_config("enable_task_execute", False):
+            chat_reply = await self._chat_task_decision(user_id, message)
+            if chat_reply is not None:
+                try:
+                    await asyncio.wait_for(event.send(MessageChain().message(chat_reply)), timeout=15)
+                except Exception as exc:
+                    logger.debug("phone agent task decision reply failed: %s", _text(exc, 160))
+                return
+        if not NG_RELEASE_RE.search(message):
             return
         result = await self._night_guard_release(user_id)
         if result.get("success"):
