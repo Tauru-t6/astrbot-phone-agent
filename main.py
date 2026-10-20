@@ -3211,6 +3211,58 @@ class PhoneAgentPlugin(Star):
         return json.dumps(result, ensure_ascii=False)
 
 
+    @filter.llm_tool(name="phone_task_propose")
+    @_tolerate_nested_args
+    async def phone_task_propose(self, event: AstrMessageEvent, goal: str = "", **_kwargs: Any) -> str:
+        """Propose a phone task and let the user approve it on the phone. Use this when the user asks you to do something on their phone (go home, open or suspend an app). Never claim it is done: it only takes effect after the user approves on the device.
+
+        Args:
+            goal(string): What the user wants done on the phone, worded close to their own request, e.g. "回到桌面" or "把抖音暂停".
+        """
+        if not self._enabled() or not self._authorized(event):
+            return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if not self._bool_config("enable_task_execute", False):
+            return json.dumps({"success": False, "error": "task execution is disabled on this server"},
+                              ensure_ascii=False)
+        goal = _text(goal, 500)
+        if not goal:
+            return json.dumps({"success": False, "error": "goal is required"}, ensure_ascii=False)
+        registration = self.device_app.registration() or {}
+        device_id = _text(registration.get("device_id"), 64)
+        if not device_id:
+            return json.dumps({"success": False, "error": "the phone app has not registered yet"},
+                              ensure_ascii=False)
+        subject = self._event_user_id(event) or next(iter(sorted(self._allowed_users())), "")
+        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=None)
+        actions = [step.action for step in run.steps if step.action in WRITE_ACTIONS]
+        if not actions:
+            return json.dumps({
+                "success": False,
+                "error": "this goal maps to no phone action; tell the user what you can do "
+                         "(go home, open an app, suspend an app)",
+            }, ensure_ascii=False)
+        packages = [step.args.get("package") for step in run.steps if step.args.get("package")]
+        ttl = self._task_float("task_approval_ttl_seconds", 180.0, 30.0, 300.0)
+        approval = ApprovalRequest.create(
+            run_id=run.run_id, subject=subject, device_id=device_id,
+            actions=actions, packages=packages, ttl_seconds=ttl,
+        )
+        run.transition(RUN_WAITING_APPROVAL)
+        self._task_runs.add_run(run)
+        self._task_runs.add_approval(approval)
+        self._task_runs.save()
+        self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=actions, source="chat")
+        return json.dumps({
+            "success": True,
+            "awaiting_approval": True,
+            "message": f"已在手机上发起待批准任务：{goal}。"
+                       f"请让用户打开 App 的「自主功能 → 待你决定」，或在手机屏幕上点悬浮卡片的允许；"
+                       f"{int(ttl)} 秒内有效。批准前手机不会有任何变化。",
+            "approval_id": approval.approval_id,
+            "actions": actions,
+            "expires_in_seconds": int(ttl),
+        }, ensure_ascii=False)
+
     @filter.llm_tool(name="phone_reminder")
     @_tolerate_nested_args
     @_feature_gate("phone_reminder")
