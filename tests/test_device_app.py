@@ -340,3 +340,10 @@ class FailoverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_relay_only_registration_succeeds(self):
+        """A device with no direct URL is still registered; transport is separate."""
+        result = self.backend.register({"device_id": "phone-relay", "app_version": "0.3.22"})
+        self.assertTrue(result["success"])
+        self.assertEqual(self.backend.direct_urls(), [])
+        self.assertEqual(self.backend.registration()["device_id"], "phone-relay")

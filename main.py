@@ -3946,17 +3946,6 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if package in PROTECTED_POLICY_PACKAGES:
             return "refusing to change a protected control or system package"
         return ""
-
-    def _push_phone_notification(self, title: str, text: str) -> None:
-        """Best-effort local notification on the phone; never raises."""
-        try:
-            if self._control_backend() == "app":
-                self.device_app.execute(
-                    "send_notification", {"title": title, "text": text}
-                )
-        except Exception as exc:
-            logger.debug("phone notification push failed: %s", _text(exc, 160))
-
     @staticmethod
     def _parse_suspended_state(output: str) -> bool | None:
         matches = re.findall(r"\bsuspended\s*=\s*(true|false)\b", output or "", re.I)
