@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.8.5]
+
+### Changed
+
+- **The care scheduler moved into `care_scheduler.py`** as a mixin
+  (`PhoneAgentPlugin(CareSchedulerMixin, Star)`). Pure move: no behaviour
+  change, `main.py` drops from 4273 to ~4180 lines so the plugin file can stay
+  about assembly. Three implicit dependencies (`_text`, `json`, `Path`) only
+  became visible because of the move.
+- **The unused `_push_phone_notification` helper is gone** (a reviewer noted it
+  had no callers). The reminder test that asserted its absence now asserts the
+  absence of a direct push path instead.
+- **README opens with a five-minute quickstart**, and the release notes link the
+  companion APK so a new user does not have to find the second repository.
+
+### Tests
+
+- Added a relay-only registration case (a device with no direct URL still
+  registers; transport is modelled separately). 233 passed.
+
 ## [0.8.4]
 
 ### Changed
