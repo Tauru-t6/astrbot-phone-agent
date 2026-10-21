@@ -8,6 +8,23 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 插件保留原有 **OperitAI 模式**，新增 **自有 App 模式**。两种模式决定手机端如何执行任务；原有的后台任务、健康数据库、定位联动、应用策略、审计、Relay 和可选 Private Companion 扩展继续保留。
 
+## 5 分钟上手（自有 App 模式）
+
+1. **装插件**：在 AstrBot 插件市场搜索 `Phone Control` 安装，或按[安装与升级](#安装与升级)用 Git 拉取。
+2. **装 App**：从 [App Releases](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases/latest) 下载最新 APK，安装后把 Shizuku 启动并授权。
+3. **填三个字段**（App 的「纸笺 → 服务器连接」）：
+
+   | 字段 | 填什么 |
+   | --- | --- |
+   | 插件地址 | `http://<你的服务器>:6185/api/plug/astrbot_plugin_phone_agent` |
+   | 插件令牌 | AstrBot 面板登录后的 Dashboard JWT |
+   | 手机共享 Token | 插件配置里的 `app_shared_token` |
+
+4. **测连接**：App 里点「测试已保存连接」，显示「设备直连 / 已连接」就通了。
+5. **说一句话**：在 QQ 里对机器人说「看看手机电量」；要改手机的动作（打开应用、回桌面、暂停应用）会先发一条待批准任务，回「可以」才执行。
+
+卡住的话先看[排障与开发](#排障与开发)，三处最常见：服务器地址写成了局域网、JWT 过期、Shizuku 没启动。
+
 ## 先选手机执行端
 
 | | 自有 App | OperitAI |
