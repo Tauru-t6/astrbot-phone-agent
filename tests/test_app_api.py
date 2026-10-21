@@ -65,7 +65,7 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         self.config = {"enabled": True, "control_backend": "app", "enable_reminder_tools": True,
                        "enable_audit_tool": True, "enable_observe_tool": True}
         for key in ("reminders_path", "app_state_path", "audit_log_path", "tasks_path", "policy_state_path",
-                    "notification_path"):
+                    "notification_path", "task_runs_path"):
             self.config[key] = str(Path(self.temp.name) / (key + ".json"))
         self.plugins = []
         self.create_plugin()
@@ -143,8 +143,9 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_due_app_reminder_only_publishes_one_durable_phone_event(self):
         payload, reminder = await self.add()
-        with patch.object(self.plugin, "_push_phone_notification", side_effect=AssertionError("no direct push")):
-            await self.fire(reminder["id"])
+        # The plugin has no direct phone-push path any more: a due reminder is
+        # published as a timeline event only.
+        await self.fire(reminder["id"])
         self.plugin.context.send_message.assert_not_called()
         self.assertEqual(self.plugin._reminders, {})
         events = self.plugin.device_app.timeline_since(0, 100)
@@ -424,3 +425,23 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
             again = await self.post("/app/task/approve", {"approval_id": approval_id})
             self.assertEqual(again.status_code, 409)
             self.assertEqual(execute.await_count, 1)
+    # -- chat-side approval
+
+    async def test_chat_approval_runs_the_pending_task(self):
+        self._register()
+        await self.post("/app/task/propose", {"goal": "回到桌面"})
+        approval = next(iter(self.plugin._task_runs._approvals.values()))
+        with patch.object(self.plugin._task_executor, "execute",
+                          new=AsyncMock(side_effect=lambda run, **kw: run)) as execute:
+            reply = await self.plugin._chat_task_decision(approval.subject, "可以")
+        self.assertIsNotNone(reply)
+        self.assertEqual(execute.await_count, 1)
+        self.assertEqual(approval.status, "approved")
+
+    async def test_chat_noise_is_not_an_approval(self):
+        self._register()
+        await self.post("/app/task/propose", {"goal": "回到桌面"})
+        approval = next(iter(self.plugin._task_runs._approvals.values()))
+        reply = await self.plugin._chat_task_decision(approval.subject, "今天天气不错")
+        self.assertIsNone(reply)
+        self.assertEqual(approval.status, "pending")
