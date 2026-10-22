@@ -24,6 +24,7 @@ event_api.AstrMessageEvent = object
 class _NoOpFilter:
     class EventMessageType:
         PRIVATE_MESSAGE = "private"
+        GROUP_MESSAGE = "group"
 
     def __getattr__(self, name):
         return lambda *args, **kwargs: (lambda function: function)

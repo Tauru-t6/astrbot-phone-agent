@@ -4,7 +4,7 @@ author: tauru
 description: |
   AstrBot 手机控制插件：App / OperitAI 双模式，Shizuku 执行。支持开关应用、观察屏幕、提醒、夜间守护，以及按范围授权、逐步核验的手机任务。
   Android phone control for AstrBot with two modes (own App + Shizuku, or OperitAI): app control, observation, reminders, the night guard, and scoped task execution with per-step verification.
-version: 0.8.5
+version: 0.8.6
 astrbot_version: ">=4.22.0"
 support_platforms:
   - aiocqhttp

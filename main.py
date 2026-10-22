@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import time
@@ -2561,6 +2562,30 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return _text(sender.get("user_id") or sender.get("id"), 120)
         return ""
 
+    def _is_private_session(self, event: AstrMessageEvent) -> bool:
+        # An unknown/blank origin counts as private: only a clear group session
+        # is restricted, so direct tool calls (and tests) keep working.
+        umo = _text(getattr(event, "unified_msg_origin", ""), 240)
+        lowered = umo.lower()
+        return "group" not in lowered
+
+    def _group_tool_blocked(self, event: AstrMessageEvent, tool: str) -> bool:
+        """Group chats may only run the command tools unless config says more.
+
+        Data tools (health, location, notifications, screenshots, audit) would
+        leak private information into a group, so they stay private by default.
+        """
+        if self._is_private_session(event):
+            return False
+        raw = _text(self.config.get("group_allowed_tools", ""), 400)
+        allowed = {item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()}
+        return tool not in allowed
+
+    def _group_tool_error(self, tool: str) -> str:
+        return json.dumps({
+            "success": False,
+            "error": f"{tool} 只能在私聊里使用；群聊仅开放命令类操作",
+        }, ensure_ascii=False)
     def _authorized(self, event: AstrMessageEvent) -> bool:
         allowed = self._allowed_users()
         user_id = self._event_user_id(event)
@@ -3076,6 +3101,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         """
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_health"):
+            return self._group_tool_error("phone_health")
         try:
             days = max(1, min(int(days or 1), 30))
         except (TypeError, ValueError):
@@ -3109,6 +3136,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         """
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_usage"):
+            return self._group_tool_error("phone_usage")
         try:
             days = max(1, min(int(days or 1), 30))
         except (TypeError, ValueError):
@@ -3167,12 +3196,16 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._task_runs.add_approval(approval)
         self._task_runs.save()
         self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=actions, source="chat")
+        if self._is_private_session(event):
+            guidance = (f"已在手机上发起待批准任务：{goal}。"
+                        f"请让用户打开 App 的「自主功能 → 待你决定」，或在手机屏幕上点悬浮卡片的允许；"
+                        f"{int(ttl)} 秒内有效。批准前手机不会有任何变化。")
+        else:
+            guidance = f"已在手机上发起待批准任务：{goal}。" + self._issue_group_code(event, approval)
         return json.dumps({
             "success": True,
             "awaiting_approval": True,
-            "message": f"已在手机上发起待批准任务：{goal}。"
-                       f"请让用户打开 App 的「自主功能 → 待你决定」，或在手机屏幕上点悬浮卡片的允许；"
-                       f"{int(ttl)} 秒内有效。批准前手机不会有任何变化。",
+            "message": guidance,
             "approval_id": approval.approval_id,
             "actions": actions,
             "expires_in_seconds": int(ttl),
@@ -3249,6 +3282,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             limit(number): Max number of recent records to return, from 1 to 100. Defaults to 20."""
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_audit"):
+            return self._group_tool_error("phone_audit")
         records: list[dict[str, Any]] = []
         try:
             try:
@@ -3403,6 +3438,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         """
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_observe"):
+            return self._group_tool_error("phone_observe")
         if self._control_backend() == "app":
             status = await asyncio.to_thread(self.device_app.execute, "status", {})
             if status.get("success"):
@@ -3496,6 +3533,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         """
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_location"):
+            return self._group_tool_error("phone_location")
         high_accuracy = self._coerce_bool(high_accuracy)
         include_address = self._coerce_bool(include_address)
         if (high_accuracy or include_address) and not self._coerce_bool(confirmed):
@@ -3542,7 +3581,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         result["backend"] = "operit"
         return json.dumps(result, ensure_ascii=False)
 
-    def _propose_explicit_task(self, goal: str, action: str, args: dict[str, Any]) -> dict[str, Any]:
+    def _propose_explicit_task(self, goal: str, action: str, args: dict[str, Any], event: Any = None) -> dict[str, Any]:
         """Create a pending proposal for one known action.
 
         Tool paths that already resolved what has to happen (a policy
@@ -3553,11 +3592,18 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         # the device is resolved again when the user approves it.
         device_id = _text(registration.get("device_id"), 64)
         subject = next(iter(sorted(self._allowed_users())), "")
+        packages = [args["package"]] if args.get("package") else []
+        # One request must not leave two pending approvals behind when the model
+        # calls the tool twice: reuse the fresh identical one.
+        existing = self._task_runs.pending_for(subject)
+        if (existing is not None and list(existing.actions) == [action]
+                and list(existing.packages) == packages):
+            self._audit("task_proposal_reused", approval_id=existing.approval_id, actions=[action])
+            return self._approval_payload(existing)
         run = PhoneTaskRun.new(goal, subject=subject, device_id=device_id)
         run.add_step("observe", {})
         run.add_step(action, dict(args))
         ttl = self._task_float("task_approval_ttl_seconds", 180.0, 30.0, 300.0)
-        packages = [args["package"]] if args.get("package") else []
         approval = ApprovalRequest.create(
             run_id=run.run_id, subject=subject, device_id=device_id,
             actions=[action], packages=packages, ttl_seconds=ttl,
@@ -3567,12 +3613,22 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._task_runs.add_approval(approval)
         self._task_runs.save()
         self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=[action], source="tool")
+        payload = self._approval_payload(approval)
+        if event is not None and not self._is_private_session(event):
+            payload["message"] = f"已在手机上发起待批准任务：{goal}。" + self._issue_group_code(event, approval)
+        else:
+            payload["message"] = f"已在手机上发起待批准任务：{goal}。" + payload["message"]
+        return payload
+
+    def _approval_payload(self, approval: ApprovalRequest) -> dict[str, Any]:
+        """The tool-facing view of a pending approval (new or reused)."""
+        remaining = max(0, int(approval.expires_at - time.time()))
         return {
             "success": True,
             "awaiting_approval": True,
             "approval_id": approval.approval_id,
-            "message": f"已在手机上发起待批准任务：{goal}。回「可以」即可批准，{int(ttl)} 秒内有效。",
-            "expires_in_seconds": int(ttl),
+            "message": f"回「可以」即可批准，{remaining} 秒内有效。",
+            "expires_in_seconds": remaining,
         }
 
     @filter.llm_tool(name="phone_app_policy")
@@ -3620,7 +3676,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         # forgetting to call the other tool.
         if self._bool_config("enable_task_execute", False) and normalized == "disable":
             proposal = self._propose_explicit_task(
-                f"暂停 {package}", "suspend_app", {"package": package},
+                f"暂停 {package}", "suspend_app", {"package": package}, event=event,
             )
             return json.dumps(proposal, ensure_ascii=False)
         result = await self._execute_app_policy(package, normalized, minutes)
@@ -3851,6 +3907,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         """
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_notifications"):
+            return self._group_tool_error("phone_notifications")
         try:
             limit = max(1, min(int(limit or 20), 100))
         except (TypeError, ValueError):
@@ -3863,9 +3921,26 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
     # ---------- screenshots ----------
 
     def _screenshot_dir(self) -> Path:
-        directory = Path(tempfile.gettempdir()) / "astrbot_phone_agent"
+        """Screenshots live under the plugin data dir so they can be audited.
+
+        They used to go to the system temp directory and were deleted right
+        after delivery, which left the audit log unable to point at anything.
+        """
+        directory = Path(self._plugin_data_path("screenshot_dir", "screenshots"))
         directory.mkdir(parents=True, exist_ok=True)
         return directory
+
+    def _prune_screenshots(self, keep: int = 20) -> None:
+        try:
+            files = sorted(self._screenshot_dir().glob("screen_*.jpg"),
+                           key=lambda item: item.stat().st_mtime, reverse=True)
+        except OSError:
+            return
+        for stale in files[keep:]:
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("phone agent could not delete old screenshot: %s", stale)
 
     async def _deliver_image(self, event: AstrMessageEvent, path: Path, caption: str) -> bool:
         """Send one local image into the conversation that asked for it."""
@@ -3900,6 +3975,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return json.dumps({"success": False, "error": "phone agent disabled"}, ensure_ascii=False)
         if not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "phone_screenshot"):
+            return self._group_tool_error("phone_screenshot")
         if self._control_backend() != "app":
             return json.dumps({"success": False,
                                "error": "phone_screenshot currently requires control_backend=app"},
@@ -3924,15 +4001,12 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             path.write_bytes(raw)
         except OSError:
             return json.dumps({"success": False, "error": "could not store the screenshot"}, ensure_ascii=False)
-        # B10: always clean up the temp file, whether delivery succeeds,
-        # fails, or raises. The image data is already in memory if needed.
         try:
             delivered = await self._deliver_image(event, path, _text(caption, 200))
         finally:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                logger.debug("phone agent could not delete screenshot temp file: %s", path)
+            # The file stays for auditing; only the newest few are kept so the
+            # directory cannot grow without bound.
+            self._prune_screenshots()
         return json.dumps({
             "success": True,
             "delivered": delivered,
@@ -4314,6 +4388,51 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
 
     # ==================== night guard user release ====================
 
+    def _private_umo_for(self, event: AstrMessageEvent, user_id: str) -> str:
+        parts = _text(getattr(event, "unified_msg_origin", ""), 240).split(":")
+        return f"{parts[0]}:FriendMessage:{user_id}" if len(parts) == 3 else ""
+
+    def _issue_group_code(self, event: AstrMessageEvent, approval: ApprovalRequest) -> str:
+        """Send a 6-digit code to the user's private chat for a group command."""
+        user_id = str(self._event_user_id(event))
+        group = _text(getattr(event, "unified_msg_origin", ""), 240)
+        private = self._private_umo_for(event, user_id)
+        if not private:
+            return "拿不到你的私聊会话，没法发送确认码。"
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        store = self.__dict__.setdefault("_group_codes", {})
+        store[(user_id, group)] = {
+            "code": code,
+            "approval_id": approval.approval_id,
+            "expires": time.time() + 180.0,
+        }
+        text = (f"群聊里的任务确认码：{code}"
+                f"（{'、'.join(approval.actions)}，3 分钟内有效）。在群里回复这 6 位数字即可执行。")
+        try:
+            from astrbot.api.message_components import Plain
+            chain: Any = MessageChain([Plain(text)])
+        except Exception:  # pragma: no cover - older host without components
+            chain = text
+        try:
+            asyncio.get_running_loop().create_task(self.context.send_message(private, chain))
+        except Exception as exc:
+            logger.debug("group code send failed: %s", _text(exc, 120))
+            return "确认码发送失败，请稍后再试。"
+        return "已把 6 位确认码发到你的私聊，180 秒内在本群回复该码即可执行。"
+
+    def _event_text(self, event: AstrMessageEvent) -> str:
+        texts: list[str] = []
+        try:
+            for component in (event.get_messages() or []):
+                text = getattr(component, "text", None)
+                if isinstance(text, str):
+                    texts.append(text)
+        except Exception:
+            pass
+        if texts:
+            return _text(" ".join(texts), 300)
+        plain = getattr(getattr(event, "message_obj", None), "plain_result", None)
+        return _text(plain, 300) if isinstance(plain, str) else ""
     async def _chat_task_decision(self, user_id: str, message: str) -> str | None:
         """Approve or reject a pending proposal from a chat reply.
 
@@ -4338,6 +4457,16 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             self._task_runs.save()
             self._audit("task_rejected", approval_id=approval.approval_id, reason="chat_reject")
             return "好，这次不做了，任务已取消。"
+        return await self._approve_task(approval)
+
+
+    async def _approve_task(self, approval: ApprovalRequest) -> str:
+        """Approve one pending task: issue the grant, execute, verify."""
+        run = self._task_runs.run(approval.run_id)
+        if run is None:
+            approval.decide(False, reason="run_missing")
+            self._task_runs.save()
+            return "这条任务的记录不见了，没法执行。"
         approval.decide(True, reason="chat_approve")
         # Resolve the device now: the proposal may have been made while offline.
         device_id = approval.device_id or _text((self.device_app.registration() or {}).get("device_id"), 64)
@@ -4368,6 +4497,33 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return f"批准了，但执行被拒绝：{summary['refused']}。"
         return f"试了，没成功：{_text(run.last_error, 80) or '未知原因'}。"
 
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_group_message(self, event: AstrMessageEvent) -> None:
+        """Group confirmation: the 6-digit code sent to private chat approves it."""
+        if not self._enabled() or not self._authorized(event):
+            return
+        if not self._bool_config("enable_task_execute", False):
+            return
+        message = self._event_text(event).strip()
+        if not re.fullmatch(r"\d{6}", message):
+            return
+        user_id = str(self._event_user_id(event))
+        group = _text(getattr(event, "unified_msg_origin", ""), 240)
+        store = self.__dict__.get("_group_codes") or {}
+        entry = store.pop((user_id, group), None)
+        if not entry:
+            return
+        if entry["expires"] < time.time() or entry["code"] != message:
+            return
+        approval = self._task_runs.approval(entry["approval_id"])
+        if approval is None or not approval.pending():
+            reply = "这条任务已经过期或处理过了。"
+        else:
+            reply = await self._approve_task(approval)
+        try:
+            await asyncio.wait_for(event.send(MessageChain().message(reply)), timeout=15)
+        except Exception as exc:
+            logger.debug("group confirmation reply failed: %s", _text(exc, 120))
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent) -> None:
         """Deterministic night-guard release and session memory.

@@ -661,6 +661,16 @@ class TaskRunStore:
         ordered = sorted(self._approvals.values(), key=lambda item: item.created_at, reverse=True)
         return [item.to_dict() for item in ordered[: max(1, int(limit))]]
 
+    def pending_for(self, subject: str) -> ApprovalRequest | None:
+        """The newest still-pending approval for one subject, if any."""
+        candidates = [
+            item for item in self._approvals.values()
+            if item.subject == _short(subject, 120) and item.pending()
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item.created_at)
+
     # -- runs
 
     def add_run(self, run: PhoneTaskRun) -> PhoneTaskRun:

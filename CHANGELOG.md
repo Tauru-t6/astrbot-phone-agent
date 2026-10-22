@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.8.6]
+
+### Added
+
+- **Group-chat commands with an out-of-band code.** An authorized user may ask
+  for a phone action in a group; the proposal is created as usual and a 6-digit
+  code is delivered to that user's **private chat**. Replying the code in the
+  group approves it (3-minute window, single use, bound to that user and group).
+  Data tools stay private-only so a group never sees health, location,
+  notifications, screen text or screenshots (`group_allowed_tools`).
+- **Screenshots are auditable.** Captures are written under the plugin data
+  directory (`screenshot_dir`) and the newest 20 are kept, instead of being
+  deleted from the system temp directory right after delivery.
+
+### Fixed
+
+- **Duplicate proposals.** A model that called the tool twice for one request
+  used to leave two pending approvals; the fresh identical one is reused.
+- **A single tailnet hiccup failed the whole run.** Live observation retries
+  once before reporting `stale_observation`.
+
+### Tests
+
+- 233 passed; the harness gained the group message type and the screenshot and
+  reminder tests were adjusted to the new paths.
+
 ## [0.8.5]
 
 ### Changed

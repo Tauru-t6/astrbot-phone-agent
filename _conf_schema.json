@@ -299,6 +299,16 @@
     "default": 180,
     "description": "How long a proposed task waits for a human decision before it expires. A proposal alone never touches the phone."
   },
+  "screenshot_dir": {
+    "type": "text",
+    "default": "",
+    "description": "Where captured screenshots are kept for auditing. Empty uses the plugin data directory; the newest 20 files are kept."
+  },
+  "group_allowed_tools": {
+    "type": "text",
+    "default": "phone_action,phone_task_propose,phone_app_policy,phone_reminder",
+    "description": "Tools that may run in a group chat. Data tools (health, location, notifications, screenshots, audit, observe) stay private-only, so group members never see them."
+  },
   "task_runs_path": {
     "type": "text",
     "default": "",
