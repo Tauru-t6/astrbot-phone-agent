@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -101,6 +102,17 @@ MAX_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 200
 _HEALTH_TIMEOUT_SECONDS = 1.5
 _REGISTER_TIMEOUT_SECONDS = 8
+
+# Actions whose device-side execution is legitimately slow: screen_text waits
+# on uiautomator (issue #1: a dump can exceed 8 s on some devices), status
+# aggregates usage stats (~10 s), screenshot encodes an image, usage_stats
+# scans history, location can wait up to 20 s for a fix. These get a longer
+# per-attempt window than the fast-path cap; everything else answers in
+# milliseconds and keeps the short cap so a dead route cannot eat the budget.
+SLOW_ACTIONS = frozenset({
+    "status", "quick_status", "screen_text", "screenshot", "usage_stats", "location",
+})
+SLOW_ACTION_ATTEMPT_SECONDS = 35.0
 
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
 
@@ -461,7 +473,17 @@ class DeviceAppBackend:
                 pass
             return {"success": False, "error_code": "http_error", "error": f"device HTTP {exc.code}"}
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-            return {"success": False, "error": f"device connection failed: {str(exc)[:180]}"}
+            # A stalled read must be distinguishable from a refused or broken
+            # link: without a code, "phone busy" and "wrong address" look
+            # identical to the model (issue #1).
+            reason = getattr(exc, "reason", None)
+            # socket.timeout is an alias of TimeoutError on 3.10+; the explicit
+            # tuple keeps the mapping right on older interpreters too.
+            if isinstance(exc, (TimeoutError, socket.timeout)) or isinstance(reason, (TimeoutError, socket.timeout)):
+                return {"success": False, "error_code": "timeout",
+                        "error": f"device timed out after {timeout:g}s"}
+            return {"success": False, "error_code": "connection_failed",
+                    "error": f"device connection failed: {str(exc)[:180]}"}
 
     def health(self) -> dict[str, Any]:
         registration = self.registration()
@@ -519,7 +541,13 @@ class DeviceAppBackend:
             if remaining <= 0:
                 break
             routes_left = len(urls) - index + int(self.relay_enabled())
-            attempt_timeout = min(remaining, max(4.0, min(8.0, remaining / routes_left)))
+            # The flat 8 s cap used to time out inherently slow reads on
+            # healthy-but-slow devices (issue #1: screen_text waited on a
+            # uiautomator dump that took >15 s). The app bounds screen_text to
+            # ~29 s worst case, so 35 s covers it; fast actions keep the short
+            # cap so a hanging route cannot eat the shared budget.
+            attempt_cap = SLOW_ACTION_ATTEMPT_SECONDS if envelope["action"] in SLOW_ACTIONS else 8.0
+            attempt_timeout = min(remaining, max(4.0, min(attempt_cap, remaining / routes_left)))
             result = self._http_json(base_url + "/command", self.shared_token(), method="POST", payload=envelope, timeout=attempt_timeout)
             if result.get("command_id") or result.get("type") == "result" or result.get("success"):
                 # A matching denial is final. A malformed result is also final:

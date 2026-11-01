@@ -217,6 +217,26 @@ being returned to tools. A matching `success:false` result is final and is not
 replayed through another endpoint or relay. Only transport failures try the
 next URL or relay, reusing the same command ID.
 
+### Attempt windows and transport error codes
+
+The per-URL command attempt is capped at 8 seconds for actions that answer in
+milliseconds. Inherently slow reads — `screen_text`, `screenshot`,
+`usage_stats`, `status`, `quick_status`, `location` — get a 35-second window so
+a healthy-but-slow device still answers (issue #1: a uiautomator dump can take
+longer than the old flat cap). The window never exceeds the caller's remaining
+budget.
+
+Transport failures carry an `error_code`: `timeout` when the phone accepted
+the connection but did not answer inside the attempt window,
+`connection_failed` when the connect or socket broke. A busy phone and a wrong
+address are therefore distinguishable in tool results.
+
+On the app side `screen_text` is bounded too: the uiautomator dump runs under
+`timeout 8` with its own shell leash, the temp file is removed before each
+dump so a stale one is never read, and the top activity's `dumpsys` view
+hierarchy is the fallback. If both sources produce nothing the command fails
+with `error_code: ui_dump_unavailable` instead of holding the connection open.
+
 ## Device status heartbeat
 
 `POST /device/status` accepts a periodic status heartbeat from the app:

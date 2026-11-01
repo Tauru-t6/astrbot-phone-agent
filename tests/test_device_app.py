@@ -109,6 +109,13 @@ class RegisterTests(unittest.TestCase):
             "token_fingerprint": fingerprint,
         })["success"])
 
+    def test_relay_only_registration_succeeds(self):
+        """A device with no direct URL is still registered; transport is separate."""
+        result = self.backend.register({"device_id": "phone-relay", "app_version": "0.3.22"})
+        self.assertTrue(result["success"])
+        self.assertEqual(self.backend.direct_urls(), [])
+        self.assertEqual(self.backend.registration()["device_id"], "phone-relay")
+
 
 class RebindTests(unittest.TestCase):
     """P1-C: a new binding must not inherit the previous device's samples."""
@@ -338,12 +345,88 @@ class FailoverTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(self.config["app_state_path"]).read_text(encoding="utf-8"))["timeline"], [first])
 
 
+class AttemptWindowTests(unittest.TestCase):
+    """Issue #1: inherently slow reads need more than the flat 8 s attempt cap."""
+
+    def setUp(self):
+        self.backend = device_app.DeviceAppBackend(
+            FakeConfig(app_shared_token="t", app_direct_urls="http://phone:8260",
+                       app_command_timeout_seconds=200),
+            RecordingAudit())
+        self.backend.register({"device_id": "phone-x", "base_url": "http://phone:8260"})
+
+    @staticmethod
+    def result(payload):
+        return {"type": "result", "schema_version": 1, "command_id": payload["command_id"],
+                "action": payload["action"], "success": True, "output": "ok",
+                "finished_at": 1790000000.0}
+
+    def test_slow_action_gets_a_long_attempt_window(self):
+        timeouts = []
+
+        def http(url, token, method="GET", payload=None, timeout=15.0):
+            timeouts.append(timeout)
+            if url.endswith("/health"):
+                return {"success": True}
+            return self.result(payload)
+
+        with patch.object(self.backend, "_http_json", side_effect=http):
+            result = self.backend.execute("screen_text")
+        self.assertTrue(result["success"])
+        # The app bounds screen_text to ~29 s worst case (8 s dump leash +
+        # cat + dumpsys fallback); the window must cover that.
+        self.assertGreaterEqual(timeouts[-1], 30.0)
+
+    def test_fast_actions_keep_the_short_cap(self):
+        timeouts = []
+
+        def http(url, token, method="GET", payload=None, timeout=15.0):
+            timeouts.append(timeout)
+            if url.endswith("/health"):
+                return {"success": True}
+            return self.result(payload)
+
+        with patch.object(self.backend, "_http_json", side_effect=http):
+            self.backend.execute("ping")
+        self.assertLessEqual(timeouts[-1], 8.0)
+
+    def test_attempt_window_never_exceeds_the_caller_budget(self):
+        timeouts = []
+
+        def http(url, token, method="GET", payload=None, timeout=15.0):
+            timeouts.append(timeout)
+            if url.endswith("/health"):
+                return {"success": True}
+            return self.result(payload)
+
+        with patch.object(self.backend, "_http_json", side_effect=http):
+            self.backend.execute("screen_text", timeout=10.0)
+        self.assertLessEqual(timeouts[-1], 10.0)
+
+
+class HttpJsonErrorCodeTests(unittest.TestCase):
+    """Transport failures must carry a code: stalled read vs broken link (issue #1)."""
+
+    def setUp(self):
+        self.backend = device_app.DeviceAppBackend(FakeConfig(app_shared_token="t"), RecordingAudit())
+
+    def test_read_timeout_reports_timeout_code(self):
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("The read operation timed out")):
+            result = self.backend._http_json("http://phone:8260/health", "t")
+        self.assertEqual(result["error_code"], "timeout")
+        self.assertIn("timed out", result["error"])
+
+    def test_urlerror_wrapping_a_timeout_reports_timeout_code(self):
+        with patch("urllib.request.urlopen",
+                   side_effect=device_app.urllib.error.URLError(TimeoutError("timed out"))):
+            result = self.backend._http_json("http://phone:8260/health", "t")
+        self.assertEqual(result["error_code"], "timeout")
+
+    def test_refused_connection_reports_connection_failed_code(self):
+        with patch("urllib.request.urlopen", side_effect=ConnectionRefusedError("refused")):
+            result = self.backend._http_json("http://phone:8260/health", "t")
+        self.assertEqual(result["error_code"], "connection_failed")
+
+
 if __name__ == "__main__":
     unittest.main()
-
-    def test_relay_only_registration_succeeds(self):
-        """A device with no direct URL is still registered; transport is separate."""
-        result = self.backend.register({"device_id": "phone-relay", "app_version": "0.3.22"})
-        self.assertTrue(result["success"])
-        self.assertEqual(self.backend.direct_urls(), [])
-        self.assertEqual(self.backend.registration()["device_id"], "phone-relay")

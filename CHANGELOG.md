@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.8.7]
+
+### Fixed
+
+- **`screen_text` no longer ends as a transport timeout on slow devices**
+  (app issue #1, Galaxy S10 / Android 12). Both ends moved together:
+  - The plugin capped every per-URL attempt at 8 seconds — shorter than a
+    uiautomator dump can legitimately take — so screen reads died as
+    "device connection failed: timed out" before the phone could answer.
+    Inherently slow actions (`screen_text`, `screenshot`, `usage_stats`,
+    `status`, `quick_status`, `location`) now get a 35-second attempt
+    window; fast actions keep the 8-second cap, and the window never
+    exceeds the caller's remaining budget.
+  - The app (v0.3.25) no longer lets the dump hang either: it runs under
+    `timeout 8` with its own shell leash, the temp file is removed before
+    each dump so a stale one is never read, the top activity's dumpsys view
+    hierarchy is the fallback, and when both sources yield nothing the
+    command answers `error_code: ui_dump_unavailable` instead of holding
+    the connection. The app's socket read timeout also rose from 15 s to
+    60 s so it can no longer be shorter than its own 25 s shell timeout.
+- **Transport failures are distinguishable.** Connection errors now carry
+  `error_code`: `timeout` for a stalled read, `connection_failed` for
+  refused or broken links, so a busy phone no longer looks identical to a
+  wrong address in tool results.
+- **The relay-only registration test never ran.** It sat in the unreachable
+  tail of `test_device_app.py` after `unittest.main()`; it now lives in
+  `RegisterTests`.
+
+### Tests
+
+- 240 passed (was 233; the revived relay-only registration test and six new
+  cases join the suite). New attempt-window cases cover the slow-action
+  window (≥30 s), the fast-action cap (≤8 s) and the caller-budget ceiling,
+  plus transport error-code cases for `timeout` and `connection_failed`.
+
 ## [0.8.6]
 
 ### Added
