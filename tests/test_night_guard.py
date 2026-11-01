@@ -68,7 +68,7 @@ def freeze_window(plugin, start="00:30", end="08:00", now=None):
     return now
 
 
-class NightGuardTests(unittest.IsolatedAsyncioTestCase):
+class _GuardFixture(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.config = {
@@ -86,6 +86,7 @@ class NightGuardTests(unittest.IsolatedAsyncioTestCase):
             "night_guard_consecutive_hits": 2,
             "night_guard_max_enforcements_per_night": 2,
             "night_guard_warning_cooldown_minutes": 60,
+            "night_guard_warning_llm": False,
             "night_guard_packages": "testvid," + VIDEO,
             "night_guard_exempt_packages": "",
             "night_guard_private_only": True,
@@ -181,6 +182,7 @@ class NightGuardTests(unittest.IsolatedAsyncioTestCase):
                 pass
         return records
 
+class NightGuardTests(_GuardFixture):
     # ---------- window ----------
 
     def test_window_normal_and_crossing_midnight(self):
@@ -1052,6 +1054,152 @@ class AutonomySchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_care_snapshot_missing_file_is_empty(self):
         self.assertEqual(self.plugin._care_status_snapshot(), {})
+class _FakeProvider:
+    """Minimal stand-in for astrbot's chat provider: records calls, returns text."""
+
+    def __init__(self, text="", error=None):
+        self.text = text
+        self.error = error
+        self.calls = []
+
+    async def text_chat(self, prompt=None, system_prompt=None, **kwargs):
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt})
+        if self.error is not None:
+            raise self.error
+        return types.SimpleNamespace(completion_text=self.text)
+
+
+class NightGuardWarningTextTests(_GuardFixture):
+    """The model only rewrites wording; every fact check and failure path is fixed."""
+
+    def use_provider(self, provider):
+        if provider is None:
+            self.plugin.context.__dict__.pop("get_using_provider", None)
+        else:
+            self.plugin.context.get_using_provider = lambda umo=None: provider
+        self.config["night_guard_warning_llm"] = True
+
+    async def warn(self):
+        state = self.user_state()
+        with patch.object(self.plugin, "_night_guard_observe", new=self.heartbeats(VIDEO, VIDEO)):
+            await self.tick()
+            await self.tick()
+        return state
+
+    def sent_text(self, index=-1):
+        return self.send_message.await_args_list[index].args[1].text
+
+    def rows(self, operation):
+        return [item for item in self.audit_operations() if item.get("operation") == operation]
+
+    async def test_valid_model_text_is_sent_verbatim(self):
+        provider = _FakeProvider("都两点多了，testvid 还开着；10 分钟后我再来看看。先睡吧。")
+        self.use_provider(provider)
+        await self.warn()
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.sent_text(), "都两点多了，testvid 还开着；10 分钟后我再来看看。先睡吧。")
+        self.assertEqual(self.rows("night_guard_warning_sent")[-1]["source"], "llm")
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback"), [])
+
+    async def test_model_text_missing_app_name_falls_back(self):
+        provider = _FakeProvider("都两点多了，还在刷手机；10 分钟后我再来看看。")
+        self.use_provider(provider)
+        await self.warn()
+        self.assertEqual(self.sent_text(), module.PhoneAgentPlugin._night_guard_warning_template(
+            self.plugin, "testvid", 10))
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "missing_app")
+        self.assertEqual(self.rows("night_guard_warning_sent")[-1]["source"], "template")
+
+    async def test_model_text_missing_grace_falls_back(self):
+        provider = _FakeProvider("testvid 还开着，早点睡吧。")
+        self.use_provider(provider)
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "missing_grace")
+
+    async def test_chinese_minutes_are_accepted(self):
+        provider = _FakeProvider("testvid 还开着，十分钟后我再看一眼。")
+        self.use_provider(provider)
+        await self.warn()
+        self.assertEqual(self.sent_text(), "testvid 还开着，十分钟后我再看一眼。")
+        self.assertEqual(self.rows("night_guard_warning_sent")[-1]["source"], "llm")
+
+    async def test_timeout_falls_back(self):
+        self.use_provider(_FakeProvider(error=asyncio.TimeoutError()))
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "timeout")
+
+    async def test_provider_error_falls_back(self):
+        self.use_provider(_FakeProvider(error=RuntimeError("boom")))
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "error")
+
+    async def test_missing_provider_attribute_falls_back(self):
+        self.use_provider(None)
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"],
+                         "provider_lookup_failed")
+
+    async def test_provider_returning_none_falls_back(self):
+        self.plugin.context.get_using_provider = lambda umo=None: None
+        self.config["night_guard_warning_llm"] = True
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "no_provider")
+
+    async def test_overlong_text_falls_back(self):
+        self.use_provider(_FakeProvider("testvid 还开着，10 分钟后我再看。" + "啊" * 90))
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "too_long")
+
+    async def test_multiline_and_url_are_rejected(self):
+        self.use_provider(_FakeProvider("testvid 还开着\n10 分钟后我再看。"))
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "multi_line")
+        self.send_message.reset_mock()
+        self.use_provider(_FakeProvider("testvid 还开着，10 分钟后我再看 http://x.test"))
+        self.plugin._night_guard_states.clear()
+        await self.warn()
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback")[-1]["reason"], "has_url")
+
+    async def test_quotes_are_stripped(self):
+        self.use_provider(_FakeProvider("「testvid 还开着，10 分钟后我再看。」"))
+        await self.warn()
+        self.assertEqual(self.sent_text(), "testvid 还开着，10 分钟后我再看。")
+
+    async def test_switch_off_never_asks_the_model(self):
+        provider = _FakeProvider("testvid 还开着，10 分钟后我再看。")
+        self.plugin.context.get_using_provider = lambda umo=None: provider
+        self.config["night_guard_warning_llm"] = False
+        await self.warn()
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.rows("night_guard_warning_llm_fallback"), [])
+        self.assertIn("先放下手机", self.sent_text())
+
+    async def test_enforce_notice_uses_alias_not_package(self):
+        state = self.user_state()
+        execute = AsyncMock(return_value={"success": True, "verified": True, "package": VIDEO})
+        with patch.object(self.plugin, "_night_guard_observe", new=self.heartbeats(VIDEO, VIDEO, VIDEO)), \
+                patch.object(self.plugin, "_execute_app_policy", new=execute):
+            await self.tick()
+            await self.tick()
+            state["warning_deadline"] = time.time() - 1
+            await self.tick()
+        self.assertEqual(state["phase"], module.NG_PHASE_ENFORCED)
+        self.assertIn("testvid", self.sent_text())
+        self.assertNotIn(VIDEO, self.sent_text())
+
+    def test_cn_number(self):
+        self.assertEqual(module._cn_number(1), "一")
+        self.assertEqual(module._cn_number(10), "十")
+        self.assertEqual(module._cn_number(12), "十二")
+        self.assertEqual(module._cn_number(20), "二十")
+        self.assertEqual(module._cn_number(0), "")
+        self.assertEqual(module._cn_number(100), "")
+
+    def test_builtin_aliases_cover_shipped_packages(self):
+        aliases = self.plugin._app_aliases()
+        for package_name in ("tv.danmaku.bili", "com.youku.phone",
+                             "com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.lite"):
+            self.assertIn(package_name, aliases.values(), package_name)
 
 
 if __name__ == "__main__":

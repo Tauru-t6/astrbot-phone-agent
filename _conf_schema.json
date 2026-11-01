@@ -17,7 +17,7 @@
   "health_db_path": {
     "type": "text",
     "default": "",
-    "description": "Read-only SQLite path produced by xiaomi-sync (usually .../data/health.db)"
+    "description": "Read-only SQLite path containing daily_metrics and sync_runs (usually .../data/health.db)"
   },
   "operit_base_url": {
     "type": "text",
@@ -117,7 +117,7 @@
   "enable_health_tools": {
     "type": "bool",
     "default": false,
-    "description": "Enable phone_health tool and /health route (requires xiaomi-sync health.db)"
+    "description": "Enable phone_health tool and /health route (requires a readable health database)"
   },
   "max_background_tasks": {
     "type": "int",
@@ -313,5 +313,15 @@
     "type": "text",
     "default": "",
     "description": "Persistent task run history (capped). Empty uses the default plugin data path."
+  },
+  "night_guard_warning_llm": {
+    "type": "bool",
+    "default": true,
+    "description": "Let the active chat model rewrite the night-guard reminder wording. The app name and grace minutes are still checked before sending; any failure falls back to the fixed template."
+  },
+  "night_guard_warning_llm_timeout_seconds": {
+    "type": "int",
+    "default": 10,
+    "description": "Give up on the model rewrite after this many seconds and send the fixed template instead, from 3 to 30."
   }
 }

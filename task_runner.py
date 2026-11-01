@@ -859,7 +859,8 @@ def _number(value: Any) -> float | None:
 
 
 # Foreground packages that mean "the phone is idle at its home screen".
-_LAUNCHER_HINTS = ("launcher", ".home", "homescreen", "com.android.settings")
+# com.android.settings 不算空闲：停在设置页多半是人正在操作手机
+_LAUNCHER_HINTS = ("launcher", ".home", "homescreen")
 
 
 def _looks_idle(foreground: str) -> bool:
@@ -908,7 +909,10 @@ class TaskExecutor:
         self._observe = observe
         self._observe_live = observe_live
         self._act = act
-        self._allowed = {item for item in (allowed_actions or ()) if item}
+        # None means no whitelist was configured (unrestricted). An explicit
+        # empty collection means every action is disabled; `or ()` used to
+        # collapse those two very different cases.
+        self._allowed = None if allowed_actions is None else {item for item in allowed_actions if item}
         self._protected = {item for item in protected_packages if item}
         self._step_timeout = max(0.05, float(step_timeout))
         self._run_timeout = max(5.0, float(run_timeout))
@@ -1095,7 +1099,7 @@ class TaskExecutor:
                 before = observation
                 continue
 
-            if self._allowed and step.action not in self._allowed:
+            if self._allowed is not None and step.action not in self._allowed:
                 step.finish(ok=False, verify={"reason": "action_not_enabled"}, error="action_not_enabled", now=_now())
                 counts["failed"] += 1
                 run.transition(RUN_FAILED, error="action_not_enabled")

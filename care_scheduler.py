@@ -7,6 +7,7 @@ device helpers, so it must be mixed into PhoneAgentPlugin, not used alone.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import time
 from datetime import datetime
@@ -14,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+
+# Same relative base as main.PLUGIN_DATA_DIR; kept here so the mixin does not
+# import the plugin module (which imports this mixin) and create a cycle.
+PLUGIN_DATA_DIR = Path("data") / "plugin_data" / "astrbot_plugin_phone_agent"
 
 
 def _text(value: Any, limit: int = 240) -> str:

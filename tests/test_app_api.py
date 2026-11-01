@@ -350,17 +350,20 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
     # -- P1-E stage 3 routes
 
     async def test_grant_requires_a_registered_device(self):
+        self.plugin.config["enable_task_execute"] = True
         response = await self.post("/app/grant", {"actions": ["home"], "ttl_seconds": 60})
         self.assertEqual(response.status_code, 409)
         self.assertEqual((await response.get_json())["error_code"], "no_device")
 
     async def test_grant_rejects_non_write_actions(self):
+        self.plugin.config["enable_task_execute"] = True
         self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
         response = await self.post("/app/grant", {"actions": ["observe"], "ttl_seconds": 60})
         self.assertEqual(response.status_code, 400)
         self.assertEqual((await response.get_json())["error_code"], "invalid_actions")
 
     async def test_grant_issues_a_scoped_grant(self):
+        self.plugin.config["enable_task_execute"] = True
         self.plugin.device_app.registration = lambda: {"device_id": "dev-1"}
         response = await self.post("/app/grant",
                                    {"actions": ["home"], "ttl_seconds": 120, "max_steps": 2})

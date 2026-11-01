@@ -26,6 +26,10 @@ PORT = int(os.environ.get("RELAY_PORT", "8791"))
 MAX_TASKS = 64
 TASK_TTL_SECONDS = 24 * 3600
 RESULT_TTL_SECONDS = 24 * 3600
+# A pending command older than this is never delivered; it only blocks the queue.
+# 30 min by default: a command issued while the phone was locked is still
+# delivered when it wakes, while a long-offline queue cannot pile up forever.
+STALE_PENDING_SECONDS = float(os.environ.get("RELAY_STALE_SECONDS", 1800))
 CLAIM_LEASE_SECONDS = 5 * 60
 # B08: must match the plugin's device_app._http_json 4 MiB read ceiling so a
 # structured command or result envelope is never silently truncated. A body
@@ -108,13 +112,22 @@ def poll_task(device_id: str | None = None) -> dict | None:
     with _lock:
         _gc_locked(now)
         for task in _state["tasks"]:
-            if task["status"] == "pending":
-                task["status"] = "claimed"
-                task["claimed_at"] = now
-                if device_id:
-                    task["device_id"] = device_id
-                _persist()
-                return task
+            if task["status"] != "pending":
+                continue
+            # A command that has waited longer than its usefulness must not block
+            # the queue: the phone may have been offline for hours, and every new
+            # command would otherwise sit behind those stale ones.
+            if now - task.get("created_at", 0) > STALE_PENDING_SECONDS:
+                task["status"] = "expired"
+                task["expired_at"] = now
+                continue
+            task["status"] = "claimed"
+            task["claimed_at"] = now
+            if device_id:
+                task["device_id"] = device_id
+            _persist()
+            return task
+        _persist()
     return None
 
 

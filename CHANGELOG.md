@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.8.8]
+
+### Added
+
+- **Night-guard warnings can be reworded by the chat model** (`night_guard_warning_llm`,
+  default on, `night_guard_warning_llm_timeout_seconds` 3–30 s). The active
+  provider rewrites the fixed 「很晚了，还在刷X」 reminder into one natural
+  sentence; the two facts — app name and grace minutes (Arabic or Chinese
+  numerals) — are verified on the way out, and any failure (no provider,
+  timeout, multi-line chat reply, missing fact, URL, over-length) falls back
+  to the deterministic template. The audit entry records the source and text.
+- **Operit tasks can be cancelled and retried from the dashboard.**
+  `POST /app/operit_task_cancel` cancels the local wait (the phone-side
+  Operit request may still finish) and `POST /app/operit_task_retry`
+  re-queues a finished task, honouring its confirmation state.
+- **Policy-lease restores retry with backoff.** When the phone does not
+  confirm an unsuspend (offline, Shizuku down, package manager busy), the
+  expiry lease retries on an exponential schedule (30 s doubling, capped at
+  15 min) instead of silently dropping the owed restore.
+- **The relay expires stale pending commands** (`RELAY_STALE_SECONDS`, 30 min
+  default): a command queued while the phone was offline can no longer block
+  every newer command behind it.
+
+### Fixed
+
+- **Task approvals are pinned to the device they were proposed for.** A
+  pending approval or scoped grant no longer executes against a newly
+  registered phone: the web route and the chat approval cancel the old
+  proposal with `device_changed`, and grants refuse a foreign device.
+- **An explicitly empty `task_execute_allowed_actions` disables every
+  action** instead of falling back to the default allow-list; only an unset
+  value keeps the default. The same None-vs-empty distinction now holds in
+  the task runner's grant checks, where `or ()` used to collapse the two.
+- **Reminders and Operit tasks are scoped to their owner.** Records carry an
+  owner; list, status and cancel filter on it, and legacy owner-less records
+  belong to the primary allowed user rather than every authorized user.
+- **The Bilibili alias resolves to `tv.danmaku.bili`** (the HD build keeps
+  its own alias), and 优酷 maps to `com.youku.phone` instead of the Honor
+  store variant.
+- **A command no longer reports the cached heartbeat as a fresh sample** on
+  backends that cannot probe the phone live.
+- **Stopping at com.android.settings no longer counts as idle** — a person
+  is operating the phone.
+- Health tools describe their source as the generic read-only `health_db`
+  instead of naming one collector.
+
+### Tests
+
+- 255 passed (was 240): the suite gained the night-guard LLM wording tests
+  and the task-switch gating cases.
+
 ## [0.8.7]
 
 ### Fixed
