@@ -9,8 +9,6 @@
 - Add the MIT license for original project code.
 - Publish bridge health in the care snapshot. See docs/PRIVATE_COMPANION_719_ADAPTATION.md for limits, settings and deployment notes.
 
-## [Unreleased]
-
 - Harden command dispatch against duplicate execution, uncertain Operit fallback,
   authenticated HTTP redirects, stale post-action observations and invalid input.
 - Preserve policy expiry ownership after failed renewals or early restores;
