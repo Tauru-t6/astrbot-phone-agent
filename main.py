@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import tempfile
 import time
@@ -25,6 +26,14 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Star
 from quart import jsonify, request
+from .model_planning import plan_goal, simple_fallback_goal
+
+try:
+    from .storage import read_jsonl_tail, write_json_atomic
+    from .http_transport import open_http
+except ImportError:  # pragma: no cover - direct-module test harness
+    from storage import read_jsonl_tail, write_json_atomic
+    from http_transport import open_http
 
 try:
     from .device_app import (
@@ -239,6 +248,19 @@ def _feature_gate(tool_name: str):
     return decorator
 
 
+def _web_feature_gate(feature: str, handler):
+    """Recheck optional routes after runtime configuration changes."""
+    @functools.wraps(handler)
+    async def guarded():
+        plugin = handler.__self__
+        if not plugin._enabled():
+            return jsonify({"success": False, "error": "phone agent disabled", "error_code": "disabled"}), 503
+        if not plugin._feature(feature):
+            return jsonify({"success": False, "error": f"{feature} feature is disabled", "error_code": "disabled"}), 403
+        return await handler()
+    return guarded
+
+
 class PhoneAgentPlugin(CareSchedulerMixin, Star):
     def __init__(self, context: Any, config: AstrBotConfig):
         super().__init__(context)
@@ -270,6 +292,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._task_runs = TaskRunStore(self._task_run_path())
         self._task_runs.load()
         self._task_planner = TaskPlanner(self._app_aliases())
+        self._planning_lock = asyncio.Lock()
         self._task_runner = ReadOnlyTaskRunner(
             self._task_runs,
             self._task_planner,
@@ -414,6 +437,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             ("/device/test", self._web_device_test, ["POST"], "Ping the phone app through the current backend", None),
             ("/device/timeline", self._web_device_timeline, ["GET"], "Timeline items for the phone app sync", None),
             ("/app/state", self._web_app_state, ["GET"], "AstrBot Phone Agent App state snapshot", None),
+            ("/app/care/preview", self._web_app_care_preview, ["POST"], "Preview one care decision without sending a message", "observe_tool"),
             ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create an App reminder", None),
         ("/app/task/plan", self._web_app_task_plan, ["POST"],
          "Plan a task and dry-run it without touching the phone", "observe_tool"),
@@ -433,7 +457,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             gate = route[4] if len(route) > 4 else None
             if gate and not self._feature(gate):
                 continue
-            register(prefix + route[0], route[1], route[2], route[3])
+            handler = _web_feature_gate(gate, route[1]) if gate else route[1]
+            register(prefix + route[0], handler, route[2], route[3])
 
     def _web_config_view(self) -> dict[str, Any]:
         keys = (
@@ -457,7 +482,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if not self._web_write_allowed():
             return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
         payload = await request.get_json(silent=True)
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or not self._finite_json(payload):
             return jsonify({"success": False, "error": "JSON object required"}), 400
         bool_keys = {"enabled", "use_private_companion_auth"}
         int_keys = {"operit_timeout_seconds", "max_background_tasks", "app_command_timeout_seconds"}
@@ -716,6 +741,9 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if not item or not item.get("task"):
             return jsonify({"success": False, "error": "task not found or not retryable",
                             "error_code": "not_found"}), 404
+        retry_error = self._operit_retry_error(item)
+        if retry_error:
+            return jsonify({"success": False, "error": retry_error, "error_code": "retry_unavailable"}), 409
         if self._task_requires_confirmation(str(item["task"])) and not item.get("confirmed"):
             return jsonify({"success": False, "needs_confirmation": True,
                             "error": "ask the user to confirm this task before retrying it",
@@ -755,18 +783,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             limit = max(1, min(int(request.args.get("limit", "50")), 200))
         except ValueError:
             limit = 50
-        records: list[dict[str, Any]] = []
-        try:
-            lines = Path(self._audit_path()).read_text(encoding="utf-8").splitlines()[-limit:]
-            for line in lines:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, dict):
-                        records.append(value)
-                except json.JSONDecodeError:
-                    pass
-        except OSError:
-            pass
+        records = await asyncio.to_thread(read_jsonl_tail, self._audit_path(), limit)
         return jsonify({"success": True, "records": records})
 
     # ==================== Device-app backend (control_backend=app) ====================
@@ -846,18 +863,36 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         return jsonify({"success": True, "received": True})
 
     async def _web_device_command(self):
+        if not self._enabled():
+            return jsonify({"success": False, "error": "phone agent disabled", "error_code": "disabled"}), 503
+        if self._control_backend() != "app":
+            return jsonify({"success": False, "error": "device commands require the app backend", "error_code": "wrong_backend"}), 409
         if not self._web_write_allowed():
             return jsonify({"success": False, "error": "cross-origin write rejected"}), 403
         payload = await request.get_json(silent=True)
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or not self._finite_json(payload):
             return jsonify({"success": False, "error": "JSON object required"}), 400
         action = _text(payload.get("action"), 40).lower()
         if action not in COMMAND_ACTIONS:
             return jsonify({"success": False, "error": f"unsupported action; allowed: {', '.join(sorted(COMMAND_ACTIONS))}"}), 400
-        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        feature = {
+            "screenshot": "screenshot_tool", "screen_text": "observe_tool",
+            "location": "location_tool", "usage_stats": "usage_tool",
+            "suspend_app": "policy_tools", "unsuspend_app": "policy_tools",
+            "suspend_video_apps": "policy_tools", "unsuspend_video_apps": "policy_tools",
+        }.get(action)
+        if feature and not self._feature(feature):
+            return jsonify({"success": False, "error": f"{feature} feature is disabled", "error_code": "disabled"}), 403
+        args = payload.get("args", {})
+        if not isinstance(args, dict):
+            return jsonify({"success": False, "error": "args must be a JSON object"}), 400
         if action in {"suspend_app", "unsuspend_app", "open_app", "close_app"}:
             args = dict(args)
             args["package"] = self._resolve_package(args.get("package"))
+        if action in {"suspend_app", "unsuspend_app"}:
+            error = self._protected_policy_error(args["package"])
+            if error:
+                return jsonify({"success": False, "error": error, "error_code": "protected_package"}), 403
         result = await asyncio.to_thread(self.device_app.execute, action, args)
         return jsonify(result), 200 if result.get("success") else 502
 
@@ -960,6 +995,69 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             "task_execute_enabled": self._bool_config("enable_task_execute", False),
         })
 
+    async def _web_app_care_preview(self):
+        allowed, error = self._app_api_write_allowed("observe_tool")
+        if not allowed:
+            return jsonify({"success": False, "error": error}), 403
+        provider = self._companion_care()
+        if provider is None:
+            return jsonify({"success": False, "error_code": "care_unavailable"}), 503
+        if not self._care_device_fresh():
+            return jsonify({"success": False, "error_code": "device_stale"}), 409
+        target = next((item for item in self._care_targets() if item["user_id"] in self._allowed_users()), None)
+        if target is None:
+            return jsonify({"success": False, "error_code": "private_session_unavailable"}), 409
+        try:
+            result = await asyncio.wait_for(provider.evaluate_care(
+                target["user_id"], target["umo"], "owner", preview=True), timeout=70)
+        except asyncio.TimeoutError:
+            return jsonify({"success": False, "error_code": "care_preview_timeout"}), 504
+        except Exception:
+            return jsonify({"success": False, "error_code": "care_preview_failed"}), 503
+        return jsonify({"success": True, "result": result})
+
+    async def _start_planned_task(self, goal, *, subject, device_id, grant=None, umo=""):
+        if not self._bool_config("enable_llm_task_planner", False):
+            return self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+        if self._planning_lock.locked():
+            raise ValueError("规划器正在处理另一项任务，请稍后再试。")
+        async with self._planning_lock:
+            session = umo or _text(self._night_guard_states.get(subject, {}).get("session"), 240)
+            provider = None
+            try:
+                provider_id = _text(self.config.get("task_planner_provider_id"), 160)
+                provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider(umo=session or None)
+            except Exception:
+                pass
+            result = None
+            if provider is not None:
+                result = await plan_goal(provider, goal, aliases=self._app_aliases(), allowed=self._task_allowed_actions(),
+                    foreground=_text((self.device_app.last_status() or {}).get("foreground_package"), 160),
+                    timeout=self._task_float("task_planner_timeout_seconds", 20, 3, 60),
+                    max_steps=int(self._task_float("task_planner_max_steps", 6, 1, 10)))
+            if not self._enabled() or self._registered_device_id() != device_id:
+                raise ValueError("规划期间设备或开关发生变化，请重新发起任务。")
+            if result is None or result.reason == "model_unavailable":
+                if not simple_fallback_goal(goal):
+                    raise ValueError("模型暂不可用。请稍后重试，或拆成明确的单步目标。")
+                planned = self._task_planner.plan(goal)
+                if not any(step.is_write for step in planned):
+                    raise ValueError("没有识别到目标应用，请补充已配置的应用名称。")
+                if any(step.is_write and step.action not in self._task_allowed_actions() for step in planned):
+                    raise ValueError("该操作尚未在服务端允许，请检查任务权限配置。")
+                run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+                run.summary["planning"] = {"source": "rules", "reason": "model_unavailable"}
+                return run
+            if result.reason:
+                raise ValueError(result.clarification or "目标暂不能安全规划，请补充具体动作。")
+            run = PhoneTaskRun.new(goal, subject=subject, device_id=device_id, grant_id=grant.grant_id if grant else "")
+            for step in result.steps:
+                run.add_step(step.action, step.args)
+            run.transition("running")
+            run.summary["planning"] = {"source": "llm", "steps": len(result.steps)}
+            self._task_runs.add_run(run)
+            return run
+
     async def _web_app_task_propose(self):
         """Stage 4: plan a task and stop for a human decision."""
         allowed, error, error_code = self._task_api_write_allowed()
@@ -982,7 +1080,10 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return jsonify({"success": False, "error": "no device registered",
                             "error_code": "no_device"}), 409
         subject = _text(payload.get("subject"), 120) or next(iter(sorted(self._allowed_users())), "")
-        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=None)
+        try:
+            run = await self._start_planned_task(goal, subject=subject, device_id=device_id)
+        except ValueError as exc:
+            return jsonify({"success": False, "error_code": "plan_unavailable", "error": str(exc)}), 422
         actions = [step.action for step in run.steps if step.action in WRITE_ACTIONS]
         packages = [step.args.get("package") for step in run.steps if step.args.get("package")]
         if not actions:
@@ -1052,7 +1153,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         grant = ScopedGrant.issue(
             subject=approval.subject, device_id=approval.device_id,
             actions=list(approval.actions), packages=list(approval.packages),
-            ttl_seconds=120.0, max_steps=max(1, len(approval.actions)),
+            ttl_seconds=120.0, max_steps=max(1, sum(step.action in WRITE_ACTIONS for step in run.steps)),
             source=GRANT_SOURCE_APPROVAL,
         )
         self._task_runs.add_grant(grant)
@@ -1117,7 +1218,10 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return jsonify({"success": False, "error": "the grant belongs to a different device",
                             "error_code": "device_changed"}), 409
         subject = _text(payload.get("subject"), 120) or next(iter(sorted(self._allowed_users())), "")
-        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+        try:
+            run = await self._start_planned_task(goal, subject=subject, device_id=device_id, grant=grant)
+        except ValueError as exc:
+            return jsonify({"success": False, "error_code": "plan_unavailable", "error": str(exc)}), 422
         allow_active = bool(payload.get("allow_while_active") is True)
         run = await self._task_executor.execute(run, grant=grant, allow_active=allow_active)
         self._audit(
@@ -1215,7 +1319,10 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             if grant is None:
                 return jsonify({"success": False, "error": "grant not found or expired",
                                 "error_code": "grant_unusable"}), 409
-        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+        try:
+            run = await self._start_planned_task(goal, subject=subject, device_id=device_id, grant=grant)
+        except ValueError as exc:
+            return jsonify({"success": False, "error_code": "plan_unavailable", "error": str(exc)}), 422
         run = self._task_runner.execute(
             run,
             grant=grant,
@@ -2169,12 +2276,26 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
     def _task_path(self) -> str:
         return str(self._plugin_data_path("tasks_path", "phone_agent_tasks.json"))
 
+    def _operit_background_full(self) -> bool:
+        try:
+            limit = max(1, min(int(self.config.get("max_background_tasks", self._max_background_tasks)), 8))
+        except (TypeError, ValueError, OverflowError):
+            limit = self._max_background_tasks
+        return sum(item.get("status") in {"queued", "running"} for item in self._operit_tasks.values()) >= limit
+
+    def _operit_retry_error(self, item: dict[str, Any]) -> str:
+        if self._control_backend() != "operit":
+            return "Operit retries require control_backend=operit"
+        if item.get("status") not in {"failed", "cancelled", "interrupted"}:
+            return "only failed, cancelled or interrupted tasks can be retried"
+        if self._operit_background_full():
+            return "too many background phone tasks; wait for one to finish"
+        return ""
+
     def _save_operit_tasks(self) -> None:
         try:
-            path = Path(self._task_path())
-            path.parent.mkdir(parents=True, exist_ok=True)
             items = list(self._operit_tasks.items())[-100:]
-            path.write_text(json.dumps(dict(items), ensure_ascii=False, indent=2), encoding="utf-8")
+            write_json_atomic(self._task_path(), dict(items))
         except Exception as exc:
             logger.debug("phone agent task save failed: %s", exc)
 
@@ -2343,23 +2464,12 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             logger.warning("phone agent policy state file is invalid; ignoring it")
 
     def _save_reminders(self) -> None:
-        path = Path(self._reminder_path())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         # Keep completed idempotency receipts for 30 days; active ones never expire.
         cutoff = time.time() - 30 * 86400
         requests = {key: value for key, value in self._reminder_requests.items()
                     if value.get("status") == "pending" or value.get("finished_at", time.time()) >= cutoff}
-        try:
-            with temporary.open("w", encoding="utf-8") as handle:
-                json.dump({"version": 2, "pending": self._reminders, "requests": requests},
-                          handle, ensure_ascii=False, allow_nan=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            self._reminder_requests = requests
-        finally:
-            temporary.unlink(missing_ok=True)
+        write_json_atomic(self._reminder_path(), {"version": 2, "pending": self._reminders, "requests": requests})
+        self._reminder_requests = requests
 
     def _load_reminders(self) -> None:
         try:
@@ -2819,9 +2929,15 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            process.kill()
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
             await process.communicate()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             return 124, "", "adb command timed out"
         return process.returncode or 0, stdout.decode(errors="replace").strip(), stderr.decode(errors="replace").strip()
 
@@ -3151,7 +3267,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_http(request, timeout=timeout) as response:
                 data = json.loads(response.read(64 * 1024).decode("utf-8", errors="replace"))
             return data if isinstance(data, dict) else {"success": False, "error": "relay returned invalid JSON"}
         except urllib.error.HTTPError as exc:
@@ -3214,7 +3330,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         # so the phone's polling workflow can pick the task up without a VPN.
         if token:
             direct = self._operit_task_direct(task, show_floating, initial_mode)
-            if direct.get("success") or not self._relay_enabled():
+            if direct.get("success") or not self._relay_enabled() or not direct.get("safe_to_retry"):
                 return direct
             self._audit("relay_fallback", reason=_text(direct.get("error"), 180))
         return self._relay_submit(task, self._operit_timeout())
@@ -3242,7 +3358,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._operit_timeout()) as response:
+            with open_http(request, timeout=self._operit_timeout()) as response:
                 body = response.read(256 * 1024).decode("utf-8", errors="replace")
             data = json.loads(body)
             if isinstance(data, dict):
@@ -3251,7 +3367,13 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         except urllib.error.HTTPError as exc:
             return {"success": False, "error": f"Operit HTTP {exc.code}"}
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return {"success": False, "error": f"Operit connection failed: {str(exc)[:180]}"}
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            # Operit has no cross-route command-id deduplication. A timeout or
+            # disconnected response may follow an already executed side effect.
+            safe_to_retry = isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+            return {"success": False, "error": f"Operit connection failed: {str(exc)[:180]}",
+                    "error_code": "connection_failed" if safe_to_retry else "execution_unknown",
+                    "safe_to_retry": safe_to_retry}
         except json.JSONDecodeError:
             return {"success": False, "error": "Operit returned non-JSON data"}
 
@@ -3264,7 +3386,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             headers={"Authorization": "Bearer " + token},
         )
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            with open_http(request, timeout=8) as response:
                 data = json.loads(response.read(4096).decode("utf-8", errors="replace"))
             return {"available": bool(data.get("enabled") and data.get("service_running")), "port": data.get("port"), "version": data.get("version_name")}
         except urllib.error.HTTPError as exc:
@@ -3364,7 +3486,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
     @filter.llm_tool(name="phone_task_propose")
     @_tolerate_nested_args
     async def phone_task_propose(self, event: AstrMessageEvent, goal: str = "", **_kwargs: Any) -> str:
-        """Propose a phone task and let the user approve it on the phone. Use this when the user asks you to do something on their phone (go home, open or suspend an app). Never claim it is done: it only takes effect after the user approves on the device.
+        """Plan a bounded, ordered multi-step phone task and let the user approve the complete plan on the phone. If the planner asks for clarification, ask the user instead of guessing or claiming success. Use this when the user asks you to do something on their phone (go home, open or suspend an app). Never claim it is done: it only takes effect after the user approves on the device.
 
         Args:
             goal(string): What the user wants done on the phone, worded close to their own request, e.g. "回到桌面" or "把抖音暂停".
@@ -3383,7 +3505,12 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return json.dumps({"success": False, "error": "the phone app has not registered yet"},
                               ensure_ascii=False)
         subject = self._event_user_id(event) or next(iter(sorted(self._allowed_users())), "")
-        run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=None)
+        try:
+            run = await self._start_planned_task(goal, subject=subject, device_id=device_id, umo=str(getattr(event, "unified_msg_origin", "") or ""))
+        except ValueError as exc:
+            return json.dumps({"success": False, "error_code": "plan_unavailable", "error": str(exc)}, ensure_ascii=False)
+        if not self._authorized(event) or not self._bool_config("enable_task_execute", False):
+            return json.dumps({"success": False, "error": "authorization changed during planning"})
         actions = [step.action for step in run.steps if step.action in WRITE_ACTIONS]
         if not actions:
             return json.dumps({
@@ -3411,6 +3538,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         return json.dumps({
             "success": True,
             "awaiting_approval": True,
+            "plan": [{"action": step.action, "args": step.args} for step in run.steps],
             "message": guidance,
             "approval_id": approval.approval_id,
             "actions": actions,
@@ -3499,21 +3627,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
         if self._group_tool_blocked(event, "phone_audit"):
             return self._group_tool_error("phone_audit")
-        records: list[dict[str, Any]] = []
         try:
-            try:
-                limit = max(1, min(int(limit or 20), 100))
-            except (TypeError, ValueError):
-                return json.dumps({"success": False, "error": "limit must be an integer from 1 to 100"}, ensure_ascii=False)
-            for line in Path(self._audit_path()).read_text(encoding="utf-8").splitlines()[-limit:]:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, dict):
-                        records.append(value)
-                except json.JSONDecodeError:
-                    continue
-        except OSError:
-            pass
+            limit = max(1, min(int(limit or 20), 100))
+        except (TypeError, ValueError, OverflowError):
+            return json.dumps({"success": False, "error": "limit must be an integer from 1 to 100"}, ensure_ascii=False)
+        records = await asyncio.to_thread(read_jsonl_tail, self._audit_path(), limit)
         return json.dumps({"success": True, "records": records}, ensure_ascii=False)
 
     @filter.llm_tool(name="operit_task")
@@ -3570,12 +3688,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if initial_mode not in {"WINDOW", "BALL", "VOICE_BALL", "FULLSCREEN", "RESULT_DISPLAY", "SCREEN_OCR"}:
             initial_mode = "WINDOW"
         if background:
-            try:
-                max_tasks = max(1, min(int(self.config.get("max_background_tasks", self._max_background_tasks)), 8))
-            except (TypeError, ValueError):
-                max_tasks = self._max_background_tasks
-            active = sum(value.get("status") in {"queued", "running"} for value in self._operit_tasks.values())
-            if active >= max_tasks:
+            if self._operit_background_full():
                 return json.dumps({"success": False, "error": "too many background phone tasks; wait for one to finish"}, ensure_ascii=False)
             task_id = uuid.uuid4().hex[:12]
             self._operit_tasks[task_id] = {"status": "queued", "task": task, "confirmed": bool(confirmed),
@@ -3639,6 +3752,9 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         item = self._operit_tasks.get(task_id)
         if not item or not self._owned_by(item, owner) or not item.get("task"):
             return json.dumps({"success": False, "error": "task not found or not retryable"}, ensure_ascii=False)
+        retry_error = self._operit_retry_error(item)
+        if retry_error:
+            return json.dumps({"success": False, "error": retry_error, "error_code": "retry_unavailable"}, ensure_ascii=False)
         if self._task_requires_confirmation(str(item["task"])) and not item.get("confirmed"):
             return json.dumps({"success": False, "needs_confirmation": True, "error": "Ask the user for confirmation before retrying this task."}, ensure_ascii=False)
         new_id = uuid.uuid4().hex[:12]
@@ -3971,6 +4087,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         action = _text(action, 40).lower()
         if action not in ALLOWED_ACTIONS:
             return json.dumps({"success": False, "error": "unsupported action"}, ensure_ascii=False)
+        if action == "screen_text":
+            if not self._tool_enabled("phone_observe"):
+                return json.dumps({"success": False, "error": "screen observation is disabled"}, ensure_ascii=False)
+            if self._group_tool_blocked(event, "phone_observe"):
+                return self._group_tool_error("phone_observe")
         if action in {"suspend_app", "unsuspend_app", "suspend_video_apps", "unsuspend_video_apps"} and not self._tool_enabled("phone_app_policy"):
             return json.dumps({"success": False, "error": "app policy actions are disabled; enable policy_tools in the plugin config"}, ensure_ascii=False)
         if action == "trigger_workflow" and not confirmed:
@@ -4052,19 +4173,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         except (OSError, ValueError, TypeError):
             logger.warning("phone agent notification file is invalid; ignoring it")
 
-    def _save_notifications(self) -> None:
-        path = self._notification_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-        try:
-            with temporary.open("w", encoding="utf-8") as handle:
-                json.dump({"version": 1, "notifications": self._notifications}, handle,
-                          ensure_ascii=False, allow_nan=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    def _save_notifications(self, notifications: list[dict[str, Any]] | None = None) -> None:
+        write_json_atomic(self._notification_path(), {
+            "version": 1,
+            "notifications": self._notifications if notifications is None else notifications,
+        })
 
     async def _web_app_notifications(self):
         if not self._enabled():
@@ -4084,6 +4197,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         items = payload.get("notifications")
         if not isinstance(items, list):
             return jsonify({"success": False, "error": "notifications must be a list", "error_code": "invalid_payload"}), 400
+        candidate = list(self._notifications)
         added = 0
         for entry in items[:50]:
             if not isinstance(entry, dict):
@@ -4093,16 +4207,16 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             body = _text(entry.get("text"), 500)
             try:
                 posted = float(entry.get("posted_at"))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 posted = time.time()
             if not math.isfinite(posted) or posted <= 0:
                 posted = time.time()
             if not (package or title or body):
                 continue
             key = _text(entry.get("key"), 160) or f"{package}|{title}|{int(posted)}"
-            if any(existing.get("key") == key for existing in self._notifications):
+            if any(existing.get("key") == key for existing in candidate):
                 continue
-            self._notifications.insert(0, {
+            candidate.insert(0, {
                 "key": key,
                 "package": package,
                 "title": title,
@@ -4113,12 +4227,13 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             })
             added += 1
         if added:
-            self._notifications = self._notifications[: self.MAX_NOTIFICATIONS]
+            candidate = candidate[: self.MAX_NOTIFICATIONS]
             try:
-                self._save_notifications()
+                self._save_notifications(candidate)
             except OSError:
                 return jsonify({"success": False, "error": "could not store notifications",
                                 "error_code": "storage_unavailable"}), 503
+            self._notifications = candidate
             self._audit("app_notifications_received", count=added)
         return jsonify({"success": True, "added": added, "total": len(self._notifications)})
 
@@ -4386,6 +4501,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if normalized == "disable":
             # Register the lease before sending the command, so a crash between
             # the policy call and the bookkeeping does not lose the owner.
+            existing = self._policy_leases.get(package, {}).get(source)
             lease = self._policy_leases.setdefault(package, {}).setdefault(
                 source, _PolicyLease(source=source)
             )
@@ -4396,7 +4512,9 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                           "error": _text(exc, 240)}
             if not result.get("success"):
                 leases = self._policy_leases.get(package, {})
-                if leases.get(source) is lease:
+                # A failed renewal must not remove a previous suspension's
+                # owner, deadline or recovery timer.
+                if existing is None and leases.get(source) is lease:
                     leases.pop(source, None)
                 if not leases:
                     self._policy_leases.pop(package, None)
@@ -4413,14 +4531,16 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             result["owners"] = sorted(self._policy_leases.get(package, {}))
             self._save_policy_state()
             return result
-        # enable: release this source's lease. Only send the actual unsuspend
-        # when no other source still owns the package.
-        released = self._policy_leases.get(package, {}).pop(source, None)
-        if released is not None:
-            self._cancel_policy_expiry(package, source)
-        remaining = sorted(self._policy_leases.get(package, {}))
+        # Keep the final owner's lease and timer until the phone confirms the
+        # restore. In particular, an early manual restore that fails must not
+        # cancel the original deadline's automatic retry.
+        leases = self._policy_leases.get(package, {})
+        released = leases.get(source)
+        remaining = sorted(owner for owner in leases if owner != source)
         if remaining:
             # Other sources still want this package suspended — do NOT enable.
+            self._cancel_policy_expiry(package, source)
+            leases.pop(source, None)
             self._save_policy_state()
             return {
                 "success": True,
@@ -4432,13 +4552,18 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 "remaining_owners": remaining,
                 "note": f"package remains suspended by {len(remaining)} other source(s)",
             }
-        self._policy_leases.pop(package, None)
         try:
             result = await self._apply_app_policy(package, normalized)
         except Exception as exc:  # keep the restore responsibility on a raise
             result = {"success": False, "action": normalized, "package": package,
                       "error": _text(exc, 240)}
         if result.get("success"):
+            # Cancel while the lease is still indexed; popping it first makes
+            # _cancel_policy_expiry unable to find the detached timer.
+            self._cancel_policy_expiry(package, source)
+            self._policy_leases.get(package, {}).pop(source, None)
+            if not self._policy_leases.get(package):
+                self._policy_leases.pop(package, None)
             self._guard_suspended.discard(package)
             result.update({"mode": "enabled", "lease_released": True, "owners": []})
             self._save_policy_state()
@@ -4449,7 +4574,6 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         lease = self._policy_leases.setdefault(package, {}).setdefault(
             source, released if released is not None else _PolicyLease(source=source)
         )
-        lease.task = None
         self._guard_suspended.add(package)
         result.update({
             "mode": "restore_pending",
@@ -4740,7 +4864,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         grant = ScopedGrant.issue(
             subject=approval.subject, device_id=device_id,
             actions=list(approval.actions), packages=list(approval.packages),
-            ttl_seconds=120.0, max_steps=max(1, len(approval.actions)),
+            ttl_seconds=120.0, max_steps=max(1, sum(step.action in WRITE_ACTIONS for step in run.steps)),
             source=GRANT_SOURCE_APPROVAL,
         )
         self._task_runs.add_grant(grant)
@@ -4797,39 +4921,20 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return
         user_id = self._night_guard_user_id(event)
         session = _text(getattr(event, "unified_msg_origin", ""), 240)
-        # Diagnostic: prove whether the private handler runs at all, and with
-        # which identity. Cheap enough to keep while the guard is being tested.
-        self._audit("private_message_seen", user_id=user_id, session=session[:80],
-                    authorized=self._authorized(event))
         if not user_id or not session:
             return
-        # Defense in depth beyond the PRIVATE_MESSAGE filter: never act on,
-        # or record, a group session for night-guard purposes.
-        if self._bool_config("night_guard_private_only", True) and ":FriendMessage:" not in session:
-            return
-        if not self._night_guard_enabled():
+        # Chat approvals are independent of night guard settings and work for
+        # every supported private-message adapter. Never accept them in groups.
+        if not self._is_private_session(event):
             return
         # B01: authorize BEFORE recording the session, so an empty allowlist or
         # a removed user never seeds the night-guard state file.
         if not self._authorized(event):
             return
-        self._record_night_guard_session(user_id, session)
-        message = ""
-        try:
-            components = event.get_messages() or []
-        except Exception:
-            components = []
-        texts = []
-        for component in components:
-            text = getattr(component, "text", None)
-            if isinstance(text, str):
-                texts.append(text)
-        if texts:
-            message = " ".join(texts)
-        if not message:
-            plain = getattr(event.message_obj, "plain_result", None)
-            message = plain if isinstance(plain, str) else ""
-        message = _text(message, 300)
+        guard_enabled = self._night_guard_enabled()
+        if guard_enabled:
+            self._record_night_guard_session(user_id, session)
+        message = self._event_text(event)
         if not message:
             return
         # A pending proposal can be approved or rejected from chat, so the phone
@@ -4842,7 +4947,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 except Exception as exc:
                     logger.debug("phone agent task decision reply failed: %s", _text(exc, 160))
                 return
-        if not NG_RELEASE_RE.search(message):
+        if not guard_enabled or not NG_RELEASE_RE.search(message):
             return
         result = await self._night_guard_release(user_id)
         if result.get("success"):

@@ -9,6 +9,7 @@ never loses pending work.
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import threading
@@ -35,6 +36,7 @@ CLAIM_LEASE_SECONDS = 5 * 60
 # structured command or result envelope is never silently truncated. A body
 # above the limit is rejected with 413 (see do_POST) — never cropped JSON.
 MAX_BODY_BYTES = 4 * 1024 * 1024
+REQUEST_TIMEOUT_SECONDS = 15.0
 DEVICE_HEADER = "X-Relay-Device-ID"
 MAX_DEVICE_ID_LENGTH = 128
 # Device identity is required by default so a second phone cannot submit a
@@ -52,9 +54,16 @@ _rate_buckets: dict[tuple[str, str], deque[float]] = {}
 
 
 def _persist() -> None:
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(_state, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(STATE_PATH)
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_name(STATE_PATH.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(_state, handle, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, STATE_PATH)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load() -> None:
@@ -63,22 +72,55 @@ def _load() -> None:
         try:
             loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and isinstance(loaded.get("tasks"), list):
-                _state = loaded
+                def timestamp(value) -> bool:
+                    if not isinstance(value, (int, float)) or isinstance(value, bool):
+                        return False
+                    try:
+                        return math.isfinite(value) and value > 0
+                    except OverflowError:
+                        return False
+
+                tasks = []
+                for task in loaded["tasks"]:
+                    if (not isinstance(task, dict) or not isinstance(task.get("id"), str)
+                            or not task["id"] or not isinstance(task.get("message"), str)
+                            or not isinstance(task.get("status"), str)
+                            or task.get("status") not in {"pending", "claimed", "running", "done", "expired"}
+                            or not timestamp(task.get("created_at"))):
+                        continue
+                    if task.get("status") in {"claimed", "running"} and not timestamp(task.get("claimed_at")):
+                        task["status"] = "pending"
+                        task.pop("claimed_at", None)
+                        task.pop("device_id", None)
+                    tasks.append(task)
+                results = loaded.get("results")
+                _state = {"tasks": tasks, "results": {
+                    key: value for key, value in (results.items() if isinstance(results, dict) else [])
+                    if isinstance(value, dict) and timestamp(value.get("finished_at"))
+                }}
         except (OSError, json.JSONDecodeError):
             pass
 
 
-def _gc_locked(now: float) -> None:
+def _gc_locked(now: float) -> bool:
+    changed = False
     for task in _state["tasks"]:
         # Claims created by older relay versions have no owner. Reset them so
         # strict device mode never leaves an uncompletable task behind.
         if task.get("status") == "claimed" and REQUIRE_DEVICE_ID and not task.get("device_id"):
             task["status"] = "pending"
             task.pop("claimed_at", None)
+            changed = True
         if task.get("status") in {"claimed", "running"} and now - task.get("claimed_at", task.get("created_at", now)) >= CLAIM_LEASE_SECONDS:
             task["status"] = "pending"
             task.pop("claimed_at", None)
             task.pop("device_id", None)
+            changed = True
+        if task.get("status") == "pending" and now - task.get("created_at", 0) > STALE_PENDING_SECONDS:
+            task["status"] = "expired"
+            task["expired_at"] = now
+            changed = True
+    old_tasks, old_results = len(_state["tasks"]), len(_state["results"])
     _state["tasks"] = [
         t for t in _state["tasks"]
         if now - t.get("created_at", 0) < TASK_TTL_SECONDS
@@ -87,13 +129,14 @@ def _gc_locked(now: float) -> None:
         k: v for k, v in _state["results"].items()
         if now - v.get("finished_at", 0) < RESULT_TTL_SECONDS
     }
+    return changed or len(_state["tasks"]) != old_tasks or len(_state["results"]) != old_results
 
 
 def push_task(payload: dict) -> dict:
     now = time.time()
     with _lock:
         _gc_locked(now)
-        if len([t for t in _state["tasks"] if t.get("status") == "pending"]) >= MAX_TASKS:
+        if sum(t.get("status") in {"pending", "claimed", "running"} for t in _state["tasks"]) >= MAX_TASKS:
             raise OverflowError("pending task queue is full")
         task_id = uuid.uuid4().hex[:12]
         task = {
@@ -104,38 +147,34 @@ def push_task(payload: dict) -> dict:
         }
         _state["tasks"].append(task)
         _persist()
-        return task
+        return dict(task)
 
 
 def poll_task(device_id: str | None = None) -> dict | None:
     now = time.time()
     with _lock:
-        _gc_locked(now)
+        changed = _gc_locked(now)
         for task in _state["tasks"]:
             if task["status"] != "pending":
-                continue
-            # A command that has waited longer than its usefulness must not block
-            # the queue: the phone may have been offline for hours, and every new
-            # command would otherwise sit behind those stale ones.
-            if now - task.get("created_at", 0) > STALE_PENDING_SECONDS:
-                task["status"] = "expired"
-                task["expired_at"] = now
                 continue
             task["status"] = "claimed"
             task["claimed_at"] = now
             if device_id:
                 task["device_id"] = device_id
             _persist()
-            return task
-        _persist()
+            return dict(task)
+        if changed:
+            _persist()
     return None
 
 
 def submit_result(task_id: str, success: bool, ai_response: str, error: str = "", device_id: str | None = None) -> bool:
     now = time.time()
     with _lock:
+        if _gc_locked(now):
+            _persist()
         task = next((t for t in _state["tasks"] if t["id"] == task_id), None)
-        if task is None or task["status"] not in {"pending", "claimed", "running"}:
+        if task is None or task["status"] not in {"claimed", "running"}:
             return False
         if task.get("device_id") and task.get("device_id") != device_id:
             return False
@@ -155,6 +194,8 @@ def submit_result(task_id: str, success: bool, ai_response: str, error: str = ""
 def renew_task(task_id: str, device_id: str | None = None) -> bool:
     now = time.time()
     with _lock:
+        if _gc_locked(now):
+            _persist()
         task = next((t for t in _state["tasks"] if t["id"] == task_id), None)
         if task is None or task.get("status") not in {"claimed", "running"}:
             return False
@@ -179,11 +220,20 @@ def get_result(task_id: str) -> dict | None:
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+
     def _reply(self, code: int, body: dict, headers: dict[str, str] | None = None) -> None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        # Error responses may precede consuming the body. Never parse those
+        # unread bytes as another HTTP request on the same connection.
+        if code >= 400:
+            self.close_connection = True
+            self.send_header("Connection", "close")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -263,15 +313,28 @@ class RelayHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if self._rate_limited("task" if path == "/task" else "post"):
             return
+        if self.headers.get("Transfer-Encoding"):
+            self._reply(400, {"success": False, "error": "Transfer-Encoding is unsupported"})
+            return
         try:
+            if len(self.headers.get_all("Content-Length", [])) > 1:
+                raise ValueError("duplicate Content-Length")
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > MAX_BODY_BYTES:
-                self.close_connection = True
-                self._reply(413, {"success": False, "error": "request body too large"}, {"Connection": "close"})
+                self._reply(413, {"success": False, "error": "request body too large"})
                 return
-            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError("incomplete body")
+            payload = json.loads(body.decode("utf-8")) if length else {}
+        except TimeoutError:
+            self._reply(408, {"success": False, "error": "request body timed out"})
+            return
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
             self._reply(400, {"success": False, "error": "invalid JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._reply(400, {"success": False, "error": "JSON object required"})
             return
         if path == "/task":
             if not isinstance(payload, dict) or not str(payload.get("message", "")).strip():
@@ -285,6 +348,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._reply(200, {"success": True, "task_id": task["id"]})
             return
         if path == "/result":
+            if not isinstance(payload.get("success"), bool):
+                self._reply(400, {"success": False, "error": "success must be a boolean"})
+                return
             task_id = str(payload.get("task_id", ""))
             device_id = self._require_device()
             if REQUIRE_DEVICE_ID and device_id is None:

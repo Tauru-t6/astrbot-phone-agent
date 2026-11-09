@@ -77,6 +77,7 @@
     <div><div class="eyebrow">AstrBot Plugin</div><h1>手机 Agent 控制台</h1><p class="muted">App / Operit 双模式 · LAN / Tailscale 连接 · Shizuku 执行</p></div>
     <div class="toolbar"><span class="status"><i id="headerDot" class="dot"></i><span id="headerStatus">正在读取</span></span><button id="refreshBtn" type="button">刷新</button></div>
   </header>
+  <p id="refreshNotice" class="notice"></p>
   <nav class="tabs"><button class="tab active" data-view="overview" type="button">运行状态</button><button class="tab" data-view="settings" type="button">配置</button><button class="tab" data-view="policy" type="button">App 策略</button><button class="tab" data-view="logs" type="button">任务与审计</button></nav>
 
   <section id="overview" class="view active">
@@ -95,7 +96,7 @@
     </div>
     <div class="grid two" style="margin-top:14px">
       <article class="panel"><div class="panel-head"><div><h2>连接状态</h2><p class="muted">只显示状态，不回显密钥</p></div><div class="actions"><button id="testBtn" type="button">测试当前后端</button><button id="locationBtn" type="button">获取定位</button></div></div><div id="statusRows" class="rows"></div><p id="statusNotice" class="notice"></p><pre id="locationPre" hidden></pre><p id="locationNotice" class="notice"></p></article>
-      <article class="panel"><div class="panel-head"><div><h2>今日健康摘要</h2><p class="muted">来自 xiaomi-sync 的只读 SQLite</p></div><button id="healthBtn" type="button">刷新健康</button></div><div id="healthRows" class="rows"></div></article>
+      <article class="panel"><div class="panel-head"><div><h2>今日健康摘要</h2><p class="muted">来自 xiaomi-sync 的只读 SQLite</p></div><button id="healthBtn" type="button">刷新健康</button></div><div id="healthRows" class="rows"></div><p id="healthNotice" class="notice"></p></article>
     </div>
   </section>
 
@@ -103,19 +104,77 @@
 
   <section id="policy" class="view"><div class="grid two"><article class="panel"><div class="panel-head"><div><h2>按需 App 策略</h2><p class="muted">只在你或 LLM 调用时执行，不后台轮询</p></div></div><form><div class="form-grid"><label>动作<select id="policy_action"><option value="disable">禁用</option><option value="enable">恢复</option></select></label><label>持续分钟数<input id="policy_minutes" type="number" min="0" max="1440" value="0"><small class="muted">0 表示保持到下一次恢复</small></label><label class="full">目标 App（别名或包名）<input id="policy_package" placeholder="例如：抖音极速版 或 com.ss.android.ugc.aweme.lite"></label></div><div class="actions"><button id="policyApplyBtn" class="primary" type="button">执行策略</button><button id="policyRestoreBtn" type="button">立即恢复</button></div><p id="policyNotice" class="notice"></p></form><hr><form><label>临时模式默认目标 App<input id="sleep_guard_packages" placeholder="例如：B站,快手,优酷"></label><label>默认例外 App<input id="sleep_guard_exempt_apps" placeholder="例如：微信"></label><div class="actions"><button id="policyConfigSaveBtn" type="button">保存默认列表</button></div><p id="policyConfigNotice" class="notice"></p></form></article><article class="panel"><div class="panel-head"><div><h2>临时模式</h2><p class="muted">立即执行一次，到期自动恢复</p></div></div><form><label>持续分钟数<input id="sleep_minutes" type="number" min="5" max="1440" value="120"></label><label>临时目标 App（可留空使用默认）<input id="sleep_packages" placeholder="例如：B站,快手"></label><div class="actions"><button id="sleepStartBtn" class="primary" type="button">启动临时模式</button><button id="sleepStopBtn" class="danger" type="button">解除限制</button></div><p id="modeNotice" class="notice"></p></form></article></div></section>
 
-  <section id="logs" class="view"><div class="grid two"><article class="panel"><div class="panel-head"><div><h2>Operit 任务</h2><p class="muted">当前实例内存中的任务</p></div><div class="actions"><label class="toggle"><input id="autoRefresh" type="checkbox" checked> 自动刷新</label><button id="tasksBtn" type="button">刷新</button></div></div><div id="taskList" class="task-list"><div class="empty">暂无任务</div></div></article><article class="panel"><div class="panel-head"><div><h2>最近审计</h2><p class="muted">不含 Token 和消息正文</p></div><button id="auditBtn" type="button">刷新</button></div><div style="overflow:auto"><table><thead><tr><th>时间</th><th>操作</th><th>详情</th></tr></thead><tbody id="auditBody"></tbody></table></div></article></div><article class="panel" style="margin-top:14px"><div class="panel-head"><div><h2>提醒</h2><p class="muted">可查看当前提醒，取消错误或过期的项目</p></div><button id="remindersBtn" type="button">刷新</button></div><div id="reminderList" class="task-list"><div class="empty">暂无提醒</div></div><p id="reminderNotice" class="notice"></p></article></section>
+  <section id="logs" class="view"><div class="grid two"><article class="panel"><div class="panel-head"><div><h2>Operit 任务</h2><p class="muted">当前实例内存中的任务</p></div><div class="actions"><label class="toggle"><input id="autoRefresh" type="checkbox" checked> 自动刷新</label><button id="tasksBtn" type="button">刷新</button></div></div><p id="tasksNotice" class="notice"></p><div id="taskList" class="task-list"><div class="empty">暂无任务</div></div></article><article class="panel"><div class="panel-head"><div><h2>最近审计</h2><p class="muted">不含 Token 和消息正文</p></div><button id="auditBtn" type="button">刷新</button></div><div style="overflow:auto"><table><thead><tr><th>时间</th><th>操作</th><th>详情</th></tr></thead><tbody id="auditBody"></tbody></table></div><p id="auditNotice" class="notice"></p></article></div><article class="panel" style="margin-top:14px"><div class="panel-head"><div><h2>提醒</h2><p class="muted">在这里创建手机提醒，或查看、取消已有提醒</p></div><button id="remindersBtn" type="button">刷新</button></div><form id="reminderForm" style="margin-bottom:16px"><div class="form-grid"><label>提醒内容<input id="reminder_text" maxlength="500" placeholder="例如：喝水，休息一下" required></label><label>多少分钟后<input id="reminder_minutes" type="number" min="1" max="10080" step="1" value="15" required></label></div><div class="actions"><button id="reminderCreateBtn" class="primary" type="button">创建手机提醒</button></div><p class="muted">到期后同步至手机时间线与本地通知。手机需保持连接，通知需授予权限。</p></form><p id="reminderNotice" class="notice"></p><div id="reminderList" class="task-list"><div class="empty">暂无提醒</div></div><p id="reminderListNotice" class="notice"></p></article></section>
 </div>
 <script>
 const fallback = { apiGet: async () => ({success:false,error:'插件页面桥接不可用'}), apiPost: async () => ({success:false,error:'插件页面桥接不可用'}) };
 const bridge = window.AstrBotPluginPage || fallback;
-const $ = (id) => document.getElementById(id);
-const text = (value) => value === null || value === undefined || value === '' ? '--' : String(value);
-function setNotice(id, message, good=false){ const el=$(id); el.textContent=message||''; el.className='notice '+(message?(good?'good':'bad'):''); }
-async function get(name, params){ return bridge.apiGet(name, params); }
-async function post(name, body){ return bridge.apiPost(name, body); }
-function showBackendFields(){ document.querySelectorAll('[data-backend]').forEach(el=>el.hidden=el.dataset.backend!==$('control_backend').value); }
-function fillConfig(c){ ['control_backend','operit_base_url','app_direct_urls','allowed_user_ids','app_aliases_json','sleep_guard_packages','sleep_guard_exempt_apps'].forEach(k=>{ if($(k)) $(k).value = c[k] ?? ''; }); showBackendFields(); }
-function renderStatus(data){ const isApp=data.control_backend==='app', label=isApp?'AstrBot Phone Agent App':data.control_backend==='adb'?'ADB（旧版诊断）':'OperitAI'; $('backendLabel').textContent=label; const o=(isApp?data.device_app:data.operit)||{}, h=data.health||{}, s=data.sleep_mode||{}, sync=h.sync||{}; $('operitState').textContent=o.available?'在线':'离线'; $('operitState').className=o.available?'good-text':'bad-text'; $('operitVersion').textContent=text(o.app_version||o.version); $('healthState').textContent=!h.available?(h.error?'不可用':'未配置'):h.fresh?'已同步':'可能过期'; $('healthState').className=!h.available||h.fresh?'':'bad-text'; $('healthDate').textContent=sync.finished_at?`数据 ${text(h.latest?.date)} · 同步 ${sync.finished_at}`:text(h.latest?.date); $('sleepState').textContent=s.manual_active?'临时':'按需'; $('sleepUntil').textContent=text(s.until); $('taskCount').textContent=text(data.tasks); $('reminderCount').textContent='提醒 '+text(data.reminders); $('headerStatus').textContent=label+(o.available?' 在线':' 不可用'); $('headerDot').className='dot '+(o.available?'good':'bad'); const rows=[['后端',data.config?.control_backend],['直连地址',isApp?(o.base_url||data.config?.app_direct_urls):data.config?.operit_base_url],['Token',(isApp?data.config?.app_shared_token_configured:data.config?.operit_token_configured)?'已配置':'未配置'],['健康库',h.available?(h.fresh?'已连接':'已连接但可能过期'):(h.error?'不可用':'未配置')],['最近同步',sync.finished_at||'--'],['私人陪伴授权',data.config?.use_private_companion_auth?'已开启':'关闭']]; $('statusRows').innerHTML=rows.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); const latest=h.latest||{}; const health=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]]; $('healthRows').innerHTML=health.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); if(!document.getElementById('settings').classList.contains('active')) fillConfig(data.config||{}); }
+const $ = id => document.getElementById(id);
+const text = value => value === null || value === undefined || value === '' ? '--' : String(value);
+const pending = new Map();
+const dirtyFields = new Set();
+const savedValues = new Map();
+const configFields = ['control_backend','operit_base_url','app_direct_urls','allowed_user_ids','app_aliases_json','sleep_guard_packages','sleep_guard_exempt_apps'];
+const secretFields = ['operit_token','app_shared_token'];
+let configRevision = 0;
+function setNotice(id, message, good=false) {
+  const el = $(id);
+  el.textContent = message || '';
+  el.className = 'notice ' + (message ? (good ? 'good' : 'bad') : '');
+}
+async function request(method, name, data) {
+  const result = await bridge[method](name, data);
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw Error('服务器返回了无效数据');
+  if (result.success === false) throw Error(result.error || result.connection?.error || result.operit?.error || '操作失败，请重试');
+  return result;
+}
+const get = (name, params) => request('apiGet', name, params);
+const post = (name, body) => request('apiPost', name, body);
+function runAction(key, noticeId, buttons, operation) {
+  if (pending.has(key)) return pending.get(key);
+  const controls = buttons.map(button => typeof button === 'string' ? $(button) : button).filter(Boolean);
+  const previous = controls.map(button => button.disabled);
+  controls.forEach(button => { button.disabled = true; button.setAttribute('aria-busy','true'); });
+  const work = Promise.resolve().then(operation).catch(error => {
+    setNotice(noticeId, error?.message || '请求失败，请重试');
+  }).finally(() => {
+    controls.forEach((button,index) => { button.disabled = previous[index]; button.removeAttribute('aria-busy'); });
+    pending.delete(key);
+    document.querySelectorAll('[data-task-action]').forEach(button => button.disabled = pending.has('task:'+button.dataset.taskId));
+    document.querySelectorAll('[data-reminder-id]').forEach(button => button.disabled = pending.has('reminder:'+button.dataset.reminderId));
+  });
+  pending.set(key, work);
+  return work;
+}
+function showBackendFields() {
+  document.querySelectorAll('[data-backend]').forEach(el => el.hidden = el.dataset.backend !== $('control_backend').value);
+}
+function markDirty(key) {
+  if ($(key).value === (savedValues.get(key) ?? '')) dirtyFields.delete(key);
+  else dirtyFields.add(key);
+}
+function fillConfig(config) {
+  configFields.forEach(key => {
+    if (!dirtyFields.has(key)) {
+      $(key).value = config[key] ?? '';
+      savedValues.set(key, $(key).value);
+    }
+  });
+  showBackendFields();
+}
+function acceptSaved(submitted, config={}) {
+  Object.entries(submitted).forEach(([key,value]) => {
+    const secret = secretFields.includes(key);
+    const canonical = secret ? '' : String(config[key] ?? value);
+    savedValues.set(key, canonical);
+    if ($(key).value === value) {
+      $(key).value = canonical;
+      dirtyFields.delete(key);
+    } else markDirty(key); // Edits made while saving are still unsaved drafts.
+  });
+  showBackendFields();
+}
+function renderStatus(data, updateConfig=true){ const isApp=data.control_backend==='app', label=isApp?'AstrBot Phone Agent App':data.control_backend==='adb'?'ADB（旧版诊断）':'OperitAI'; $('backendLabel').textContent=label; const o=(isApp?data.device_app:data.operit)||{}, h=data.health||{}, s=data.sleep_mode||{}, sync=h.sync||{}; $('operitState').textContent=o.available?'在线':'离线'; $('operitState').className=o.available?'good-text':'bad-text'; $('operitVersion').textContent=text(o.app_version||o.version); $('healthState').textContent=!h.available?(h.error?'不可用':'未配置'):h.fresh?'已同步':'可能过期'; $('healthState').className=!h.available||h.fresh?'':'bad-text'; $('healthDate').textContent=sync.finished_at?`数据 ${text(h.latest?.date)} · 同步 ${sync.finished_at}`:text(h.latest?.date); $('sleepState').textContent=s.manual_active?'临时':'按需'; $('sleepUntil').textContent=text(s.until); $('taskCount').textContent=text(data.tasks); $('reminderCount').textContent='提醒 '+text(data.reminders); $('headerStatus').textContent=label+(o.available?' 在线':' 不可用'); $('headerDot').className='dot '+(o.available?'good':'bad'); const rows=[['后端',data.config?.control_backend],['直连地址',isApp?(o.base_url||data.config?.app_direct_urls):data.config?.operit_base_url],['Token',(isApp?data.config?.app_shared_token_configured:data.config?.operit_token_configured)?'已配置':'未配置'],['健康库',h.available?(h.fresh?'已连接':'已连接但可能过期'):(h.error?'不可用':'未配置')],['最近同步',sync.finished_at||'--'],['私人陪伴授权',data.config?.use_private_companion_auth?'已开启':'关闭']]; $('statusRows').innerHTML=rows.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); const latest=h.latest||{}; const health=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]]; $('healthRows').innerHTML=health.map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); if(updateConfig) fillConfig(data.config||{}); }
 function renderAutonomy(data){
   const t=v=>escapeHtml(text(v==null?'--':v));
   const row=(k,v,cls)=>`<div class="row"><span class="muted">${k}</span><span class="value">${cls?`<span class="pill ${cls}">${t(v)}</span>`:t(v)}</span></div>`;
@@ -127,17 +186,22 @@ function renderAutonomy(data){
     ['模式',ng.dry_run?'dry-run（只观察）':'真实执行',ng.dry_run?'warn':'bad'],
     ['监视应用',(ng.packages||[]).length+' 个'],
   ].map(r=>row(r[0],r[1],r[2])).join('');
-  const care=data.care||null;
+  const care=data.care && typeof data.care.autonomy_enabled==='boolean'?data.care:null;
+  const careUsers=Object.entries(care?.users||{}).filter(([,user])=>user && typeof user==='object');
   const careRows=care?[
     ['状态',care.autonomy_enabled?'已开启':'关闭',care.autonomy_enabled?'ok':'muted'],
     ['模式',care.mode==='preview'?'预览（不发送）':care.mode,care.mode==='preview'?'muted':'ok'],
     ['安静时段',care.quiet_hours||'--'],
-    ['今日配额',(care.sent_today||0)+'/'+(care.daily_limit||0)+'，剩 '+(care.remaining||0)],
-    ['今日评估',(care.eval_today||0)+' 次'],
   ]:[['状态','未收到关怀快照','muted']];
-  const recent=(care&&care.recent)||[];
+  for(const [userId,user] of careUsers){
+    careRows.push([t(userId)+' 今日配额',(user.sent_today??0)+'/'+(care.daily_limit??0)+'，剩 '+(user.remaining??0)]);
+    careRows.push([t(userId)+' 今日评估',(user.eval_today??0)+' 次']);
+  }
+  if(care && !careUsers.length) careRows.push(['今日记录','尚无用户评估记录','muted']);
+  const recent=careUsers.flatMap(([userId,user])=>(Array.isArray(user.recent)?user.recent:[]).map(item=>({...item,userId})))
+    .sort((a,b)=>Number(b.at||0)-Number(a.at||0)).slice(0,2);
   $('careRows').innerHTML=careRows.map(r=>row(r[0],r[1],r[2])).join('')
-    +recent.slice(-2).reverse().map(item=>row(t(item.outcome)+' · '+t(item.reason),item.detail||'',item.reason==='gated'?'warn':item.reason==='invalid'?'bad':item.reason==='preview'?'muted':'ok')).join('');
+    +recent.map(item=>row(t(item.userId)+' · '+t(item.outcome)+' · '+t(item.reason),item.detail||'',item.reason==='gated'?'warn':item.reason==='invalid'?'bad':item.reason==='preview'?'muted':'ok')).join('');
   const runs=data.task_runs||[];
   $('taskRunRows').innerHTML=runs.length?runs.slice(0,3).map(run=>{
     const s=run.summary||{}, bits=[];
@@ -150,25 +214,218 @@ function renderAutonomy(data){
     return row(t(run.goal||'任务'),(run.status||'')+(bits.length?' · '+bits.join(' · '):''),cls);
   }).join(''):row('暂无','还没有执行过任务','muted');
 }
-async function refresh(){ try { const data=await get('status'); if(data.success===false) throw Error(data.error||'读取失败'); renderStatus(data); renderAutonomy(data); setNotice('statusNotice',''); } catch(e){ $('headerStatus').textContent='状态读取失败'; $('headerDot').className='dot bad'; setNotice('statusNotice',e.message); } }
-async function loadHealth(){ try { const data=await get('health',{days:'7'}); const h=data.health||{}; const latest=(h.days||[])[0]||{}; $('healthRows').innerHTML=[['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]].map(r=>`<div class="row"><span class="muted">${r[0]}</span><span class="value">${escapeHtml(text(r[1]))}</span></div>`).join(''); } catch(e){ setNotice('statusNotice',e.message); } }
-async function saveConfig(){ try { let aliases=$('app_aliases_json').value.trim(); if(aliases) JSON.parse(aliases); const body={}; ['control_backend','operit_base_url','app_direct_urls','allowed_user_ids','app_aliases_json'].forEach(k=>body[k]=$(k).value); for(const key of ['operit_token','app_shared_token']) if($(key).value.trim()) body[key]=$(key).value.trim(); const r=await post('config',body); if(r.success===false) throw Error(r.error||'保存失败'); $('operit_token').value=''; $('app_shared_token').value=''; setNotice('saveNotice','已保存',true); await refresh(); } catch(e){ setNotice('saveNotice',e.message); } }
-async function savePolicyDefaults(){ const body={sleep_guard_packages:$('sleep_guard_packages').value,sleep_guard_exempt_apps:$('sleep_guard_exempt_apps').value}; try { const r=await post('config',body); if(r.success===false) throw Error(r.error||'保存失败'); $('sleep_guard_packages').value=r.config?.sleep_guard_packages??body.sleep_guard_packages; $('sleep_guard_exempt_apps').value=r.config?.sleep_guard_exempt_apps??body.sleep_guard_exempt_apps; setNotice('policyConfigNotice','默认列表已保存',true); } catch(e){ setNotice('policyConfigNotice',e.message); } }
-async function applyPolicy(action){ const packageName=$('policy_package').value.trim(); if(!packageName){ setNotice('policyNotice','请填写目标 App'); return; } const minutes=action==='disable'?Number($('policy_minutes').value||0):0; try { const r=await post('app_policy',{action:action,package:packageName,minutes:minutes}); if(r.success===false) throw Error(r.error||'策略执行失败'); setNotice('policyNotice',action==='disable'?'App 已按策略处理':'App 已恢复',true); await refresh(); } catch(e){ setNotice('policyNotice',e.message); } }
-async function loadLocation(){ $('locationBtn').disabled=true; try { const r=await get('location',{high_accuracy:'false',include_address:'false',timeout:'10'}); if(r.success===false) throw Error(r.error||r.operit?.error||'定位失败'); $('locationPre').hidden=false; $('locationPre').textContent=JSON.stringify(r.location||r,null,2); setNotice('locationNotice','已读取一次定位；页面不会保存坐标',true); } catch(e){ setNotice('locationNotice',e.message); } finally { $('locationBtn').disabled=false; } }
-async function testBackend(){ $('testBtn').disabled=true; try { const r=await post('test_backend',{}); setNotice('statusNotice',r.success?'当前后端连接正常':'当前后端不可用：'+(r.connection?.error||r.error||'未知错误'),r.success); await refresh(); } catch(e){ setNotice('statusNotice',e.message); } finally { $('testBtn').disabled=false; } }
-async function sleepMode(mode){ const body={mode}; if(mode==='start'){ body.minutes=Number($('sleep_minutes').value); body.packages=$('sleep_packages').value; } try { const r=await post('sleep_mode',body); if(r.success===false) throw Error(r.error||'操作失败'); setNotice('modeNotice',mode==='start'?'临时模式已启动':'限制已解除',true); await refresh(); } catch(e){ setNotice('modeNotice',e.message); } }
-function escapeHtml(value){ return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function taskBadge(status){ const good=['completed','done'].includes(status), bad=['failed','cancelled'].includes(status); return `<span class="badge ${good?'good':bad?'bad':''}">${escapeHtml(status||'unknown')}</span>`; }
-async function taskAction(id, action){ try { const r=await post(action,{task_id:id}); if(r.success===false) throw Error(r.error||'操作失败'); await loadTasks(); } catch(e){ setNotice('statusNotice',e.message); } }
-async function loadTasks(){ const r=await get('tasks'); const tasks=r.tasks||{}; const entries=Object.entries(tasks).reverse(); $('taskList').innerHTML=entries.length?entries.map(([id,t])=>`<div class="task"><div class="task-head"><strong>${escapeHtml(id)}</strong>${taskBadge(t.status)}</div><div class="muted">${escapeHtml(t.task||'')} · ${escapeHtml(t.created_at||'')}</div><div class="actions" style="margin-top:8px">${['queued','running'].includes(t.status)?`<button type="button" data-task-action="operit_task_cancel" data-task-id="${escapeHtml(id)}">取消等待</button>`:''}${['failed','cancelled'].includes(t.status)?`<button type="button" data-task-action="operit_task_retry" data-task-id="${escapeHtml(id)}">重试</button>`:''}</div></div>`).join(''):'<div class="empty">暂无任务</div>'; document.querySelectorAll('[data-task-action]').forEach(btn=>btn.onclick=()=>taskAction(btn.dataset.taskId,btn.dataset.taskAction)); }
-async function loadAudit(){ const r=await get('audit',{limit:'50'}); $('auditBody').innerHTML=(r.records||[]).slice().reverse().map(x=>`<tr><td>${text(x.time)}</td><td>${text(x.operation)}</td><td>${Object.entries(x).filter(([k])=>!['time','operation'].includes(k)).map(([k,v])=>`${k}=${typeof v==='object'?JSON.stringify(v):v}`).join(' ')}</td></tr>`).join(''); }
-async function loadReminders(){ const r=await get('reminders'); const items=Object.entries(r.reminders||{}); $('reminderList').innerHTML=items.length?items.map(([id,item])=>`<div class="task"><div class="task-head"><strong>${escapeHtml(item.text||'')}</strong><span class="badge">${escapeHtml(id)}</span></div><div class="muted">到期：${escapeHtml(new Date(Number(item.due||0)*1000).toLocaleString())}</div><div class="actions" style="margin-top:8px"><button type="button" data-reminder-id="${escapeHtml(id)}">取消提醒</button></div></div>`).join(''):'<div class="empty">暂无提醒</div>'; document.querySelectorAll('[data-reminder-id]').forEach(btn=>btn.onclick=()=>cancelReminder(btn.dataset.reminderId)); }
-async function cancelReminder(id){ try { const r=await post('reminders',{action:'cancel',reminder_id:id}); if(r.success===false) throw Error(r.error||'取消失败'); setNotice('reminderNotice','提醒已取消',true); await loadReminders(); } catch(e){ setNotice('reminderNotice',e.message); } }
-document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));btn.classList.add('active');$(btn.dataset.view).classList.add('active');}));
-$('control_backend').onchange=showBackendFields; $('refreshBtn').onclick=refresh; $('testBtn').onclick=testBackend; $('locationBtn').onclick=loadLocation; $('healthBtn').onclick=loadHealth; $('saveBtn').onclick=saveConfig; $('policyApplyBtn').onclick=()=>applyPolicy($('policy_action').value); $('policyRestoreBtn').onclick=()=>applyPolicy('enable'); $('policyConfigSaveBtn').onclick=savePolicyDefaults; $('sleepStartBtn').onclick=()=>sleepMode('start'); $('sleepStopBtn').onclick=()=>sleepMode('stop'); $('tasksBtn').onclick=loadTasks; $('auditBtn').onclick=loadAudit; $('remindersBtn').onclick=loadReminders;
-let refreshTimer=null; function scheduleRefresh(){ if(refreshTimer) clearInterval(refreshTimer); if($('autoRefresh').checked) refreshTimer=setInterval(()=>{ refresh(); loadTasks(); loadReminders(); },15000); } $('autoRefresh').onchange=scheduleRefresh; scheduleRefresh();
-refresh(); loadTasks(); loadAudit(); loadReminders();
+function refresh() {
+  return runAction('status', 'refreshNotice', ['refreshBtn'], async () => {
+    const revision = configRevision;
+    try {
+      const data = await get('status');
+      renderStatus(data, revision === configRevision);
+      renderAutonomy(data);
+      setNotice('refreshNotice','');
+    } catch (error) {
+      $('headerStatus').textContent = '状态读取失败';
+      $('headerDot').className = 'dot bad';
+      throw error;
+    }
+  });
+}
+function loadHealth() {
+  return runAction('health','healthNotice',['healthBtn'],async () => {
+    const data = await get('health',{days:'7'});
+    const latest = (data.health?.days || [])[0] || {};
+    $('healthRows').innerHTML = [['日期',latest.date],['步数',latest.steps],['睡眠（分钟）',latest.sleep_total_min],['平均心率',latest.hr_avg],['静息心率',latest.hr_resting],['血氧均值',latest.spo2_avg]].map(([label,value]) => `<div class="row"><span class="muted">${label}</span><span class="value">${escapeHtml(text(value))}</span></div>`).join('');
+    setNotice('healthNotice','');
+  });
+}
+function saveConfig() {
+  return runAction('config','saveNotice',['saveBtn'],async () => {
+    const aliases = $('app_aliases_json').value.trim();
+    if (aliases) {
+      const parsed = JSON.parse(aliases);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('App 别名必须是 JSON 对象');
+    }
+    const submitted = Object.fromEntries(configFields.slice(0,5).map(key => [key,$(key).value]));
+    secretFields.forEach(key => { if ($(key).value.trim()) submitted[key] = $(key).value; });
+    configRevision++;
+    const result = await post('config',submitted);
+    configRevision++;
+    acceptSaved(submitted,result.config);
+    setNotice('saveNotice','已保存；保存期间的新修改仍保留在输入框中',true);
+    await refresh();
+  });
+}
+function savePolicyDefaults() {
+  return runAction('policy-config','policyConfigNotice',['policyConfigSaveBtn'],async () => {
+    const submitted = Object.fromEntries(configFields.slice(5).map(key => [key,$(key).value]));
+    configRevision++;
+    const result = await post('config',submitted);
+    configRevision++;
+    acceptSaved(submitted,result.config);
+    setNotice('policyConfigNotice','默认列表已保存',true);
+  });
+}
+function integerInput(id, minimum, maximum, label) {
+  const value = Number($(id).value);
+  if (!$(id).value.trim() || !Number.isInteger(value) || value < minimum || value > maximum) throw Error(`${label}须为 ${minimum}–${maximum} 的整数`);
+  return value;
+}
+function applyPolicy(action) {
+  return runAction('policy','policyNotice',['policyApplyBtn','policyRestoreBtn'],async () => {
+    const packageName = $('policy_package').value.trim();
+    if (!packageName) throw Error('请填写目标 App');
+    const minutes = action === 'disable' ? integerInput('policy_minutes',0,1440,'持续分钟数') : 0;
+    await post('app_policy',{action,package:packageName,minutes});
+    setNotice('policyNotice',action === 'disable' ? 'App 已按策略处理' : 'App 已恢复',true);
+    await refresh();
+  });
+}
+function loadLocation() {
+  return runAction('location','locationNotice',['locationBtn'],async () => {
+    const result = await get('location',{high_accuracy:'false',include_address:'false',timeout:'10'});
+    $('locationPre').hidden = false;
+    $('locationPre').textContent = JSON.stringify(result.location || result,null,2);
+    setNotice('locationNotice','已读取一次定位；页面不会保存坐标',true);
+  });
+}
+function testBackend() {
+  return runAction('test','statusNotice',['testBtn'],async () => {
+    await post('test_backend',{});
+    await refresh();
+    setNotice('statusNotice','当前后端连接正常',true);
+  });
+}
+function sleepMode(mode) {
+  return runAction('sleep','modeNotice',['sleepStartBtn','sleepStopBtn'],async () => {
+    const body = {mode};
+    if (mode === 'start') {
+      body.minutes = integerInput('sleep_minutes',5,1440,'持续分钟数');
+      body.packages = $('sleep_packages').value;
+    }
+    await post('sleep_mode',body);
+    setNotice('modeNotice',mode === 'start' ? '临时模式已启动' : '限制已解除',true);
+    await refresh();
+  });
+}
+function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function taskBadge(status) {
+  const good = ['completed','done'].includes(status), bad = ['failed','cancelled','interrupted'].includes(status);
+  return `<span class="badge ${good ? 'good' : bad ? 'bad' : ''}">${escapeHtml(status || 'unknown')}</span>`;
+}
+function taskAction(id, action, button) {
+  return runAction('task:'+id,'tasksNotice',[button],async () => {
+    await post(action,{task_id:id});
+    setNotice('tasksNotice','操作已提交',true);
+    await loadTasks();
+  });
+}
+function loadTasks() {
+  return runAction('tasks','tasksNotice',['tasksBtn'],async () => {
+    const result = await get('tasks');
+    const entries = Object.entries(result.tasks || {}).reverse();
+    $('taskList').innerHTML = entries.length ? entries.map(([id,task]) => `<div class="task"><div class="task-head"><strong>${escapeHtml(id)}</strong>${taskBadge(task.status)}</div><div class="muted">${escapeHtml(task.task || '')} · ${escapeHtml(task.created_at || '')}</div><div class="actions" style="margin-top:8px">${['queued','running'].includes(task.status) ? `<button type="button" data-task-action="operit_task_cancel" data-task-id="${escapeHtml(id)}">取消等待</button>` : ''}${['failed','cancelled','interrupted'].includes(task.status) ? `<button type="button" data-task-action="operit_task_retry" data-task-id="${escapeHtml(id)}">重试</button>` : ''}</div></div>`).join('') : '<div class="empty">暂无任务</div>';
+    document.querySelectorAll('[data-task-action]').forEach(button => {
+      button.disabled = pending.has('task:'+button.dataset.taskId);
+      button.onclick = () => taskAction(button.dataset.taskId,button.dataset.taskAction,button);
+    });
+    setNotice('tasksNotice','');
+  });
+}
+function loadAudit() {
+  return runAction('audit','auditNotice',['auditBtn'],async () => {
+    const result = await get('audit',{limit:'50'});
+    $('auditBody').innerHTML = (result.records || []).slice().reverse().map(record => {
+      const detail = Object.entries(record).filter(([key]) => !['time','operation'].includes(key)).map(([key,value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`).join(' ');
+      return `<tr><td>${escapeHtml(text(record.time))}</td><td>${escapeHtml(text(record.operation))}</td><td>${escapeHtml(detail)}</td></tr>`;
+    }).join('');
+    setNotice('auditNotice','');
+  });
+}
+function loadReminders() {
+  return runAction('reminders','reminderListNotice',['remindersBtn'],async () => {
+    const result = await get('reminders');
+    const items = Object.entries(result.reminders || {});
+    $('reminderList').innerHTML = items.length ? items.map(([id,item]) => `<div class="task"><div class="task-head"><strong>${escapeHtml(item.text || '')}</strong><span class="badge">${escapeHtml(id)}</span></div><div class="muted">到期：${escapeHtml(new Date(Number(item.due || 0)*1000).toLocaleString())} · ${item.source === 'app' ? '手机提醒' : '聊天提醒'}</div><div class="actions" style="margin-top:8px"><button type="button" data-reminder-id="${escapeHtml(id)}">取消提醒</button></div></div>`).join('') : '<div class="empty">暂无提醒</div>';
+    document.querySelectorAll('[data-reminder-id]').forEach(button => {
+      button.disabled = pending.has('reminder:'+button.dataset.reminderId);
+      button.onclick = () => cancelReminder(button.dataset.reminderId,button);
+    });
+    setNotice('reminderListNotice','');
+  });
+}
+function cancelReminder(id, button) {
+  return runAction('reminder:'+id,'reminderListNotice',[button],async () => {
+    await post('reminders',{action:'cancel',reminder_id:id});
+    await loadReminders();
+    setNotice('reminderListNotice','提醒已取消',true);
+  });
+}
+const reminderRequests = new Map();
+function newRequestId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes,byte => byte.toString(16).padStart(2,'0')).join('');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+function createReminder() {
+  return runAction('reminder-create','reminderNotice',['reminderCreateBtn'],async () => {
+    const reminderText = $('reminder_text').value.trim();
+    if (!reminderText || reminderText.length > 500) throw Error('提醒内容须为 1–500 个字符');
+    const minutes = integerInput('reminder_minutes',1,10080,'提醒分钟数');
+    const signature = JSON.stringify([reminderText,minutes]);
+    if (!reminderRequests.has(signature)) reminderRequests.set(signature,newRequestId());
+    const requestId = reminderRequests.get(signature);
+    // Keep the same UUID after a lost response; the server will return the
+    // original reminder instead of scheduling a second copy.
+    await post('app/reminders',{text:reminderText,minutes,request_id:requestId});
+    reminderRequests.delete(signature);
+    if ($('reminder_text').value.trim() === reminderText && Number($('reminder_minutes').value) === minutes) $('reminder_text').value = '';
+    setNotice('reminderNotice','手机提醒已创建；手机离线时会在重新连接后同步',true);
+    await loadReminders();
+  });
+}
+configFields.concat(secretFields).forEach(key => {
+  ['input','change'].forEach(event => $(key).addEventListener(event,() => markDirty(key)));
+});
+document.querySelectorAll('.notice').forEach(el => { el.setAttribute('role','status'); el.setAttribute('aria-live','polite'); });
+document.querySelectorAll('form').forEach(form => form.addEventListener('submit',event => event.preventDefault()));
+document.querySelectorAll('.tab').forEach(button => button.addEventListener('click',() => {
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+  button.classList.add('active');
+  $(button.dataset.view).classList.add('active');
+}));
+$('control_backend').onchange = showBackendFields;
+$('refreshBtn').onclick = refresh;
+$('testBtn').onclick = testBackend;
+$('locationBtn').onclick = loadLocation;
+$('healthBtn').onclick = loadHealth;
+$('saveBtn').onclick = saveConfig;
+$('policyApplyBtn').onclick = () => applyPolicy($('policy_action').value);
+$('policyRestoreBtn').onclick = () => applyPolicy('enable');
+$('policyConfigSaveBtn').onclick = savePolicyDefaults;
+$('sleepStartBtn').onclick = () => sleepMode('start');
+$('sleepStopBtn').onclick = () => sleepMode('stop');
+$('tasksBtn').onclick = loadTasks;
+$('auditBtn').onclick = loadAudit;
+$('remindersBtn').onclick = loadReminders;
+$('reminderCreateBtn').onclick = createReminder;
+let refreshTimer = null;
+function scheduleRefresh() {
+  if (refreshTimer !== null) clearTimeout(refreshTimer);
+  refreshTimer = null;
+  if (document.hidden || !$('autoRefresh').checked) return;
+  refreshTimer = setTimeout(async () => {
+    refreshTimer = null;
+    if (!document.hidden && $('autoRefresh').checked) await Promise.all([refresh(),loadTasks(),loadReminders()]);
+    scheduleRefresh();
+  },15000);
+}
+$('autoRefresh').onchange = scheduleRefresh;
+document.addEventListener('visibilitychange',scheduleRefresh);
+scheduleRefresh();
+Promise.all([refresh(),loadTasks(),loadAudit(),loadReminders()]);
 </script>
 </body>
 </html>

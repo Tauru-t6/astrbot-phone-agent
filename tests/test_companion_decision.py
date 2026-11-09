@@ -594,13 +594,53 @@ class BudgetReservationTests(unittest.IsolatedAsyncioTestCase):
         async def slow(*args, **kwargs):
             for item in self.plugin._reservations_for(USER):
                 item["expires_at"] = time.time() - 1
-            self.plugin._sweep_reservations(USER)
             return '{"intent":"send_message","message":"在吗"}'
 
         result = await self.run_generation(AsyncMock(side_effect=slow))
         self.assertEqual(result, "")
         self.assertEqual(self.plugin._decision_count.get(USER, 0), 0)
         self.assertEqual(self.plugin._reservations_for(USER)[0]["status"], "released")
+
+    async def test_cancelled_model_releases_reservation(self):
+        started = asyncio.Event()
+
+        async def model(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(self.run_generation(AsyncMock(side_effect=model)))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.plugin._decision_count[USER], 0)
+        self.assertEqual(self.plugin._reservations_for(USER)[0]["status"], "released")
+
+    async def test_cancelled_observation_releases_reservation(self):
+        started = asyncio.Event()
+
+        async def observe(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        original = AsyncMock()
+        with patch.object(self.plugin, "_enrich", new=observe):
+            task = asyncio.create_task(self.run_generation(original))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        original.assert_not_awaited()
+        self.assertEqual(self.plugin._decision_count[USER], 0)
+
+    async def test_old_reservation_failure_does_not_refund_todays_quota(self):
+        reservation, _ = await self.plugin._reserve_decision(USER)
+        await self.plugin._commit_decision_generated(reservation)
+        tomorrow = datetime.now() + timedelta(days=1)
+        self.plugin._reset_decision_day(USER, tomorrow)
+        self.plugin._decision_count[USER] = 1
+        await self.plugin._mark_delivery_failed(reservation["id"])
+        self.assertEqual(self.plugin._decision_count[USER], 1)
 
     async def test_p1b_release_is_idempotent(self):
         """Self-review: a double release must not debit the count twice."""
@@ -674,7 +714,7 @@ class CareDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_evaluate_care_delivers_the_message(self):
-        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1000000001")
+        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1000000001", "owner")
         self.assertTrue(result["delivered"])
         self.context.send_message.assert_awaited_once()
         umo, payload = self.context.send_message.await_args.args
@@ -683,7 +723,38 @@ class CareDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delivery_failure_is_recorded_not_claimed(self):
         self.context.send_message = AsyncMock(side_effect=RuntimeError("qq offline"))
-        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1000000001")
+        result = await self.plugin.evaluate_care(USER, "tauru:FriendMessage:1000000001", "owner")
         self.assertFalse(result["delivered"])
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "deliver_failed")
         status = json.loads(Path(self.config["care_status_path"]).read_text(encoding="utf-8"))
         self.assertEqual(status["users"][USER]["recent"][-1]["reason"], "deliver_failed")
+
+    async def test_scheduler_rejects_unauthorized_user_before_generation(self):
+        result = await self.plugin.evaluate_care("other", "tauru:FriendMessage:other", "owner")
+        self.assertEqual(result["reason"], "user_not_eligible")
+        self.plugin._wrapped.assert_not_awaited()
+        self.context.send_message.assert_not_awaited()
+
+    async def test_role_lookup_failure_blocks_scheduler(self):
+        def broken_role(*args):
+            raise RuntimeError("authorization unavailable")
+
+        target = types.SimpleNamespace(_private_user_role=broken_role)
+        with patch.object(self.plugin, "_companion", return_value=target):
+            result = await self.plugin.evaluate_care(USER, USER_DICT["umo"], "owner")
+        self.assertEqual(result["reason"], "user_not_eligible")
+        self.context.send_message.assert_not_awaited()
+
+    async def test_scheduler_updates_reservation_after_real_delivery_result(self):
+        async def host(user, name, trigger, action_context=""):
+            return '{"intent":"send_message","message":"休息一下"}'
+
+        target = types.SimpleNamespace(_generate_proactive_message_with_llm=host)
+        with patch.object(self.plugin, "_companion", return_value=target), patch.object(self.plugin, "_phone", return_value=object()):
+            await self.plugin._install_bridge_once()
+            self.context.send_message.side_effect = RuntimeError("offline")
+            result = await self.plugin.evaluate_care(USER, USER_DICT["umo"], "owner")
+        self.assertFalse(result["sent"])
+        self.assertEqual(self.plugin._decision_count[USER], 0)
+        self.assertEqual(self.plugin._reservations_for(USER)[0]["status"], "failed")

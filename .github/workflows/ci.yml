@@ -13,10 +13,15 @@ jobs:
         with:
           python-version: "3.11"
       - name: Compile plugin modules
-        run: python -m py_compile main.py device_app.py companion-context/main.py deploy/relay/relay_server.py
+        run: python -m py_compile main.py model_planning.py device_app.py task_runner.py care_scheduler.py storage.py http_transport.py companion-context/main.py companion-context/v2_adapter.py deploy/relay/relay_server.py
       - name: Validate configuration JSON
         run: python -m json.tool _conf_schema.json >/dev/null && python -m json.tool companion-context/_conf_schema.json >/dev/null
       - name: Install test dependencies
         run: python -m pip install quart pytest
       - name: Run plugin and relay tests
         run: python -m pytest tests -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run dashboard regression tests
+        run: node --test tests/test_dashboard.js

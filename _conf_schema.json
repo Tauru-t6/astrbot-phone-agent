@@ -323,5 +323,25 @@
     "type": "int",
     "default": 10,
     "description": "Give up on the model rewrite after this many seconds and send the fixed template instead, from 3 to 30."
+  },
+  "enable_llm_task_planner": {
+    "type": "bool",
+    "default": false,
+    "description": "Use a bounded LLM plan for multi-step phone proposals. Existing approvals and action allowlist still apply."
+  },
+  "task_planner_provider_id": {
+    "type": "text",
+    "default": "",
+    "description": "Optional AstrBot provider ID. Empty uses the provider selected for the requesting session."
+  },
+  "task_planner_timeout_seconds": {
+    "type": "int",
+    "default": 20,
+    "description": "Maximum model planning time. No automatic retry."
+  },
+  "task_planner_max_steps": {
+    "type": "int",
+    "default": 6,
+    "description": "Maximum planned actions, excluding the mandatory observation. Range 1-10."
   }
 }

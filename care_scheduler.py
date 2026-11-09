@@ -35,6 +35,9 @@ class CareSchedulerMixin:
 
     def _companion_care(self) -> Any | None:
         """Find the companion bridge's evaluate_care(), if it is installed."""
+        current = getattr(self, "_phone_companion_context", None)
+        if current is not None and callable(getattr(current, "evaluate_care", None)):
+            return current
         for name in (
             "data.plugins.astrbot_plugin_private_companion.main",
             "astrbot_plugin_private_companion.main",

@@ -9,6 +9,21 @@ Android 前端：[AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-p
 
 [项目主页](README.md) · [English Guide](README.en.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
 
+## 0.9.0 自主决策与 7.x 适配
+
+开启 `enable_llm_task_planner` 可生成有序多步提案；未知应用或含糊目标会要求澄清，现有审批、动作范围和逐步核验继续生效。关怀桥接 0.3.0 适配 Private Companion 7.x，参考对应私聊的近期对话，减少忙碌时和重复内容的打扰。详见[适配说明](docs/PRIVATE_COMPANION_719_ADAPTATION.md)和[真机验证记录](docs/PHYSICAL_DEVICE_VALIDATION.md)。
+
+## 本地优化版的行为变化
+
+- 私聊批准/拒绝任务只依赖任务执行开关与用户授权，不再要求开启夜间守护。
+- 控制台的「任务与审计」可创建手机提醒；失败后重试复用请求 ID，避免重复提醒。刷新保留未保存的配置和策略输入，操作进行时防止重复提交，隐藏页面暂停自动轮询。
+- 设备命令接口重新检查总开关、App 后端、各功能开关和受保护包名；`phone_action(screen_text)` 同样遵守观察开关和群聊隐私限制。
+- Operit 直连超时、响应断开或明确拒绝时不自动重放到 Relay；只有明确连接未建立时才自动切换。执行结果未知时，先确认手机实际状态，再决定是否手动重试。
+- 后台任务重试受后端、任务状态和并发额度限制。通知落盘失败可安全重试；任务、提醒和通知共用原子文件写入，审计仅从日志尾部读取，避免日志增大拖慢界面。
+- Relay 仅允许有效租约的领取者续租/提交结果，已领取任务计入容量；空轮询不再写盘。短传输时限同步到设备命令期限，成功核验不能使用操作之前的旧状态。临时策略续期/提前恢复失败保留原自动恢复安排。
+
+详细变更及验证范围见 [优化记录](docs/OPTIMIZATION_REPORT.md)。
+
 ## 一、整体结构
 
 ```text
@@ -199,6 +214,10 @@ unset OPERIT_TOKEN
 <astrbot-data>/plugins/astrbot_plugin_phone_agent/
 ├── main.py
 ├── device_app.py
+├── task_runner.py
+├── care_scheduler.py
+├── storage.py
+├── http_transport.py
 ├── metadata.yaml
 ├── _conf_schema.json
 ├── pages/
@@ -207,7 +226,7 @@ unset OPERIT_TOKEN
 └── README.zh-CN.md
 ```
 
-如果变成 `astrbot_plugin_phone_agent/astrbot-phone-agent-main/main.py`，说明多套了一层目录，AstrBot 不会正确加载。
+安装或升级时复制完整插件目录，避免遗漏内部模块。如果变成 `astrbot_plugin_phone_agent/astrbot-phone-agent-main/main.py`，说明多套了一层目录，AstrBot 不会正确加载。
 
 ### 5.2 使用 Git 安装（推荐）
 
@@ -854,3 +873,7 @@ App 提醒网络重试应复用同一个 `request_id`；重复请求会返回原
 - [App API v2](docs/APP_API_V2.md)
 - [English Guide](README.en.md)
 - [更新日志](CHANGELOG.md)
+
+## 许可证
+
+本仓库自有代码采用 [MIT License](LICENSE)。第三方依赖和可选联动插件保留各自许可；不对 Private Companion 上游代码及服务器本地修改重新授权。

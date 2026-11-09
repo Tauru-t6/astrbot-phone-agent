@@ -934,6 +934,76 @@ class PolicyLeaseTests(unittest.IsolatedAsyncioTestCase):
         saved = json.loads(Path(self.config["policy_state_path"]).read_text(encoding="utf-8"))
         self.assertIn("manual", saved["packages"][VIDEO]["leases"])
 
+    async def test_failed_renewal_preserves_existing_deadline_and_timer(self):
+        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        lease = self.leases()["manual"]
+        deadline, timer = lease.until, lease.task
+        self.device.return_value = {"success": False, "error": "device offline"}
+        result = await self.plugin._execute_app_policy(VIDEO, "disable", 60, source="manual")
+        self.assertFalse(result["success"])
+        self.assertIs(self.leases()["manual"], lease)
+        self.assertEqual(lease.until, deadline)
+        self.assertIs(lease.task, timer)
+        self.assertFalse(timer.cancelling())
+        self.device.return_value = {"success": True}
+        self.plugin._cancel_policy_expiry(VIDEO, "manual")
+        await self.plugin._expire_policy_lease(VIDEO, "manual", 0)
+        self.device.assert_awaited_with(VIDEO, "enable")
+        self.assertEqual(self.leases(), {})
+
+    async def test_raising_renewal_preserves_existing_lease(self):
+        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        lease = self.leases()["manual"]
+        timer = lease.task
+        self.device.side_effect = RuntimeError("backend unavailable")
+        result = await self.plugin._execute_app_policy(VIDEO, "disable", 0, source="manual")
+        self.assertFalse(result["success"])
+        self.assertIs(self.leases()["manual"], lease)
+        self.assertIs(lease.task, timer)
+        self.assertFalse(timer.cancelling())
+        self.device.side_effect = None
+
+    async def test_failed_first_disable_does_not_create_an_owner(self):
+        self.device.return_value = {"success": False, "error": "rejected"}
+        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        self.assertEqual(self.leases(), {})
+        self.assertNotIn(VIDEO, self.plugin._policy_leases)
+
+    async def test_early_release_cancels_only_its_own_timer(self):
+        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        await self.plugin._execute_app_policy(VIDEO, "disable", 60, source="night_guard")
+        released = self.leases()["manual"]
+        timer = released.task
+        other_timer = self.leases()["night_guard"].task
+        result = await self.plugin._execute_app_policy(VIDEO, "enable", source="manual")
+        self.assertTrue(result["still_suspended"])
+        self.assertTrue(timer.cancelling())
+        self.assertIsNone(released.task)
+        self.assertFalse(other_timer.cancelling())
+
+    async def test_successful_final_release_cancels_its_timer(self):
+        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        released = self.leases()["manual"]
+        timer = released.task
+        result = await self.plugin._execute_app_policy(VIDEO, "enable", source="manual")
+        self.assertTrue(result["success"])
+        self.assertTrue(timer.cancelling())
+        self.assertIsNone(released.task)
+        self.assertEqual(self.leases(), {})
+
+    async def test_failed_early_restore_preserves_scheduled_recovery(self):
+        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        lease = self.leases()["manual"]
+        timer, deadline = lease.task, lease.until
+        self.device.return_value = {"success": False, "error": "offline"}
+        result = await self.plugin._execute_app_policy(VIDEO, "enable", source="manual")
+        self.assertTrue(result["restore_pending"])
+        self.assertIs(self.leases()["manual"], lease)
+        self.assertIs(lease.task, timer)
+        self.assertFalse(timer.cancelling())
+        self.assertEqual(lease.until, deadline)
+        self.device.return_value = {"success": True}
+
     async def test_state_file_is_versioned_and_leaves_no_temp_files(self):
         await self.plugin._execute_app_policy(VIDEO, "disable", 0, source="manual")
         await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="night_guard")

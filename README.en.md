@@ -16,6 +16,21 @@ The default control backend is Operit. Set `control_backend=app` for the standal
 
 Legacy backend aliases `phone_buddy`, `native_app`, and `own_frontend` map to `app`; `operitai` and `operit_ai` map to `operit`. `adb` remains diagnostic-only.
 
+## LLM planning and Private Companion 7.x
+
+Version 0.9.0 adds optional bounded multi-step LLM planning and Phone Companion Context 0.3.0 for Private Companion 7.x. Enable `enable_llm_task_planner` to generate ordered proposals; existing action allowlists, approval and per-step verification still apply. Unknown apps or ambiguous goals return a clarification. Care uses the matching private conversation, respects recent activity and suppresses repeated messages. See [compatibility and settings](docs/PRIVATE_COMPANION_719_ADAPTATION.md) and [physical-device validation](docs/PHYSICAL_DEVICE_VALIDATION.md).
+
+## Local optimization changes
+
+- Private chat task approvals depend on task execution and user authorization, independently of the night guard.
+- The dashboard can create phone reminders. Retrying a failed submission retains the request ID, refreshes preserve unsaved settings, and busy actions suppress duplicate submissions. Automatic polling pauses while the page is hidden.
+- Device commands recheck the master switch, App backend, feature switches and protected packages. `phone_action(screen_text)` also respects observation settings and group privacy.
+- Operit timeouts, interrupted responses and explicit rejections are not automatically replayed through Relay. Only a definite connection failure permits automatic fallback; check the phone state before manually retrying an uncertain result.
+- Background retries enforce the backend, task state and concurrency budget. Failed notification persistence is retryable. Tasks, reminders and notifications share atomic JSON writes, and audit reads inspect only a bounded log tail.
+- Relay result submissions and renewals require a current claim lease, and claimed tasks count towards capacity. Idle polls no longer write state. Short transport budgets also bound device command deadlines; post-action verification rejects older observations. Failed policy renewals or early restores preserve the original expiry timer.
+
+See the [optimization report](docs/OPTIMIZATION_REPORT.md) for implementation and validation details.
+
 ## 1. Architecture
 
 ```text
@@ -228,6 +243,10 @@ The correct structure is:
 <astrbot-data>/plugins/astrbot_plugin_phone_agent/
 ├── main.py
 ├── device_app.py
+├── task_runner.py
+├── care_scheduler.py
+├── storage.py
+├── http_transport.py
 ├── metadata.yaml
 ├── _conf_schema.json
 ├── pages/
@@ -236,7 +255,7 @@ The correct structure is:
 └── README.en.md
 ```
 
-An extra `astrbot-phone-agent-main` directory prevents AstrBot from loading the plugin correctly.
+Copy the entire plugin directory when installing or upgrading so that internal modules are included. An extra `astrbot-phone-agent-main` directory prevents AstrBot from loading the plugin correctly.
 
 ### 5.2 Install with Git (recommended)
 
@@ -618,3 +637,7 @@ The audit log avoids message bodies and tokens, but reminder, timeline and backg
 - **Reminder is late:** check which source created it (App or chat), notification permissions, phone background limits and relay/sync cadence.
 - **Health is available but stale:** verify the external synchronizer's latest successful run and the returned record date; old records are not real-time readings.
 - **Private Companion has no context:** check separate bridge installation, both enable switches, its allowlist, user role/private scope, and the Private Companion API version.
+
+## License
+
+Original code in this repository is licensed under the [MIT License](LICENSE). Optional integrations and third-party dependencies retain their own licenses; this grant does not relicense upstream Private Companion code or server-local modifications.

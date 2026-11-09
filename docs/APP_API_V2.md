@@ -8,6 +8,31 @@ The routes are registered below the plugin prefix
 routes; write routes additionally reject a different `Origin`. They do not
 perform an Android health probe unless explicitly requested by a device route.
 
+## Runtime safety checks
+
+Optional routes recheck their feature switch for each request, including after
+runtime configuration changes. Routes disabled at startup are still omitted
+until plugin reload. `POST /device/command` requires `enabled=true` and the App
+backend, and rejects disabled screenshot, observation, location, usage and policy
+actions. `args` must be a JSON object containing finite numbers. Policy commands
+cannot target protected system/control packages. These checks complement the
+host's Dashboard authentication and Android's local approval controls.
+
+Notification ingestion returns `503 storage_unavailable` on persistence failure
+and restores its previous in-memory state, so the same batch can be retried.
+Private chat task approvals do not require the night guard to be enabled.
+
+## Care preview
+
+POST /app/care/preview uses the observation feature gate and write-origin checks.
+It requires a fresh heartbeat and an allowlisted, recorded private target.
+The bridge always receives preview=true; the request body cannot enable sending.
+The result reports evaluated, preview, sent, outcome and reason. A successful
+HTTP response means the diagnostic completed, not that a model ran or sent a message.
+Quiet hours, cooldown and model budgets continue to apply. Preview consumes one
+model evaluation when it runs, but does not consume a send slot or update the
+automatic care deduplication cache.
+
 ## State
 
 `GET /app/state` returns immediately from plugin memory and disk:

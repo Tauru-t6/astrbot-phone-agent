@@ -20,6 +20,7 @@ Design notes
 """
 import asyncio
 import json
+import math
 import os
 import time
 import uuid
@@ -835,6 +836,7 @@ class ReadOnlyTaskRunner:
         if run.status == RUN_RUNNING:
             run.transition(RUN_DONE, now=stamp)
         run.summary = {
+            **run.summary,
             "dry_run": True,
             "planned": len(run.steps),
             "observed": observed,
@@ -853,8 +855,9 @@ class ReadOnlyTaskRunner:
 
 def _number(value: Any) -> float | None:
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -919,6 +922,7 @@ class TaskExecutor:
         self._observation_max_age = max(1.0, float(observation_max_age))
         self._observation_wait = max(0.5, float(observation_wait))
         self._require_user_idle = bool(require_user_idle)
+        self._executing: set[str] = set()
 
     # -- helpers
 
@@ -930,28 +934,39 @@ class TaskExecutor:
         """
         source = self._observe_live if (live and self._observe_live is not None) else self._observe
         try:
-            status = await source() or {}
+            status = await asyncio.wait_for(source(), timeout=self._step_timeout)
         except Exception:
+            return None
+        if not isinstance(status, dict):
             return None
         stamp = _number(status.get("reported_at"))
         if stamp is None:
             return None
-        if _now() - stamp > self._observation_max_age:
+        if not -5.0 <= _now() - stamp <= self._observation_max_age:
             return None
         return status
 
     async def _settle(self, step: RunStep, result: dict[str, Any],
                       before: dict[str, Any] | None) -> tuple[Verdict, dict[str, Any] | None]:
         """Poll a live observation until the postcondition holds or time is up."""
-        deadline = _now() + self._observation_wait
+        deadline = time.monotonic() + self._observation_wait
         observation = None
         verdict = self._verify(step.action, step.args, result, None, before)
         while True:
-            observation = await self._read_observation(live=True)
-            verdict = self._verify(step.action, step.args, result, observation, before)
-            if verdict.ok or _now() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return verdict, observation
-            await asyncio.sleep(0.4)
+            try:
+                observation = await asyncio.wait_for(self._read_observation(live=True), timeout=remaining)
+            except asyncio.TimeoutError:
+                return verdict, observation
+            verdict = self._verify(step.action, step.args, result, observation, before)
+            if verdict.ok and (verdict.observed_at is None or verdict.observed_at < step.started_at):
+                verdict = Verdict(False, "observation_before_command", "", verdict.command_success,
+                                  verdict.verified, verdict.observed_at)
+            if verdict.ok or time.monotonic() >= deadline:
+                return verdict, observation
+            await asyncio.sleep(min(0.4, max(0.0, deadline - time.monotonic())))
 
     def _verify(
         self,
@@ -962,7 +977,7 @@ class TaskExecutor:
         before: dict[str, Any] | None,
     ) -> Verdict:
         package = _short(args.get("package"), 160)
-        success = bool(result.get("success"))
+        success = result.get("success") is True
         verified = result.get("verified") is True
         observed_at = _number((observation or {}).get("reported_at"))
         foreground = _short((observation or {}).get("foreground_package"), 160)
@@ -970,17 +985,15 @@ class TaskExecutor:
 
         if observation is None:
             return Verdict(False, "stale_observation", "", success, verified, None)
+        if not success:
+            return Verdict(False, "command_failed", _short(result.get("error"), 120),
+                           success, verified, observed_at)
         # An empty foreground is a failed probe, not evidence of a change. Without
         # this, "home" compared "" against the previous package and reported
         # success while nothing had happened.
         foreground_actions = {"open_app", "close_app", "suspend_app", "home", "back"}
         if action in foreground_actions and not foreground:
             return Verdict(False, "observation_empty", "probe returned no package",
-                           success, verified, observed_at)
-        # A command that reported failure cannot be the source of a "done" step.
-        if action in {"open_app", "close_app", "suspend_app", "unsuspend_app", "home", "back",
-                      "lock_screen", "screenshot"} and not success:
-            return Verdict(False, "command_failed", _short(result.get("error"), 120),
                            success, verified, observed_at)
         if action == "open_app":
             ok = foreground == package
@@ -1022,7 +1035,8 @@ class TaskExecutor:
         if not allowed or package in self._protected:
             return False
         try:
-            result = await self._act("unsuspend_app", {"package": package})
+            result = await asyncio.wait_for(
+                self._act("unsuspend_app", {"package": package}), timeout=self._step_timeout)
         except Exception:
             return False
         return bool(isinstance(result, dict) and result.get("success"))
@@ -1057,8 +1071,33 @@ class TaskExecutor:
 
     async def execute(self, run: PhoneTaskRun, *, grant: ScopedGrant | None = None,
                       now: float | None = None, allow_active: bool = False) -> PhoneTaskRun:
+        # Check before the first await so duplicate approvals cannot execute a
+        # run twice, and terminal histories cannot silently replay commands.
+        if run.status not in RUN_ACTIVE or run.run_id in self._executing:
+            return run
+        self._executing.add(run.run_id)
+        self._store.add_run(run)
+        try:
+            return await self._execute(run, grant=grant, now=now, allow_active=allow_active)
+        except asyncio.CancelledError:
+            run.cancel_requested = True
+            for step in run.steps:
+                if step.status == STEP_RUNNING:
+                    step.status = STEP_UNKNOWN
+                    step.error = "cancelled_during_execution"
+                    step.finished_at = _now()
+                elif step.status == STEP_PENDING:
+                    step.skip("cancelled")
+            run.transition(RUN_CANCELLED, error="cancelled")
+            self._store.save()
+            raise
+        finally:
+            self._executing.discard(run.run_id)
+
+    async def _execute(self, run: PhoneTaskRun, *, grant: ScopedGrant | None = None,
+                       now: float | None = None, allow_active: bool = False) -> PhoneTaskRun:
         started = _now() if now is None else now
-        if self._require_user_idle and not allow_active:
+        if self._require_user_idle and not allow_active and not run.cancel_requested:
             refusal = await self._active_guard(run)
             if refusal:
                 for step in run.steps:
@@ -1187,9 +1226,11 @@ class TaskExecutor:
             if observation is not None:
                 before = observation
 
-        if run.status in {RUN_EXECUTING, RUN_VERIFYING}:
+        if run.cancel_requested:
+            run.transition(RUN_CANCELLED, error="cancelled")
+        elif run.status in {RUN_EXECUTING, RUN_VERIFYING}:
             run.transition(RUN_DONE)
-        run.summary = {"dry_run": False, "planned": len(run.steps), **counts, "allow_active": allow_active}
+        run.summary = {**run.summary, "dry_run": False, "planned": len(run.steps), **counts, "allow_active": allow_active}
         run.touch(_now())
         self._store.add_run(run)
         self._store.save()
@@ -1199,5 +1240,9 @@ class TaskExecutor:
         run = self._store.run(run_id)
         if run is None:
             return None
-        run.cancel_requested = True
+        if run.status in RUN_ACTIVE:
+            run.cancel_requested = True
+            if run.run_id not in self._executing:
+                run.cancel()
+            self._store.save()
         return run

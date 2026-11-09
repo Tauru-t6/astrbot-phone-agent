@@ -238,6 +238,21 @@ class ExecuteTests(unittest.TestCase):
         self.backend.record_device_status(None)
         self.assertIsNotNone(self.backend.last_status())
 
+    def test_status_flags_are_not_based_on_truthiness(self):
+        self.backend.record_device_status({"charging": "false", "shizuku_ready": {"ready": True},
+                                           "battery_percent": 150, "screen_on_seconds_today": True})
+        status = self.backend.last_status()
+        self.assertFalse(status["charging"])
+        self.assertIsNone(status["shizuku_ready"])
+        self.assertIsNone(status["battery_percent"])
+        self.assertIsNone(status["screen_on_seconds_today"])
+
+    def test_out_of_order_status_does_not_replace_newer_sample(self):
+        now = device_app.time.time()
+        self.backend.record_device_status({"battery_percent": 50, "reported_at": now})
+        self.backend.record_device_status({"battery_percent": 80, "reported_at": now - 30})
+        self.assertEqual(self.backend.last_status()["battery_percent"], 50)
+
 
 class FailoverTests(unittest.TestCase):
     def setUp(self):
@@ -403,6 +418,34 @@ class AttemptWindowTests(unittest.TestCase):
             self.backend.execute("screen_text", timeout=10.0)
         self.assertLessEqual(timeouts[-1], 10.0)
 
+    def test_shorter_budget_is_sent_to_the_device(self):
+        with patch.object(self.backend, "_direct_command", return_value={"success": True}) as direct:
+            self.backend.execute("ping", timeout=5)
+        self.assertEqual(direct.call_args.args[0]["deadline"], 5)
+
+    def test_invalid_budgets_never_send_a_command(self):
+        with patch.object(self.backend, "_direct_command") as direct:
+            for value in (0, -1, float("nan"), float("inf"), "invalid"):
+                self.assertEqual(self.backend.execute("ping", timeout=value)["error_code"], "bad_args")
+        direct.assert_not_called()
+
+    def test_relay_expiry_returns_immediately(self):
+        self.backend._config.update(relay_base_url="https://relay.example", relay_token="test")
+        with patch.object(self.backend, "_http_json", side_effect=[
+            {"success": True, "task_id": "r1"},
+            {"success": True, "result": {"status": "expired"}},
+        ]) as http:
+            result = self.backend._relay_submit(self.backend.build_envelope("ping"), 10)
+        self.assertEqual(result["error_code"], "relay_expired")
+        self.assertEqual(http.call_count, 2)
+
+    def test_invalid_relay_task_id_is_rejected(self):
+        self.backend._config.update(relay_base_url="https://relay.example", relay_token="test")
+        with patch.object(self.backend, "_http_json", return_value={"success": True, "task_id": "../other"}) as http:
+            result = self.backend._relay_submit(self.backend.build_envelope("ping"), 10)
+        self.assertEqual(result["error_code"], "invalid_result")
+        self.assertEqual(http.call_count, 1)
+
 
 class HttpJsonErrorCodeTests(unittest.TestCase):
     """Transport failures must carry a code: stalled read vs broken link (issue #1)."""
@@ -411,19 +454,19 @@ class HttpJsonErrorCodeTests(unittest.TestCase):
         self.backend = device_app.DeviceAppBackend(FakeConfig(app_shared_token="t"), RecordingAudit())
 
     def test_read_timeout_reports_timeout_code(self):
-        with patch("urllib.request.urlopen", side_effect=TimeoutError("The read operation timed out")):
+        with patch.object(device_app, "open_http", side_effect=TimeoutError("The read operation timed out")):
             result = self.backend._http_json("http://phone:8260/health", "t")
         self.assertEqual(result["error_code"], "timeout")
         self.assertIn("timed out", result["error"])
 
     def test_urlerror_wrapping_a_timeout_reports_timeout_code(self):
-        with patch("urllib.request.urlopen",
+        with patch.object(device_app, "open_http",
                    side_effect=device_app.urllib.error.URLError(TimeoutError("timed out"))):
             result = self.backend._http_json("http://phone:8260/health", "t")
         self.assertEqual(result["error_code"], "timeout")
 
     def test_refused_connection_reports_connection_failed_code(self):
-        with patch("urllib.request.urlopen", side_effect=ConnectionRefusedError("refused")):
+        with patch.object(device_app, "open_http", side_effect=ConnectionRefusedError("refused")):
             result = self.backend._http_json("http://phone:8260/health", "t")
         self.assertEqual(result["error_code"], "connection_failed")
 

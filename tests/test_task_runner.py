@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+import asyncio
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -494,6 +495,7 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_override_allows_running_while_active(self):
         def go_home():
             self.status["foreground_package"] = "com.android.launcher"
+            self.status["reported_at"] = time.time()
 
         self.status["foreground_package"] = "com.tencent.mobileqq"
         self.results["home"] = go_home
@@ -518,14 +520,89 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(run.summary.get("refused"), "user_active")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
     async def test_empty_observation_is_not_a_change(self):
         """A failed probe must not read as "the foreground changed"."""
         self.status["foreground_package"] = ""
         self.results["home"] = {"success": False, "error": "手机命令执行失败"}
         executor, run = self.build(["observe", "home"], allowed={"home"})
-        run = await executor.execute(run, grant=self.grant(actions=["home"]))
+        run = await executor.execute(run, grant=self.grant(actions=["home"]), allow_active=True)
         self.assertEqual(run.status, module.RUN_FAILED)
         self.assertIn(run.steps[1].verify["reason"], {"observation_empty", "command_failed"})
+
+    async def test_terminal_run_does_not_execute_again(self):
+        executor, run = self.build(["observe", "open_app"])
+        run.transition(module.RUN_DONE)
+        await executor.execute(run, grant=self.grant())
+        self.assertEqual(self.calls, [])
+
+    async def test_concurrent_execute_does_not_duplicate_command(self):
+        executor, run = self.build(["open_app"])
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def act(action, args):
+            self.calls.append(action)
+            entered.set()
+            await release.wait()
+            self.status.update(foreground_package=VIDEO, reported_at=time.time())
+            return {"success": True}
+
+        executor._act = act
+        task = asyncio.create_task(executor.execute(run, grant=self.grant()))
+        await entered.wait()
+        await executor.execute(run, grant=self.grant())
+        release.set()
+        await task
+        self.assertEqual(self.calls, ["open_app"])
+
+    async def test_cancelled_run_is_not_reported_done(self):
+        executor, run = self.build(["observe", "open_app"])
+        self.store.add_run(run)
+        executor.cancel(run.run_id)
+        await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.status, module.RUN_CANCELLED)
+        self.assertEqual(self.calls, [])
+        restored = module.TaskRunStore(Path(self.temp.name) / "runs.json")
+        restored.load()
+        self.assertEqual(restored.run(run.run_id).status, module.RUN_CANCELLED)
+
+    async def test_cancel_during_command_preserves_unknown_outcome(self):
+        executor, run = self.build(["open_app", "home"])
+        entered = asyncio.Event()
+
+        async def act(action, args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        executor._act = act
+        task = asyncio.create_task(executor.execute(run, grant=self.grant()))
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(run.status, module.RUN_CANCELLED)
+        self.assertEqual(run.steps[0].status, module.STEP_UNKNOWN)
+        self.assertEqual(run.steps[1].status, module.STEP_SKIPPED)
+
+    async def test_failed_unverified_action_is_not_success(self):
+        self.results["tap"] = {"success": False, "error": "denied"}
+        executor, run = self.build(["tap"], allowed={"tap"})
+        await executor.execute(run, grant=self.grant(actions=["tap"]))
+        self.assertEqual(run.status, module.RUN_FAILED)
+        self.assertEqual(run.steps[0].verify["reason"], "command_failed")
+
+    async def test_precommand_sample_cannot_verify_a_write(self):
+        self.status["foreground_package"] = VIDEO
+        executor, run = self.build(["open_app"])
+        await executor.execute(run, grant=self.grant())
+        self.assertEqual(run.status, module.RUN_FAILED)
+        self.assertEqual(run.steps[0].verify["reason"], "observation_before_command")
+
+    async def test_invalid_observation_values_are_rejected(self):
+        executor, _ = self.build(["open_app"])
+        for value in (float("nan"), float("inf"), time.time() + 600):
+            self.status["reported_at"] = value
+            self.assertIsNone(await executor._read_observation())
+
+
+if __name__ == "__main__":
+    unittest.main()

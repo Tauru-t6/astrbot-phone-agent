@@ -1,9 +1,12 @@
 import importlib.util
+import http.client
 import json
 import tempfile
 import time
 import unittest
+import threading
 from pathlib import Path
+from unittest.mock import patch
 
 
 RELAY_PATH = Path(__file__).parents[1] / "deploy" / "relay" / "relay_server.py"
@@ -74,6 +77,105 @@ class RelayQueueTests(unittest.TestCase):
     def test_b08_max_body_bytes_supports_4mb(self):
         """B08: MAX_BODY_BYTES must be 4 MiB to match the plugin's read ceiling."""
         self.assertEqual(relay.MAX_BODY_BYTES, 4 * 1024 * 1024)
+
+    def test_empty_poll_does_not_rewrite_state(self):
+        with patch.object(relay, "_persist") as persist:
+            self.assertIsNone(relay.poll_task("phone-a"))
+        persist.assert_not_called()
+
+    def test_result_requires_a_live_claim(self):
+        task = relay.push_task({"message": "hello"})
+        self.assertFalse(relay.submit_result(task["id"], True, "done", device_id="phone-a"))
+        relay.poll_task("phone-a")
+        relay._state["tasks"][0]["claimed_at"] = time.time() - relay.CLAIM_LEASE_SECONDS - 1
+        self.assertFalse(relay.submit_result(task["id"], True, "late", device_id="phone-a"))
+        self.assertFalse(relay.renew_task(task["id"], "phone-a"))
+
+    def test_claimed_tasks_count_toward_capacity(self):
+        with patch.object(relay, "MAX_TASKS", 1):
+            relay.push_task({"message": "hello"})
+            relay.poll_task("phone-a")
+            with self.assertRaises(OverflowError):
+                relay.push_task({"message": "another"})
+
+    def test_stale_pending_does_not_block_new_tasks(self):
+        with patch.object(relay, "MAX_TASKS", 1):
+            old = relay.push_task({"message": "old"})
+            relay._state["tasks"][0]["created_at"] = time.time() - relay.STALE_PENDING_SECONDS - 1
+            new = relay.push_task({"message": "new"})
+            self.assertEqual(relay.get_result(old["id"])["status"], "expired")
+            self.assertEqual(relay.poll_task("phone-a")["id"], new["id"])
+
+    def test_returned_task_does_not_mutate_queue(self):
+        task = relay.push_task({"message": "hello"})
+        task["status"] = "done"
+        claimed = relay.poll_task("phone-a")
+        claimed["device_id"] = "phone-b"
+        self.assertTrue(relay.submit_result(task["id"], True, "ok", device_id="phone-a"))
+
+    def test_load_recovers_valid_tasks_from_malformed_state(self):
+        valid = {"id": "valid", "message": "hello", "status": "pending", "created_at": time.time()}
+        self.state_file.write_text(json.dumps({"tasks": [None, {}, valid], "results": []}), encoding="utf-8")
+        relay._load()
+        self.assertEqual(relay.poll_task("phone-a")["id"], "valid")
+
+    def test_failed_atomic_replace_keeps_previous_state(self):
+        relay.push_task({"message": "original"})
+        previous = self.state_file.read_bytes()
+        with patch.object(relay.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                relay._persist()
+        self.assertEqual(self.state_file.read_bytes(), previous)
+        self.assertEqual(list(self.state_file.parent.glob(self.state_file.name + ".*.tmp")), [])
+
+
+class RelayHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.token = patch.object(relay, "TOKEN", "test-only-token")
+        self.token.start()
+        self.server = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.RelayHandler)
+        self.thread = threading.Thread(target=lambda: self.server.serve_forever(poll_interval=0.01), daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=1)
+        self.token.stop()
+
+    def post(self, path, value, authorized=True):
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+        headers = {"Content-Type": "application/json"}
+        if authorized:
+            headers["Authorization"] = "Bearer test-only-token"
+        connection.request("POST", path, json.dumps(value), headers)
+        response = connection.getresponse()
+        result = response.status, response.getheader("Connection"), json.loads(response.read())
+        connection.close()
+        return result
+
+    def test_array_payloads_are_rejected_without_handler_crash(self):
+        for path in ("/task", "/renew", "/result"):
+            self.assertEqual(self.post(path, [1, 2])[0], 400)
+
+    def test_string_success_is_not_coerced_to_true(self):
+        self.assertEqual(self.post("/result", {"task_id": "id", "success": "false"})[0], 400)
+
+    def test_unauthorized_body_closes_connection(self):
+        status, connection, _ = self.post("/task", {"message": "hello"}, authorized=False)
+        self.assertEqual(status, 401)
+        self.assertEqual(connection, "close")
+
+    def test_incomplete_body_has_a_bounded_read(self):
+        with patch.object(relay, "REQUEST_TIMEOUT_SECONDS", 0.05):
+            connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+            connection.request("POST", "/task", "{}", {
+                "Authorization": "Bearer test-only-token", "Content-Length": "100",
+            })
+            response = connection.getresponse()
+            self.assertEqual(response.status, 408)
+            response.read()
+            connection.close()
 
 
 if __name__ == "__main__":

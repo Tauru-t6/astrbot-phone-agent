@@ -27,6 +27,11 @@ from typing import Any
 
 from astrbot.api import logger
 
+try:
+    from .http_transport import open_http
+except ImportError:  # pragma: no cover - direct-module test harness
+    from http_transport import open_http
+
 
 COMMAND_SCHEMA_VERSION = 1
 PLUGIN_DATA_DIR = Path("data") / "plugin_data" / "astrbot_plugin_phone_agent"
@@ -375,17 +380,23 @@ class DeviceAppBackend:
         # that would make a stale sample look fresh. The consumer checks
         # reported_at for freshness; received_at is for diagnostics only.
         phone_reported = self._reported_at(status.get("reported_at"))
+        battery_percent = _int_or_none(status.get("battery_percent"))
+        if battery_percent is not None and battery_percent > 100:
+            battery_percent = None
         with self._lock:
             current_device = (self._registration or {}).get("device_id", "")
             if reported_device and current_device and reported_device != current_device:
                 return
+            previous_reported = (self._last_status or {}).get("reported_at")
+            if phone_reported is not None and previous_reported is not None and phone_reported < previous_reported:
+                return
             self._last_status = {
-                "battery_percent": _int_or_none(status.get("battery_percent")),
-                "charging": bool(status.get("charging")),
+                "battery_percent": battery_percent,
+                "charging": _opt_bool(status.get("charging")),
                 "foreground_package": _text(status.get("foreground_package"), 160),
                 "screen_on_seconds_today": _int_or_none(status.get("screen_on_seconds_today")),
                 "screen_interactive": _opt_bool(status.get("screen_interactive")),
-                "shizuku_ready": bool(status.get("shizuku_ready")),
+                "shizuku_ready": _opt_bool(status.get("shizuku_ready")),
                 "app_version": _text(status.get("app_version"), 40),
                 # App-side reason when the foreground probe returned nothing.
                 "foreground_debug": _text(status.get("foreground_debug"), 160),
@@ -397,6 +408,8 @@ class DeviceAppBackend:
 
     @staticmethod
     def _reported_at(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
         try:
             stamp = float(value)
         except (TypeError, ValueError):
@@ -461,7 +474,7 @@ class DeviceAppBackend:
             method=method,
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with open_http(req, timeout=timeout) as response:
                 data = json.loads(response.read(4 * 1024 * 1024).decode("utf-8", errors="replace"))
             return data if isinstance(data, dict) else {"success": False, "error": "device returned invalid JSON"}
         except urllib.error.HTTPError as exc:
@@ -593,6 +606,8 @@ class DeviceAppBackend:
         if not push.get("success"):
             return {"success": False, "error_code": "relay_push_failed", "error": _text(push.get("error"), 200)}
         task_id = str(push.get("task_id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", task_id):
+            return {"success": False, "error_code": "invalid_result", "error": "relay returned an invalid task ID"}
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             result = self._http_json(
@@ -603,6 +618,9 @@ class DeviceAppBackend:
                 return self._normalize_result(None, envelope)
             raw_message = str(payload.get("ai_response") or "")
             status = _text(payload.get("status"), 20)
+            if status in {"expired", "cancelled"}:
+                return {"success": False, "error_code": "relay_" + status,
+                        "task_id": task_id, "error": "relay task " + status}
             if status in {"pending", "claimed", "running"}:
                 time.sleep(min(2, max(0, deadline - time.monotonic())))
                 continue
@@ -647,7 +665,17 @@ class DeviceAppBackend:
         except ValueError as exc:
             return {"success": False, "action": action, "error_code": "unsupported_action", "error": str(exc)[:200]}
         # Callers that cannot wait (task verification) pass a tighter budget.
-        timeout = min(self.command_timeout(), float(timeout)) if timeout else self.command_timeout()
+        try:
+            timeout = self.command_timeout() if timeout is None else float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            timeout = float("nan")
+        if not math.isfinite(timeout) or timeout <= 0:
+            return {"success": False, "action": action, "error_code": "bad_args",
+                    "error": "command timeout must be a finite positive number"}
+        timeout = min(self.command_timeout(), timeout)
+        # The device must not start a queued command after its caller's shorter
+        # transport budget has elapsed. Wire deadlines use whole seconds.
+        envelope["deadline"] = max(1, math.ceil(timeout))
         deadline = time.monotonic() + timeout
         direct = self._direct_command(envelope, timeout)
         if direct.get("command_id") or direct.get("success") or not self.relay_enabled():
@@ -668,6 +696,8 @@ class DeviceAppBackend:
 
 
 def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return None
     try:
         number = int(value)
     except (TypeError, ValueError, OverflowError):

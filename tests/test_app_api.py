@@ -296,6 +296,203 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(filtered["count"], 1)
             self.assertEqual(filtered["notifications"][0]["title"], "张三")
 
+    async def test_failed_notification_save_is_retryable_and_survives_restart(self):
+        self.config["enable_notification_tool"] = True
+        self.create_plugin()
+        batch = {"notifications": [{"key": "retry-key", "title": "test", "posted_at": 1000}]}
+        with patch.object(self.plugin, "_save_notifications", side_effect=OSError("disk full")):
+            response = await self.post("/app/notifications", batch)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.plugin._notifications, [])
+        response = await self.post("/app/notifications", batch)
+        self.assertEqual((await response.get_json())["added"], 1)
+        self.create_plugin()
+        self.assertEqual(self.plugin._notifications[0]["key"], "retry-key")
+
+    async def test_oversized_notification_timestamp_does_not_partially_mutate_batch(self):
+        self.config["enable_notification_tool"] = True
+        self.create_plugin()
+        batch = {"notifications": [
+            {"key": "valid", "title": "test", "posted_at": 1000},
+            {"key": "huge-time", "title": "test", "posted_at": 10 ** 400},
+        ]}
+        response = await self.post("/app/notifications", batch)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((await response.get_json())["added"], 2)
+        self.create_plugin()
+        self.assertEqual(len(self.plugin._notifications), 2)
+        self.assertLess(self.plugin._notifications[0]["posted_at"], time.time() + 1)
+
+    async def test_device_command_enforces_switch_backend_and_feature_flags(self):
+        with patch.object(self.plugin.device_app, "execute") as execute:
+            self.config["enabled"] = False
+            self.assertEqual((await self.post("/device/command", {"action": "home"})).status_code, 503)
+            self.config["enabled"] = True
+            self.config["control_backend"] = "operit"
+            self.assertEqual((await self.post("/device/command", {"action": "home"})).status_code, 409)
+            self.config["control_backend"] = "app"
+            for action in ("screenshot", "location", "usage_stats", "suspend_app", "suspend_video_apps"):
+                self.assertEqual((await self.post("/device/command", {"action": action})).status_code, 403)
+            execute.assert_not_called()
+
+    async def test_device_command_rejects_non_object_args_and_non_finite_numbers(self):
+        with patch.object(self.plugin.device_app, "execute") as execute:
+            for args in ([], "value", None, {"x": float("inf")}, {"x": float("nan")}):
+                response = await self.post("/device/command", {"action": "tap", "args": args})
+                self.assertEqual(response.status_code, 400)
+            execute.assert_not_called()
+
+    async def test_device_command_cannot_suspend_protected_packages(self):
+        self.config["enable_policy_tools"] = True
+        with patch.object(self.plugin.device_app, "execute") as execute:
+            response = await self.post("/device/command", {"action": "suspend_app", "args": {"package": "com.android.systemui"}})
+            self.assertEqual(response.status_code, 403)
+            execute.assert_not_called()
+
+    async def test_config_rejects_non_finite_integer_without_mutating_config(self):
+        before = dict(self.config)
+        response = await self.post("/config", {"operit_timeout_seconds": float("inf")})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.config, before)
+
+    async def test_screen_text_cannot_bypass_feature_or_group_privacy(self):
+        event = types.SimpleNamespace(unified_msg_origin="qq:GroupMessage:group")
+        with patch.object(self.plugin, "_authorized", return_value=True), \
+                patch.object(self.plugin.device_app, "execute") as execute:
+            result = json.loads(await self.plugin.phone_action(event, action="screen_text"))
+            self.assertFalse(result["success"])
+            self.config["enable_observe_tool"] = False
+            event.unified_msg_origin = "qq:FriendMessage:user"
+            result = json.loads(await self.plugin.phone_action(event, action="screen_text"))
+            self.assertFalse(result["success"])
+            execute.assert_not_called()
+
+    async def test_private_approval_works_without_night_guard(self):
+        self.config.update({"enable_night_guard": False, "enable_task_execute": True, "allowed_user_ids": "user"})
+        event = types.SimpleNamespace(
+            unified_msg_origin="qq_official:PrivateMessage:user", get_sender_id=lambda: "user",
+            get_messages=lambda: [types.SimpleNamespace(text="可以")], send=AsyncMock(),
+        )
+        with patch.object(self.plugin, "_chat_task_decision", new=AsyncMock(return_value="已执行")) as decide:
+            await self.plugin.on_private_message(event)
+            decide.assert_awaited_once_with("user", "可以")
+            event.send.assert_awaited_once()
+            self.assertEqual(self.plugin._night_guard_states, {})
+            decide.reset_mock()
+            event.unified_msg_origin = "qq:GroupMessage:group"
+            await self.plugin.on_private_message(event)
+            decide.assert_not_awaited()
+
+    async def test_cancelled_adb_call_kills_and_reaps_process(self):
+        entered = asyncio.Event()
+        calls = 0
+
+        async def communicate():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await asyncio.Event().wait()
+            return b"", b""
+
+        process = types.SimpleNamespace(returncode=None, communicate=AsyncMock(side_effect=communicate))
+        from unittest.mock import Mock
+        process.kill = Mock()
+        with patch.object(module.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)):
+            running = asyncio.create_task(self.plugin._run("devices"))
+            await asyncio.wait_for(entered.wait(), 1)
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+        process.kill.assert_called_once()
+        self.assertEqual(calls, 2)
+
+    async def test_registered_optional_routes_recheck_feature_switch(self):
+        self.config["enable_notification_tool"] = True
+        self.create_plugin()
+        self.config["enable_notification_tool"] = False
+        response = await self.client.get("/astrbot_plugin_phone_agent/app/notifications")
+        self.assertEqual(response.status_code, 403)
+
+    async def test_operit_retry_respects_mode_status_and_concurrency(self):
+        task = {"status": "failed", "task": "打开应用", "owner": "user"}
+        self.plugin._operit_tasks["original"] = task
+        response = await self.post("/operit_task_retry", {"task_id": "original"})
+        self.assertEqual(response.status_code, 409)
+        self.config["control_backend"] = "operit"
+        for status in ("queued", "running", "completed"):
+            task["status"] = status
+            response = await self.post("/operit_task_retry", {"task_id": "original"})
+            self.assertEqual(response.status_code, 409)
+        task["status"] = "failed"
+        self.config["max_background_tasks"] = 1
+        self.plugin._operit_tasks["busy"] = {"status": "running"}
+        response = await self.post("/operit_task_retry", {"task_id": "original"})
+        self.assertEqual(response.status_code, 409)
+        with patch.object(self.plugin, "_authorized", return_value=True), \
+                patch.object(self.plugin, "_event_owner", return_value="user"):
+            result = json.loads(await self.plugin.operit_task_retry(object(), task_id="original"))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "retry_unavailable")
+        self.assertEqual(len(self.plugin._operit_tasks), 2)
+
+    async def test_operit_fallback_never_replays_uncertain_or_rejected_commands(self):
+        self.config.update({"operit_token": "test", "operit_base_url": "http://phone.example", "relay_base_url": "https://relay.example", "relay_token": "test"})
+        for direct in ({"success": False, "error": "timeout", "safe_to_retry": False},
+                       {"success": False, "error": "explicit rejection"},
+                       {"success": False, "error": "invalid response"}):
+            with patch.object(self.plugin, "_operit_task_direct", return_value=direct), \
+                    patch.object(self.plugin, "_relay_submit") as relay:
+                self.assertEqual(self.plugin._operit_task_sync("home", False, "WINDOW"), direct)
+                relay.assert_not_called()
+        with patch.object(self.plugin, "_operit_task_direct", return_value={"success": False, "safe_to_retry": True}), \
+                patch.object(self.plugin, "_relay_submit", return_value={"success": True}) as relay:
+            self.assertTrue(self.plugin._operit_task_sync("home", False, "WINDOW")["success"])
+            relay.assert_called_once()
+
+    async def test_operit_transport_distinguishes_refused_from_unknown_execution(self):
+        self.config.update({"operit_token": "test", "operit_base_url": "http://phone.example"})
+        for error, safe in ((ConnectionRefusedError("refused"), True), (TimeoutError("timeout"), False),
+                            (ConnectionResetError("reset"), False)):
+            with patch.object(module, "open_http", side_effect=module.urllib.error.URLError(error)):
+                result = self.plugin._operit_task_direct("home", False, "WINDOW")
+            self.assertEqual(result["safe_to_retry"], safe)
+
+    async def test_operit_redirect_does_not_replay_via_relay(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        requests = []
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                requests.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "http://redirect-target.invalid/after-execution")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+        worker.start()
+        self.config.update({"operit_token": "test", "operit_base_url": f"http://127.0.0.1:{server.server_port}",
+                            "relay_base_url": "https://relay.example", "relay_token": "test"})
+        try:
+            with patch.object(self.plugin, "_relay_submit") as relay:
+                result = self.plugin._operit_task_sync("home", False, "WINDOW")
+            relay.assert_not_called()
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "Operit HTTP 302")
+            self.assertEqual(requests, ["/api/external-chat"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=1)
+
     async def test_phone_screenshot_decodes_image_and_survives_missing_delivery(self):
         import base64 as _b64
         self.config["enable_screenshot_tool"] = True
@@ -449,3 +646,88 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.plugin._chat_task_decision(approval.subject, "今天天气不错")
         self.assertIsNone(reply)
         self.assertEqual(approval.status, "pending")
+
+    async def test_llm_plan_stays_pending_until_approval(self):
+        self._register()
+        self.config.update(enable_llm_task_planner=True, task_execute_allowed_actions="open_app,home")
+        provider = types.SimpleNamespace(text_chat=AsyncMock(return_value=types.SimpleNamespace(
+            completion_text=json.dumps({"status": "ready", "steps": [{"action": "open_app", "args": {"package": "tv.danmaku.bili"}}, {"action": "home"}]}))))
+        self.plugin.context.get_using_provider = lambda **kw: provider
+        with patch.object(self.plugin._task_executor, "execute", new=AsyncMock()) as execute:
+            response = await self.post("/app/task/propose", {"goal": "打开哔哩哔哩然后回桌面"})
+            data = await response.get_json()
+            self.assertEqual(response.status_code, 200, data)
+            self.assertEqual(data["run"]["status"], "waiting_approval")
+            self.assertEqual(set(data["approval"]["actions"]), {"open_app", "home"})
+            self.assertEqual([s["action"] for s in data["run"]["steps"]], ["observe", "open_app", "home"])
+            self.assertEqual(data["run"]["summary"]["planning"]["source"], "llm")
+            execute.assert_not_awaited()
+
+    async def test_llm_clarification_does_not_create_approval(self):
+        self._register()
+        self.config["enable_llm_task_planner"] = True
+        self.plugin.context.get_using_provider = lambda **kw: types.SimpleNamespace(text_chat=AsyncMock(return_value=types.SimpleNamespace(
+            completion_text='{"status":"needs_clarification","question":"哪一个应用？"}')))
+        response = await self.post("/app/task/propose", {"goal": "打开那个"})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.plugin._task_runs.approvals(), [])
+
+    async def test_llm_device_change_during_planning_is_rejected(self):
+        self._register()
+        self.config["enable_llm_task_planner"] = True
+        async def changed(**kw):
+            self.plugin.device_app.registration = lambda: {"device_id": "replacement"}
+            return types.SimpleNamespace(completion_text='{"status":"ready","steps":[{"action":"home"}]}')
+        self.plugin.context.get_using_provider = lambda **kw: types.SimpleNamespace(text_chat=changed)
+        response = await self.post("/app/task/propose", {"goal": "回桌面"})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.plugin._task_runs.approvals(), [])
+
+    async def test_model_unavailable_unknown_app_creates_no_active_run(self):
+        self._register()
+        self.config["enable_llm_task_planner"] = True
+        self.plugin.context.get_using_provider = lambda **kw: None
+        response = await self.post("/app/task/propose", {"goal": "打开一个未知应用"})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.plugin._task_runs.runs(), [])
+
+    async def test_multistep_approval_counts_repeated_actions(self):
+        self._register()
+        self.config.update(enable_llm_task_planner=True, task_execute_allowed_actions="open_app,home")
+        rows=[{"action":"open_app","args":{"package":"tv.danmaku.bili"}}, {"action":"home"}, {"action":"open_app","args":{"package":"tv.danmaku.bili"}}]
+        self.plugin.context.get_using_provider = lambda **kw: types.SimpleNamespace(text_chat=AsyncMock(return_value=types.SimpleNamespace(
+            completion_text=json.dumps({"status":"ready","steps":rows}))))
+        for via_chat in (False,True):
+            proposed=await (await self.post("/app/task/propose",{"goal":"打开哔哩哔哩回桌面再打开"})).get_json()
+            with patch.object(self.plugin._task_executor, "execute", new=AsyncMock(side_effect=lambda run,**kw:run)) as execute:
+                if via_chat:
+                    await self.plugin._chat_task_decision(proposed["approval"]["subject"], "可以")
+                else:
+                    await self.post("/app/task/approve", {"approval_id":proposed["approval"]["approval_id"]})
+                self.assertEqual(execute.await_args.kwargs["grant"].max_steps,3)
+
+    async def test_care_preview_always_forces_preview_for_allowed_private_target(self):
+        self.config["allowed_user_ids"] = "owner"
+        provider = types.SimpleNamespace(evaluate_care=AsyncMock(return_value={
+            "evaluated": True, "preview": True, "sent": False, "outcome": "preview"}))
+        with patch.object(self.plugin, "_companion_care", return_value=provider), \
+             patch.object(self.plugin, "_care_device_fresh", return_value=True), \
+             patch.object(self.plugin, "_care_targets", return_value=[
+                 {"user_id": "owner", "umo": "bot:FriendMessage:owner"}]):
+            response = await self.post("/app/care/preview", {"preview": False, "subject": "other"})
+        self.assertEqual(response.status_code, 200)
+        provider.evaluate_care.assert_awaited_once_with("owner", "bot:FriendMessage:owner", "owner", preview=True)
+
+    async def test_care_preview_rejects_stale_or_unscoped_target_before_model(self):
+        provider = types.SimpleNamespace(evaluate_care=AsyncMock())
+        with patch.object(self.plugin, "_companion_care", return_value=provider), \
+             patch.object(self.plugin, "_care_device_fresh", return_value=False):
+            response = await self.post("/app/care/preview", {})
+            self.assertEqual(response.status_code, 409)
+        with patch.object(self.plugin, "_companion_care", return_value=provider), \
+             patch.object(self.plugin, "_care_device_fresh", return_value=True), \
+             patch.object(self.plugin, "_care_targets", return_value=[
+                 {"user_id": "other", "umo": "bot:FriendMessage:other"}]):
+            response = await self.post("/app/care/preview", {})
+            self.assertEqual(response.status_code, 409)
+        provider.evaluate_care.assert_not_awaited()

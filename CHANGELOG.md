@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.0] - 2026-11-09
+
+- Add bounded LLM multi-step planning, explicit clarification, strict action/package validation and safe single-step fallback. Existing grants, approval and execution verification remain authoritative.
+- Adapt Phone Companion Context 0.3.0 to Private Companion 7.x without patching its private methods. Read bounded conversation/persona context through AstrBot APIs.
+- Suppress repeated care, defer unchanged context, respect recent chat activity and discard results if the conversation or host changes while the model runs.
+- Read only a bounded tail of large conversation archives, check conversation ownership and provide a care preview that never sends messages.
+- Add the MIT license for original project code.
+- Publish bridge health in the care snapshot. See docs/PRIVATE_COMPANION_719_ADAPTATION.md for limits, settings and deployment notes.
+
+## [Unreleased]
+
+- Harden command dispatch against duplicate execution, uncertain Operit fallback,
+  authenticated HTTP redirects, stale post-action observations and invalid input.
+- Preserve policy expiry ownership after failed renewals or early restores;
+  persist cancellation and unknown execution outcomes accurately.
+- Fix private chat approvals depending on the night guard, screen-text privacy
+  bypasses, runtime feature checks, care authorization and reservation accounting.
+- Share atomic state writes, make notification batches retryable, bound audit log
+  reads and stop rewriting Relay state on idle polls.
+- Add dashboard phone reminder creation with idempotent retries; protect unsaved
+  drafts, suppress duplicate requests, escape audit HTML and pause hidden polling.
+- Add regression coverage for HTTP, persistence, lifecycle, scheduler and dashboard
+  failures. See `docs/OPTIMIZATION_REPORT.md` for validation and compatibility notes.
+
 ## [0.8.8]
 
 ### Added

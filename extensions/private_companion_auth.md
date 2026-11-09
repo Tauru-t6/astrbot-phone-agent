@@ -15,6 +15,11 @@ With this setting, the phone agent asks Private Companion for its authorized
 user IDs. If the companion plugin is missing or disabled, phone tools deny
 access instead of silently opening control to everyone.
 
+Private Companion 7.x no longer exposes that legacy authorization-list method.
+For 7.x, keep an explicit Phone Agent allowed_user_ids list. The care adapter
+discovers the active product API but does not treat a general companion account
+or memory permission as consent to control a phone.
+
 For a standalone installation, leave `use_private_companion_auth` false and set
 `allowed_user_ids` to the account IDs that may control the phone. This extension
 does not change the companion plugin's personality, prompts, memory, or

@@ -17,6 +17,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Star
+from . import v2_adapter
 
 
 def _clean(value: Any, limit: int = 800) -> str:
@@ -30,6 +31,10 @@ class PhoneCompanionContext(Star):
         super().__init__(context)
         self.config = config
         self._install_task = asyncio.create_task(self._install_when_ready())
+        self._bridge_mode = "legacy"
+        self._decision_memory: dict[str, dict[str, Any]] = {}
+        self._latest_signals: dict[str, dict[str, Any]] = {}
+        self._published_phone = None
         self._target: Any | None = None
         self._original: Any | None = None
         self._wrapped: Any | None = None
@@ -162,6 +167,12 @@ class PhoneCompanionContext(Star):
     def _reservations_for(self, user_id: str) -> list[dict[str, Any]]:
         return [item for item in self._reservations.values() if item.get("user_id") == user_id]
 
+    def _return_reserved_slot(self, item: dict[str, Any]) -> None:
+        """Return quota only to the day on which this reservation was charged."""
+        user_id = item["user_id"]
+        if item.get("day") == self._decision_day.get(user_id):
+            self._decision_count[user_id] = max(0, self._decision_count.get(user_id, 0) - 1)
+
     def _decision_allowed(self, user_id: str, now: datetime | None = None) -> tuple[bool, str]:
         """Read-only gate check used to shape the prompt; it reserves nothing."""
         now = now or datetime.now()
@@ -190,7 +201,7 @@ class PhoneCompanionContext(Star):
             if item["status"] == "reserved":
                 # The model never returned, so nothing was produced: hand the
                 # slot back instead of leaking quota forever.
-                self._decision_count[user_id] = max(0, self._decision_count.get(user_id, 0) - 1)
+                self._return_reserved_slot(item)
                 item["status"] = "released"
                 item["released_reason"] = "reservation_expired"
             else:
@@ -230,6 +241,7 @@ class PhoneCompanionContext(Star):
             reservation = {
                 "id": uuid.uuid4().hex,
                 "user_id": user_id,
+                "day": now.date().isoformat(),
                 "status": "reserved",
                 "created_at": stamp,
                 "expires_at": stamp + self._reservation_ttl(),
@@ -252,8 +264,12 @@ class PhoneCompanionContext(Star):
         if not reservation:
             return False
         async with self._decision_lock:
+            # A slow model can be the only active evaluation, so no other
+            # caller may have swept its expired reservation in the meantime.
+            self._sweep_reservations(reservation["user_id"])
             item = self._reservations.get(reservation["id"])
             if item is None or item.get("status") != "reserved":
+                self._save_decision_budget()
                 return False
             stamp = time.time()
             item["status"] = "generated"
@@ -272,8 +288,7 @@ class PhoneCompanionContext(Star):
                 return
             item["status"] = "released"
             item["released_reason"] = reason
-            user_id = item["user_id"]
-            self._decision_count[user_id] = max(0, self._decision_count.get(user_id, 0) - 1)
+            self._return_reserved_slot(item)
             self._save_decision_budget()
 
     async def _mark_delivery_failed(self, reservation_id: str, reason: str = "host_send_failed") -> None:
@@ -284,8 +299,7 @@ class PhoneCompanionContext(Star):
                 return
             item["status"] = "failed"
             item["released_reason"] = reason
-            user_id = item["user_id"]
-            self._decision_count[user_id] = max(0, self._decision_count.get(user_id, 0) - 1)
+            self._return_reserved_slot(item)
             self._save_decision_budget()
 
     async def _mark_delivered(self, reservation_id: str) -> None:
@@ -328,6 +342,7 @@ class PhoneCompanionContext(Star):
             "version": self.CARE_STATUS_VERSION,
             "updated_at": time.time(),
             "bridge_enabled": self._enabled(),
+            "bridge": dict(self._bridge_status),
             "autonomy_enabled": self._autonomous_enabled(),
             "mode": self._decision_mode(),
             "quiet_hours": _clean(self.config.get("quiet_hours", "00:30-08:00"), 30),
@@ -394,14 +409,15 @@ class PhoneCompanionContext(Star):
         except Exception:  # pragma: no cover - older host without message components
             payload = text
         try:
-            await sender(umo, payload)
+            if await sender(umo, payload) is False:
+                return False
         except Exception as exc:
             logger.warning("[PhoneCompanionContext] care delivery failed: %s", _clean(exc, 160))
             return False
-        logger.info("[PhoneCompanionContext] care delivered to %s: %s", umo, _clean(text, 80))
+        logger.info("[PhoneCompanionContext] care delivery completed")
         return True
 
-    async def evaluate_care(self, user_id: str, umo: str = "", relationship_role: str = "") -> dict[str, Any]:
+    async def evaluate_care(self, user_id: str, umo: str = "", relationship_role: str = "", *, preview: bool = False) -> dict[str, Any]:
         """Scheduler entry point (P1-D): run one autonomy evaluation.
 
         The phone plugin's scheduler calls this outside the host's own loop.
@@ -417,22 +433,40 @@ class PhoneCompanionContext(Star):
         user: dict[str, Any] = {"user_id": user_id, "umo": umo}
         if relationship_role:
             user["relationship_role"] = relationship_role
+        # The wrapper intentionally preserves host behaviour for out-of-scope
+        # users. A scheduler must not invoke that passthrough and send its text.
+        if not self._eligible_user(user):
+            return {"evaluated": False, "reason": "user_not_eligible"}
+        if preview and self._bridge_mode != "v2":
+            return {"evaluated": False, "reason": "preview_requires_v2"}
+        receipt: dict[str, Any] = {}
         try:
-            text = await self._wrapped(user, self._companion_name(), "care_tick")
+            if preview:
+                text = await self._v2_generation(user, self._companion_name(), "care_tick", _care_receipt=receipt, preview=True)
+            else:
+                text = await self._wrapped(user, self._companion_name(), "care_tick", _care_receipt=receipt)
         except Exception as exc:
             logger.warning("[PhoneCompanionContext] care tick failed: %s", _clean(exc, 180))
             self._record_care_outcome(user_id, "failed", "scheduler_error", _clean(exc, 120))
             return {"evaluated": False, "reason": "error", "error": _clean(exc, 120)}
-        outcome = self._last_outcome.get(user_id, {})
         delivered = False
-        if text:
+        if text and not preview:
             delivered = await self._deliver(umo, text)
-            if not delivered:
+            reservation_id = receipt.get("reservation_id")
+            if delivered:
+                if reservation_id:
+                    await self._mark_delivered(reservation_id)
+                self._record_care_outcome(user_id, "sent", "delivered", _clean(text, 80))
+            else:
+                if reservation_id:
+                    await self._mark_delivery_failed(reservation_id, "deliver_failed")
                 self._record_care_outcome(user_id, "failed", "deliver_failed", _clean(text, 80))
+        outcome = self._last_outcome.get(user_id, {})
         return {
             "evaluated": True,
-            "sent": bool(text),
+            "sent": delivered,
             "delivered": delivered,
+            "preview": preview,
             "outcome": outcome.get("outcome", ""),
             "reason": outcome.get("reason", ""),
         }
@@ -461,10 +495,12 @@ class PhoneCompanionContext(Star):
                     "eval_count": self._decision_eval_count.get(uid, 0),
                     "last_at": self._decision_last[uid].isoformat(timespec="seconds") if uid in self._decision_last else "",
                     "last_eval_at": self._decision_eval_last[uid].isoformat(timespec="seconds") if uid in self._decision_eval_last else "",
+                    "care_memory": self._decision_memory.get(uid, {}),
                     "reservations": [
                         {
                             "id": item["id"],
                             "status": item.get("status", ""),
+                            "day": item.get("day", ""),
                             "created_at": item.get("created_at", 0),
                             "expires_at": item.get("expires_at", 0),
                             "released_reason": item.get("released_reason", ""),
@@ -496,6 +532,15 @@ class PhoneCompanionContext(Star):
             for uid, entry in users.items():
                 if not isinstance(entry, dict):
                     continue
+                memory = entry.get("care_memory")
+                if isinstance(memory, dict):
+                    self._decision_memory[uid] = {
+                        "scope": _clean(memory.get("scope"), 64),
+                        "fingerprint": _clean(memory.get("fingerprint"), 64),
+                        "next_check": min(self._safe_float(memory.get("next_check")), time.time() + 7200),
+                        "messages": [x[:500] for x in memory.get("messages", [])[-5:] if isinstance(x, str)] if isinstance(memory.get("messages"), list) else [],
+                        "reason": _clean(memory.get("reason"), 48),
+                    }
                 day = _clean(entry.get("day"), 20)
                 # R03-v3: always restore last_at for cooldown calculation,
                 # even if the day changed. The daily count resets on a new
@@ -531,6 +576,7 @@ class PhoneCompanionContext(Star):
                     item = {
                         "id": reservation_id,
                         "user_id": uid,
+                        "day": _clean(raw.get("day"), 20) or day,
                         "status": _clean(raw.get("status"), 20) or "unknown",
                         "created_at": self._safe_float(raw.get("created_at")),
                         "expires_at": self._safe_float(raw.get("expires_at")),
@@ -541,7 +587,7 @@ class PhoneCompanionContext(Star):
                         # message was produced: free the slot again.
                         item["status"] = "released"
                         item["released_reason"] = "restart"
-                        self._decision_count[uid] = max(0, self._decision_count.get(uid, 0) - 1)
+                        self._return_reserved_slot(item)
                     self._reservations[reservation_id] = item
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             logger.warning("[PhoneCompanionContext] decision budget file invalid; ignoring")
@@ -601,7 +647,7 @@ class PhoneCompanionContext(Star):
         return _clean(text, 500)
 
     def _autonomous_decision_context(self, user: dict[str, Any], screen: dict[str, Any], health: dict[str, Any]) -> str:
-        if not self._autonomous_enabled() or not self._eligible_user(user):
+        if self._bridge_mode == "v2" or not self._autonomous_enabled() or not self._eligible_user(user):
             return ""
         user_id = _clean(user.get("user_id") or user.get("id"), 120)
         # P1-B: the slot is already reserved for this evaluation, so a "daily
@@ -645,7 +691,7 @@ class PhoneCompanionContext(Star):
             try:
                 role = _clean(role_getter(user, user_id), 30).lower()
             except Exception:
-                pass
+                return False
         return role in {"owner", "primary", "self"}
 
     def _cache_seconds(self, key: str, default: int, maximum: int) -> int:
@@ -655,6 +701,9 @@ class PhoneCompanionContext(Star):
             return default
 
     def _companion(self) -> Any | None:
+        current = v2_adapter.discover(self.context)
+        if current is not None:
+            return current
         for name in (
             "data.plugins.astrbot_plugin_private_companion.main",
             "astrbot_plugin_private_companion.main",
@@ -699,8 +748,25 @@ class PhoneCompanionContext(Star):
         target = self._companion()
         phone = self._phone()
         if target is None or phone is None:
+            if self._target is not None:
+                self._uninstall_bridge("dependency_unavailable")
             self._bridge_status.update({"enabled": True, "installed": False, "reason": "private companion unavailable"})
             return
+        api = getattr(target, "extension_api", None)
+        if getattr(api, "api_version", None) == v2_adapter.API_VERSION:
+            if self._target is not target or self._bridge_mode != "v2":
+                self._uninstall_bridge("host_reloaded")
+                self._target = target
+                self._original = None
+                self._bridge_mode = "v2"
+                self._wrapped = self._v2_generation
+                logger.info("[PhoneCompanionContext] 7.x adapter ready; independent scheduler, no host method patch")
+            setattr(phone, "_phone_companion_context", self)
+            self._published_phone = phone
+            self._bridge_status = {"enabled": True, "installed": True, "mode": "v2", "api": v2_adapter.API_VERSION}
+            self._publish_care_status()
+            return
+        self._bridge_mode = "legacy"
         current = target._generate_proactive_message_with_llm
         if target is self._target and current is self._wrapped:
             self._bridge_status.update({"enabled": True, "installed": True, "target": type(target).__name__})
@@ -720,7 +786,7 @@ class PhoneCompanionContext(Star):
         original = current
 
         @functools.wraps(original)
-        async def wrapped(*args, __original=original, **kwargs):
+        async def wrapped(*args, __original=original, _care_receipt=None, **kwargs):
             positional = list(args)
             user = positional[0] if positional else kwargs.get("user")
             action_context = kwargs.get(
@@ -728,7 +794,7 @@ class PhoneCompanionContext(Star):
                 positional[3] if len(positional) > 3 else "",
             )
             return await self._proxied_generation(
-                __original, positional, kwargs, user, str(action_context or "")
+                __original, positional, kwargs, user, str(action_context or ""), _care_receipt
             )
 
         wrapped._phone_context_bridge = True
@@ -756,6 +822,9 @@ class PhoneCompanionContext(Star):
             if getattr(target, "_generate_proactive_message_with_llm", None) is wrapped:
                 target._generate_proactive_message_with_llm = original
                 restored = True
+        if getattr(self._published_phone, "_phone_companion_context", None) is self:
+            delattr(self._published_phone, "_phone_companion_context")
+        self._published_phone = None
         self._target = None
         self._wrapped = None
         self._original = None
@@ -768,6 +837,96 @@ class PhoneCompanionContext(Star):
         if restored:
             logger.info("[PhoneCompanionContext] bridge uninstalled (%s)", reason)
 
+    async def _v2_generation(self, user, companion_name="", trigger="care_tick", _care_receipt=None, *, preview=False):
+        user_id = _clean(user.get("user_id"), 120)
+        if not self._enabled() or not self._autonomous_enabled() or not self._eligible_user(user):
+            return ""
+        if v2_adapter.discover(self.context) is not self._target:
+            self._record_care_outcome(user_id, "gated", "companion_reloaded")
+            return ""
+        # Cheap gates happen before fetching context. Reservation below repeats
+        # the checks atomically after the awaited reads.
+        allowed, reason = self._decision_allowed(user_id)
+        if not allowed:
+            self._record_care_outcome(user_id, "gated", reason)
+            return ""
+        try:
+            material = await asyncio.wait_for(v2_adapter.conversation_material(self.context, user["umo"], user_id), timeout=5)
+            updated = material.get("updated_at")
+            quiet_gap = max(0, min(self._safe_int(self.config.get("care_recent_chat_seconds", 180), 180), 3600))
+            if type(updated) in {int, float} and 0 <= time.time() - updated < quiet_gap:
+                self._record_care_outcome(user_id, "gated", "recent_conversation")
+                return ""
+            enriched = await self._enrich(user, "")
+            signals = self._latest_signals.get(user_id, {})
+            digest = v2_adapter.fingerprint(material, signals)
+            scope = v2_adapter.fingerprint({"conversation_id": user["umo"] + ":" + material["conversation_id"], "persona": material["persona"], "recent": []}, {})
+            previous = self._decision_memory.get(user_id, {})
+            if previous.get("scope") != scope:
+                previous = {}
+            if previous.get("fingerprint") == digest and time.time() < self._safe_float(previous.get("next_check")):
+                self._record_care_outcome(user_id, "gated", "unchanged_context")
+                return ""
+            provider_id = _clean(self.config.get("care_provider_id"), 160)
+            provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider(umo=user["umo"])
+            if provider is None:
+                raise ValueError("provider_unavailable")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            known = {"private_session_mismatch", "conversation_scope_mismatch", "conversation_unavailable",
+                     "conversation_empty", "history_invalid", "provider_unavailable"}
+            reason = str(exc) if isinstance(exc, ValueError) and str(exc) in known else "context_or_provider_unavailable"
+            self._record_care_outcome(user_id, "gated", reason)
+            return ""
+        reservation, reason = await self._reserve_decision(user_id)
+        if reservation is None:
+            self._record_care_outcome(user_id, "gated", reason)
+            return ""
+        if _care_receipt is not None:
+            _care_receipt["reservation_id"] = reservation["id"]
+        try:
+            messages = previous.get("messages", [])[-5:]
+            request = {"local_time": datetime.now().isoformat(timespec="minutes"),
+                "recent_conversation": material["recent"], "phone_context": enriched[:6000],
+                "recent_care_messages": messages, "last_contact": self._decision_last.get(user_id).isoformat() if user_id in self._decision_last else None}
+            timeout = max(3, min(self._safe_int(self.config.get("care_model_timeout_seconds", 30), 30), 90))
+            response = await asyncio.wait_for(provider.text_chat(
+                prompt=json.dumps(request, ensure_ascii=False),
+                system_prompt=material["persona"] + chr(10) * 2 + v2_adapter.DECISION_PROMPT), timeout=timeout)
+            decision = v2_adapter.parse_decision(getattr(response, "completion_text", ""))
+            current_material = await asyncio.wait_for(v2_adapter.conversation_material(self.context, user["umo"], user_id), timeout=5)
+            if any(current_material[k] != material[k] for k in ("conversation_id", "persona", "recent")):
+                await self._release_decision(reservation, "conversation_changed")
+                self._record_care_outcome(user_id, "gated", "conversation_changed")
+                return ""
+            if v2_adapter.discover(self.context) is not self._target:
+                await self._release_decision(reservation, "companion_reloaded")
+                return ""
+            if decision["intent"] == "send_message" and v2_adapter.repeated(decision["message"], messages + [m["content"] for m in material["recent"] if m["role"] == "assistant"]):
+                decision.update(intent="no_action", reason_code="duplicate_message")
+            text = await self._consume_autonomy_result(user, user_id, decision, reservation, preview=preview)
+            # Remember no_action as well: unchanged evidence shouldn't repeatedly
+            # spend tokens. Preview outputs never count as delivered messages.
+            if text:
+                messages = (messages + [text[:500]])[-5:]
+            if not preview:
+                self._decision_memory[user_id] = {
+                    "scope": scope, "fingerprint": digest, "next_check": time.time() + decision["recheck_after_seconds"],
+                    "messages": messages, "reason": decision["reason_code"],
+                }
+                self._save_decision_budget()
+            if not text and decision["intent"] == "no_action":
+                self._record_care_outcome(user_id, "no_action", decision["reason_code"])
+            return text
+        except asyncio.CancelledError:
+            await self._release_decision(reservation, "cancelled")
+            raise
+        except Exception:
+            await self._release_decision(reservation, "model_or_protocol_error")
+            self._record_care_outcome(user_id, "failed", "model_or_protocol_error")
+            return ""
+
     async def _proxied_generation(
         self,
         original: Any,
@@ -775,6 +934,7 @@ class PhoneCompanionContext(Star):
         keyword_arguments: dict[str, Any],
         user: Any,
         action_context: str,
+        care_receipt: dict[str, Any] | None = None,
     ) -> Any:
         """Route one proactive generation through the bridge.
 
@@ -801,8 +961,13 @@ class PhoneCompanionContext(Star):
                 logger.debug("[PhoneCompanionContext] care gated: %s for %s", reason, user_id)
                 self._record_care_outcome(user_id, "gated", reason)
                 return ""
+            if care_receipt is not None:
+                care_receipt["reservation_id"] = reservation["id"]
         try:
             enriched = await self._enrich(user, action_context)
+        except asyncio.CancelledError:
+            await self._release_decision(reservation, "cancelled")
+            raise
         except Exception as exc:
             logger.warning(
                 "[PhoneCompanionContext] enrichment failed; continues: %s", _clean(exc, 180)
@@ -814,7 +979,7 @@ class PhoneCompanionContext(Star):
             keyword_arguments["action_context"] = enriched
         try:
             generated = await original(*positional, **keyword_arguments)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # A model failure must not leave the slot held until its TTL.
             if reservation is not None:
                 await self._release_decision(reservation, "model_error")
@@ -824,7 +989,7 @@ class PhoneCompanionContext(Star):
             return self._amplify_proactive_text(user, generated)
         try:
             return await self._consume_autonomy_result(user, user_id, generated, reservation)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             await self._release_decision(reservation, "consume_error")
             raise
 
@@ -834,6 +999,8 @@ class PhoneCompanionContext(Star):
         user_id: str,
         generated: Any,
         reservation: dict[str, Any],
+        *,
+        preview: bool = False,
     ) -> Any:
         """Strictly consume the model's decision on the autonomy path."""
         # v4 §3: authorization may have been revoked while the model ran; the
@@ -856,17 +1023,17 @@ class PhoneCompanionContext(Star):
             plain = self._plain_text_message(generated)
             if not plain:
                 logger.warning(
-                    "[PhoneCompanionContext] care invalid_decision for %s: %s",
-                    user_id, _clean(str(generated)[:120], 120),
+                    "[PhoneCompanionContext] care invalid_decision for %s (type=%s)",
+                    user_id, type(generated).__name__,
                 )
                 await self._release_decision(reservation, "invalid_decision")
                 self._record_care_outcome(user_id, "invalid", "invalid_decision",
                                           _clean(str(generated)[:80], 80))
                 return ""
             message = plain
-            if not self._mode_allows_send():
+            if preview or not self._mode_allows_send():
                 logger.info(
-                    "[PhoneCompanionContext] care preview: %s for %s", _clean(message, 80), user_id
+                    "[PhoneCompanionContext] care preview (chars=%s) for %s", len(message), user_id
                 )
                 await self._release_decision(reservation, "preview")
                 self._record_care_outcome(user_id, "preview", "preview", message)
@@ -876,8 +1043,8 @@ class PhoneCompanionContext(Star):
                 self._record_care_outcome(user_id, "failed", "budget_unavailable")
                 return ""
             logger.info(
-                "[PhoneCompanionContext] care send (plain text) for %s: %s",
-                user_id, _clean(message, 80),
+                "[PhoneCompanionContext] care generated for %s (chars=%s)",
+                user_id, len(message),
             )
             self._record_care_outcome(user_id, "sent_text", "sent_plain_text", message)
             return self._amplify_proactive_text(user, message)
@@ -888,10 +1055,10 @@ class PhoneCompanionContext(Star):
             self._record_care_outcome(user_id, "no_action", "no_action")
             return ""
         message = decision.get("message", "")
-        if not self._mode_allows_send():
+        if preview or not self._mode_allows_send():
             # v4: preview blocks ALL autonomy output, including send_message.
             logger.info(
-                "[PhoneCompanionContext] care preview: %s for %s", _clean(message, 80), user_id
+                "[PhoneCompanionContext] care preview (chars=%s) for %s", len(message), user_id
             )
             await self._release_decision(reservation, "preview")
             self._record_care_outcome(user_id, "preview", "preview", message)
@@ -1110,7 +1277,7 @@ class PhoneCompanionContext(Star):
                 "_reported_at": reported_at}
 
     async def _enrich(self, user: dict[str, Any], action_context: str) -> str:
-        if not self._relationship_enabled() or not self._eligible_user(user):
+        if not (self._relationship_enabled() or self._autonomous_enabled()) or not self._eligible_user(user):
             return action_context
         phone = self._phone()
         if phone is None:
@@ -1169,6 +1336,7 @@ class PhoneCompanionContext(Star):
         # Sleep guard remains a deterministic phone-agent feature; the companion LLM never triggers it.
         intervention = ""
         relationship = self._relationship_context(user, screen_signal, health_signal, intervention)
+        self._latest_signals[_clean(user.get("user_id") or user.get("id"), 120)] = {"screen": screen_signal, "health": health_signal}
         autonomy = self._autonomous_decision_context(user, screen_signal, health_signal)
         return (
             (action_context + "\n" if action_context else "")

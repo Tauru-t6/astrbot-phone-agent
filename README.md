@@ -10,6 +10,8 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 ## 5 分钟上手（自有 App 模式）
 
+0.9.0 新增可选 LLM 多步规划与 Private Companion 7.x 关怀适配。开启 enable_llm_task_planner 后，模型只生成受限计划，执行仍需审批；关怀会参考同一私聊的近期对话并抑制重复打扰。配置及边界见 docs/PRIVATE_COMPANION_719_ADAPTATION.md。
+
 1. **装插件**：在 AstrBot 插件市场搜索 `Phone Control` 安装，或按[安装与升级](#安装与升级)用 Git 拉取。
 2. **装 App**：从 [App Releases](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases/latest) 下载最新 APK，安装后把 Shizuku 启动并授权。
 3. **填三个字段**（App 的「纸笺 → 服务器连接」）：
@@ -77,7 +79,7 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 Private Companion <── 可选 companion-context 手机 / 健康摘要
 ```
 
-App 内聊天直接连接 AstrBot OpenAPI。手机指令、聊天、健康数据同步是不同链路，不需要为了健康查询保持手机 ADB 常连。
+聊天在 QQ 等 AstrBot 会话中进行，App 专注设备控制、状态和提醒。手机指令、聊天、健康数据同步是不同链路，不需要为了健康查询保持手机 ADB 常连。
 
 ## 安装与升级
 
@@ -88,7 +90,7 @@ cd <astrbot-data>/plugins
 git clone https://github.com/Tauru-t6/astrbot-phone-agent.git astrbot_plugin_phone_agent
 ```
 
-目录内应直接有 `main.py`、`device_app.py`、`metadata.yaml` 和 `pages/`。使用 [Release ZIP](https://github.com/Tauru-t6/astrbot-phone-agent/releases) 时同样保持这个布局，不要多套一层目录。
+目录内应直接有 `main.py`、`device_app.py`、`task_runner.py`、`care_scheduler.py`、`storage.py`、`http_transport.py`、`metadata.yaml` 和 `pages/`。安装或升级时复制完整插件目录，避免遗漏内部模块。使用 [Release ZIP](https://github.com/Tauru-t6/astrbot-phone-agent/releases) 时同样保持这个布局，不要多套一层目录。
 
 更新前备份插件配置和提醒、策略、任务状态文件，备份目录放在 `plugins/` 之外。更新后在 WebUI 重载插件；systemd user 部署可执行：
 
@@ -377,7 +379,8 @@ Token 字段不回显，输入留空保留原值。审计不含正文并不意�
 ```bash
 python -m pip install quart pytest
 python -m pytest tests -q
-python -m py_compile main.py device_app.py companion-context/main.py deploy/relay/relay_server.py
+python -m py_compile main.py model_planning.py device_app.py task_runner.py care_scheduler.py storage.py http_transport.py companion-context/main.py companion-context/v2_adapter.py deploy/relay/relay_server.py
+node --test tests/test_dashboard.js
 ```
 
 详细操作和完整配置参阅[中文教程](README.zh-CN.md)或 [English guide](README.en.md)。项目在原有 Operit 链路之上增加 App 模式，功能列表中的保留项并未因新前端而移除。
@@ -385,3 +388,7 @@ python -m py_compile main.py device_app.py companion-context/main.py deploy/rela
 ## 致谢
 
 本项目在 AI 编程助手协作下持续完善。感谢 [AstrBot](https://github.com/AstrBotDevs/AstrBot)、[Operit](https://github.com/Mavaebrook/Operit)、[Shizuku](https://github.com/RikkaApps/Shizuku)、[Tailscale](https://github.com/tailscale/tailscale) 和健康同步相关开源项目。欢迎通过 Issue 提供可复现问题与脱敏日志。
+
+## 许可证
+
+本仓库自有代码采用 [MIT License](LICENSE)。可选联动插件及第三方依赖遵循各自的许可证，本仓库的 MIT 授权不覆盖 Private Companion 的上游代码或服务器本地修改。
