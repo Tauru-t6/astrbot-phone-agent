@@ -10,6 +10,8 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 ## 5 分钟上手（自有 App 模式）
 
+0.9.1 修复设备中途换绑、授权累计步数、严格核验和取消后的恢复责任。升级时重新签发旧 grant；使用受限任务的 Relay 兜底时须同步更新 Relay。现有 App 0.3.26 可继续使用，详见 [升级说明](docs/REVIEW_FIXES_0_9_1.md)。
+
 0.9.0 新增可选 LLM 多步规划与 Private Companion 7.x 关怀适配。开启 enable_llm_task_planner 后，模型只生成受限计划，执行仍需审批；关怀会参考同一私聊的近期对话并抑制重复打扰。配置及边界见 docs/PRIVATE_COMPANION_719_ADAPTATION.md。
 
 1. **装插件**：在 AstrBot 插件市场搜索 `Phone Control` 安装，或按[安装与升级](#安装与升级)用 Git 拉取。

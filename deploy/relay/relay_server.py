@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -102,6 +103,15 @@ def _load() -> None:
             pass
 
 
+def _replay_safe(task: dict) -> bool:
+    try:
+        command = json.loads(task.get("message", ""))
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(command, dict) and command.get("type") == "command"
+            and command.get("schema_version") == 1 and bool(command.get("command_id")))
+
+
 def _gc_locked(now: float) -> bool:
     changed = False
     for task in _state["tasks"]:
@@ -112,7 +122,9 @@ def _gc_locked(now: float) -> bool:
             task.pop("claimed_at", None)
             changed = True
         if task.get("status") in {"claimed", "running"} and now - task.get("claimed_at", task.get("created_at", now)) >= CLAIM_LEASE_SECONDS:
-            task["status"] = "pending"
+            # Structured App commands have durable command-id deduplication.
+            # Operit natural-language tasks do not: replay could repeat effects.
+            task["status"] = "pending" if _replay_safe(task) else "unknown"
             task.pop("claimed_at", None)
             task.pop("device_id", None)
             changed = True
@@ -133,6 +145,9 @@ def _gc_locked(now: float) -> bool:
 
 
 def push_task(payload: dict) -> dict:
+    target = payload.get("target_device_id")
+    if target is not None and (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target)):
+        raise ValueError("invalid target_device_id")
     now = time.time()
     with _lock:
         _gc_locked(now)
@@ -145,6 +160,8 @@ def push_task(payload: dict) -> dict:
             "created_at": now,
             "status": "pending",
         }
+        if target:
+            task["target_device_id"] = target
         _state["tasks"].append(task)
         _persist()
         return dict(task)
@@ -156,6 +173,8 @@ def poll_task(device_id: str | None = None) -> dict | None:
         changed = _gc_locked(now)
         for task in _state["tasks"]:
             if task["status"] != "pending":
+                continue
+            if task.get("target_device_id") and task["target_device_id"] != device_id:
                 continue
             task["status"] = "claimed"
             task["claimed_at"] = now
@@ -288,7 +307,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         if self._rate_limited("get"):
             return
         if path == "/health":
-            self._reply(200, {"success": True, "service": "phone-agent-relay", "require_device_id": REQUIRE_DEVICE_ID})
+            self._reply(200, {"success": True, "service": "phone-agent-relay", "version": "0.9.1", "require_device_id": REQUIRE_DEVICE_ID,
+                              "targeted_tasks": True})
             return
         if path == "/poll":
             device_id = self._require_device()
@@ -342,6 +362,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             try:
                 task = push_task(payload)
+            except ValueError as exc:
+                self._reply(400, {"success": False, "error": str(exc)})
+                return
             except OverflowError as exc:
                 self._reply(503, {"success": False, "error": str(exc)})
                 return

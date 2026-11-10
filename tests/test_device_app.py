@@ -137,7 +137,7 @@ class RebindTests(unittest.TestCase):
         self.backend.register({"device_id": "phone-a", "base_url": "http://a:8260"})
         generation = self.backend.registration_generation()
         self.backend.record_device_status({"battery_percent": 50})
-        self.backend.register({"device_id": "phone-a", "base_url": "http://a2:8260"})
+        self.backend.register({"device_id": "phone-a", "base_url": "http://a:8260"})
         self.assertEqual(self.backend.registration_generation(), generation)
         self.assertEqual(self.backend.last_status()["battery_percent"], 50)
 

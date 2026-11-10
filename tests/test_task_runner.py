@@ -79,12 +79,12 @@ class GrantTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "grant_package_not_allowed")
 
-    def test_empty_package_allowlist_means_any_package(self):
+    def test_empty_package_allowlist_never_authorizes_package_actions(self):
         grant = self.issue(packages=[])
         allowed, reason = grant.check(subject=USER, device_id=DEVICE, action="suspend_app",
                                       package="com.any.app", now=1010.0)
-        self.assertTrue(allowed)
-        self.assertEqual(reason, "ok")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "grant_package_required")
 
     def test_grant_roundtrip(self):
         grant = self.issue()
@@ -374,11 +374,13 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
             run.add_step(action, args)
         return executor, run
 
-    def grant(self, actions=("open_app",), packages=(), max_steps=3):
-        return module.ScopedGrant.issue(
+    def grant(self, actions=("open_app",), packages=(VIDEO,), max_steps=3):
+        grant = module.ScopedGrant.issue(
             subject=USER, device_id=DEVICE, actions=list(actions), packages=list(packages),
             ttl_seconds=120, max_steps=max_steps, now=time.time(),
         )
+        self.store.add_grant(grant)
+        return grant
 
     async def test_open_app_passes_only_when_foreground_changes(self):
         def launch():

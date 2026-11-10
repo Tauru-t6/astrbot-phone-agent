@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.9.1] - 2026-11-10
+
+- Pin task execution, observations and direct routing to a device binding; stop
+  remaining steps if the phone or its endpoints change. Relay fallback for a
+  bound task requires the updated relay with device-targeted queue support.
+- Enforce a durable, cumulative grant step budget across runs, bind approval
+  grants to their approved run, require explicit package scopes, and simulate
+  remaining budget accurately in previews. Legacy grants without a usage ledger
+  expire on upgrade and must be reissued; reminder and task history are retained.
+- Reject non-boolean policy verification, stop on unknown foreground state, skip
+  malformed history records, reject invalid approval states, and finish tasks
+  after internal verification failures instead of leaving them executing.
+- Persist policy recovery intent before suspending an app. Cancellation or an
+  uncertain response retains a recovery deadline; storage failure before dispatch
+  refuses the operation. A previously unknown first suspension is no longer
+  treated as proof that no restore is owed.
+- Require explicit chat approval and release commands; block private reminder
+  lists and Operit free-text results in groups unless explicitly allowed.
+- Quote legacy ADB text for the device shell. Verified task execution explicitly
+  requires the App backend rather than silently using ADB in Operit mode.
+- Do not requeue expired natural-language Operit claims automatically. Structured
+  App commands retain command-ID-based recovery; lease renewal belongs to the
+  claiming device. Sort notification batches by their actual posting time.
+- Add review regression tests and publish a complete source archive containing
+  tests in addition to the runtime plugin archive. App 0.3.26 and optional
+  Phone Companion Context 0.3.0 remain compatible.
+
 ## [0.9.0] - 2026-11-09
 
 - Add bounded LLM multi-step planning, explicit clarification, strict action/package validation and safe single-step fallback. Existing grants, approval and execution verification remain authoritative.

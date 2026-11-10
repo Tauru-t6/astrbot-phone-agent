@@ -963,11 +963,13 @@ class PolicyLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(timer.cancelling())
         self.device.side_effect = None
 
-    async def test_failed_first_disable_does_not_create_an_owner(self):
+    async def test_failed_first_disable_keeps_a_durable_recovery_intent(self):
         self.device.return_value = {"success": False, "error": "rejected"}
-        await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
-        self.assertEqual(self.leases(), {})
-        self.assertNotIn(VIDEO, self.plugin._policy_leases)
+        result = await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")
+        self.assertTrue(result["restore_pending"])
+        self.assertIsNotNone(self.leases()["manual"].task)
+        saved = json.loads(Path(self.config["policy_state_path"]).read_text(encoding="utf-8"))
+        self.assertIn(VIDEO, saved["packages"])
 
     async def test_early_release_cancels_only_its_own_timer(self):
         await self.plugin._execute_app_policy(VIDEO, "disable", 30, source="manual")

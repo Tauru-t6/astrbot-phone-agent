@@ -36,7 +36,8 @@ class RelayQueueTests(unittest.TestCase):
         self.assertTrue(relay.submit_result(task["id"], True, "done", device_id="phone-a"))
 
     def test_expired_claim_returns_to_queue(self):
-        task = relay.push_task({"message": "observe"})
+        task = relay.push_task({"message": json.dumps({"type": "command", "schema_version": 1,
+                                                       "command_id": "replay-safe", "action": "ping"})})
         relay.poll_task("phone-a")
         relay._state["tasks"][0]["claimed_at"] = time.time() - relay.CLAIM_LEASE_SECONDS - 1
         reclaimed = relay.poll_task("phone-b")

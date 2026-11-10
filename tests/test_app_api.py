@@ -634,7 +634,7 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         approval = next(iter(self.plugin._task_runs._approvals.values()))
         with patch.object(self.plugin._task_executor, "execute",
                           new=AsyncMock(side_effect=lambda run, **kw: run)) as execute:
-            reply = await self.plugin._chat_task_decision(approval.subject, "可以")
+            reply = await self.plugin._chat_task_decision(approval.subject, "批准")
         self.assertIsNotNone(reply)
         self.assertEqual(execute.await_count, 1)
         self.assertEqual(approval.status, "approved")
@@ -701,7 +701,7 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
             proposed=await (await self.post("/app/task/propose",{"goal":"打开哔哩哔哩回桌面再打开"})).get_json()
             with patch.object(self.plugin._task_executor, "execute", new=AsyncMock(side_effect=lambda run,**kw:run)) as execute:
                 if via_chat:
-                    await self.plugin._chat_task_decision(proposed["approval"]["subject"], "可以")
+                    await self.plugin._chat_task_decision(proposed["approval"]["subject"], "批准")
                 else:
                     await self.post("/app/task/approve", {"approval_id":proposed["approval"]["approval_id"]})
                 self.assertEqual(execute.await_args.kwargs["grant"].max_steps,3)

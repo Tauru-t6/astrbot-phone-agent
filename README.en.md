@@ -4,6 +4,11 @@
 
 Control an Android phone from AstrBot through either **AstrBot Phone Agent App** or **OperitAI**. AstrBot interprets requests and delegates them to the selected backend. App mode executes a closed set of structured commands through Shizuku; Operit mode owns screenshot/OCR, UI interaction, text input, and Shizuku-backed natural-language operations.
 
+Version 0.9.1 fixes task device binding, durable grant budgets, strict verification
+and cancellation recovery. Reissue legacy grants and update the relay when using
+device-bound task fallback. App 0.3.26 and Phone Companion Context 0.3.0 remain
+compatible. See [upgrade notes](docs/REVIEW_FIXES_0_9_1.md).
+
 The default control backend is Operit. Set `control_backend=app` for the standalone App, or `control_backend=operit` for OperitAI. The server does not need a persistent ADB connection, and the phone does not need to stay connected to a computer.
 
 | | App mode | OperitAI mode |

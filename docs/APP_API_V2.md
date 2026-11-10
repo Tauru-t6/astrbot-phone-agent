@@ -136,6 +136,17 @@ audit log so an execution during someone's active session stays traceable.
 returns `{grant_id, expires_at}`. `actions` must name write actions; the
 package-bound ones (`open_app`, `close_app`, `suspend_app`, `unsuspend_app`)
 require `packages`. `ttl_seconds` is clamped to 30–600 and `max_steps` to 1–3.
+
+Since 0.9.1, `max_steps` is a durable cumulative write budget for that grant,
+including across runs. Package actions require a nonempty explicit package
+allowlist; an empty list does not authorize arbitrary apps. Approval grants are
+bound to the approved run. Previewing does not spend budget. Legacy grants that
+lack a usage ledger must be reissued after upgrading. Device identity or endpoint
+changes stop the run; already dispatched operations may still complete.
+
+Device-bound Relay submissions require relay 0.9.1 (`targeted_tasks=true` in
+authenticated `/health`). The queue's optional `target_device_id` pins the task
+to the matching `X-Relay-Device-ID` claimant; App 0.3.26 already sends this header.
 `POST /app/task/cancel` accepts `{run_id}` and only flags the run.
 
 ## App reminders

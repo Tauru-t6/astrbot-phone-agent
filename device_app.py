@@ -266,8 +266,10 @@ class DeviceAppBackend:
     def direct_urls(self) -> list[str]:
         """Ordered direct endpoints; home LAN first, Tailscale as fallback."""
         raw = str(self._config.get("app_direct_urls") or "")
+        return self._direct_urls_from(self.registration() or {}, raw)
+
+    def _direct_urls_from(self, registered: dict[str, Any], raw: str) -> list[str]:
         configured = [item.strip().rstrip("/") for item in re.split(r"[,\s]+", raw) if item.strip()]
-        registered = self.registration() or {}
         announced = registered.get("base_urls") or [registered.get("base_url", "")]
         values = configured + [str(item).strip().rstrip("/") for item in announced if str(item).strip()]
         return list(dict.fromkeys(item for item in values if self.valid_base_url(item)))[:8]
@@ -321,12 +323,14 @@ class DeviceAppBackend:
             return {"success": False, "error": "token fingerprint mismatch; update app_shared_token on one side"}
         with self._lock:
             previous = self._registration
-            rebind = previous is None or previous.get("device_id") != device_id
+            rebind = (previous is None or previous.get("device_id") != device_id
+                      or sorted(previous.get("base_urls") or []) != sorted(base_urls or [base_url]))
             if rebind:
                 # P1-C: a new binding must not inherit the old device's status.
                 self._registration_generation += 1
                 self._last_status = None
                 self._status_history = []
+                self._active_url = ""
             self._registration = {
                 "device_id": device_id,
                 "base_url": base_url,
@@ -356,6 +360,16 @@ class DeviceAppBackend:
         """Monotonic binding id; changes when a different device registers."""
         with self._lock:
             return self._registration_generation
+
+    def binding(self) -> tuple[str, int]:
+        with self._lock:
+            return (self._registration or {}).get("device_id", ""), self._registration_generation
+
+    @staticmethod
+    def _device_changed(envelope: dict[str, Any]) -> dict[str, Any]:
+        return {"success": False, "error_code": "device_changed", "outcome": "unknown",
+                "command_id": envelope["command_id"], "action": envelope["action"],
+                "error": "the registered device or its endpoints changed"}
 
     def _token_fingerprint(self) -> str:
         import hashlib
@@ -391,6 +405,8 @@ class DeviceAppBackend:
             if phone_reported is not None and previous_reported is not None and phone_reported < previous_reported:
                 return
             self._last_status = {
+                "device_id": current_device,
+                "binding_generation": self._registration_generation,
                 "battery_percent": battery_percent,
                 "charging": _opt_bool(status.get("charging")),
                 "foreground_package": _text(status.get("foreground_package"), 160),
@@ -531,8 +547,17 @@ class DeviceAppBackend:
             self._active_url = result["base_url"]
         return self._active_url
 
-    def _direct_command(self, envelope: dict[str, Any], timeout: float) -> dict[str, Any]:
-        urls = self.direct_urls()
+    def _direct_command(self, envelope: dict[str, Any], timeout: float,
+                        *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
+        if expected_binding is not None:
+            with self._lock:
+                if ((self._registration or {}).get("device_id", ""), self._registration_generation) != expected_binding:
+                    return self._device_changed(envelope)
+                registration = dict(self._registration or {})
+                configured = str(self._config.get("app_direct_urls") or "")
+            urls = self._direct_urls_from(registration, configured)
+        else:
+            urls = self.direct_urls()
         if not urls:
             return {"success": False, "error_code": "not_registered", "error": "phone app has not registered"}
         if self._active_url and self._active_url in urls:
@@ -561,7 +586,11 @@ class DeviceAppBackend:
             # cap so a hanging route cannot eat the shared budget.
             attempt_cap = SLOW_ACTION_ATTEMPT_SECONDS if envelope["action"] in SLOW_ACTIONS else 8.0
             attempt_timeout = min(remaining, max(4.0, min(attempt_cap, remaining / routes_left)))
+            if expected_binding is not None and self.binding() != expected_binding:
+                return self._device_changed(envelope)
             result = self._http_json(base_url + "/command", self.shared_token(), method="POST", payload=envelope, timeout=attempt_timeout)
+            if expected_binding is not None and self.binding() != expected_binding:
+                return self._device_changed(envelope)
             if result.get("command_id") or result.get("type") == "result" or result.get("success"):
                 # A matching denial is final. A malformed result is also final:
                 # the command may already have run, so do not replay it.
@@ -592,15 +621,25 @@ class DeviceAppBackend:
         self._record_result(result)
         return result
 
-    def _relay_submit(self, envelope: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def _relay_submit(self, envelope: dict[str, Any], timeout: float,
+                      *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
         if not self.relay_enabled():
             return {"success": False, "error_code": "relay_unconfigured", "error": "relay is not configured"}
         deadline = time.monotonic() + timeout
+        payload = {"message": json.dumps(envelope, ensure_ascii=False)}
+        if expected_binding is not None:
+            health = self._http_json(self.relay_url() + "/health", self.relay_token(), timeout=min(5, timeout))
+            if health.get("targeted_tasks") is not True:
+                return {"success": False, "error_code": "relay_targeting_required",
+                        "error": "update the relay to support device-bound tasks"}
+            if self.binding() != expected_binding:
+                return self._device_changed(envelope)
+            payload["target_device_id"] = expected_binding[0]
         push = self._http_json(
             self.relay_url() + "/task",
             self.relay_token(),
             method="POST",
-            payload={"message": json.dumps(envelope, ensure_ascii=False)},
+            payload=payload,
             timeout=min(15, timeout),
         )
         if not push.get("success"):
@@ -609,6 +648,8 @@ class DeviceAppBackend:
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", task_id):
             return {"success": False, "error_code": "invalid_result", "error": "relay returned an invalid task ID"}
         while time.monotonic() < deadline:
+            if expected_binding is not None and self.binding() != expected_binding:
+                return self._device_changed(envelope)
             remaining = deadline - time.monotonic()
             result = self._http_json(
                 f"{self.relay_url()}/result/{task_id}", self.relay_token(), timeout=min(15, remaining)
@@ -629,6 +670,8 @@ class DeviceAppBackend:
                     envelope_result = json.loads(raw_message)
                 except json.JSONDecodeError:
                     envelope_result = {"success": False, "error_code": "bad_result", "error": "phone returned non-JSON result"}
+                if expected_binding is not None and self.binding() != expected_binding:
+                    return self._device_changed(envelope)
                 return self._normalize_result(envelope_result, envelope)
             if not result.get("success"):
                 return {"success": False, "error_code": "relay_lost_task", "error": _text(result.get("error"), 200)}
@@ -658,7 +701,7 @@ class DeviceAppBackend:
         }
 
     def execute(self, action: str, args: dict[str, Any] | None = None,
-                timeout: float | None = None) -> dict[str, Any]:
+                timeout: float | None = None, *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
         """Run one command: direct first, relay as fallback."""
         try:
             envelope = self.build_envelope(action, args)
@@ -677,7 +720,8 @@ class DeviceAppBackend:
         # transport budget has elapsed. Wire deadlines use whole seconds.
         envelope["deadline"] = max(1, math.ceil(timeout))
         deadline = time.monotonic() + timeout
-        direct = self._direct_command(envelope, timeout)
+        direct = (self._direct_command(envelope, timeout, expected_binding=expected_binding)
+                  if expected_binding is not None else self._direct_command(envelope, timeout))
         if direct.get("command_id") or direct.get("success") or not self.relay_enabled():
             self._audit("device_command", action=action, command_id=envelope["command_id"], backend="direct", success=bool(direct.get("success")), error=_text(direct.get("error"), 160))
             direct["backend"] = "direct"
@@ -688,7 +732,8 @@ class DeviceAppBackend:
         if remaining <= 0:
             return {"success": False, "action": action, "command_id": envelope["command_id"], "backend": "direct",
                     "error_code": "timeout", "error": "command transport budget exhausted"}
-        relay_result = self._relay_submit(envelope, remaining)
+        relay_result = (self._relay_submit(envelope, remaining, expected_binding=expected_binding)
+                        if expected_binding is not None else self._relay_submit(envelope, remaining))
         relay_result.setdefault("action", action)
         relay_result["backend"] = "relay"
         self._audit("device_command", action=action, command_id=envelope["command_id"], backend="relay", success=bool(relay_result.get("success")))

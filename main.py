@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import socket
 import sqlite3
 import tempfile
@@ -55,8 +56,10 @@ except ImportError:  # pragma: no cover - direct-module test harness
 try:
     from .task_runner import (
         APPROVAL_PENDING,
+        CURRENT_TASK_BINDING,
         ApprovalRequest,
         GRANT_SOURCE_APPROVAL,
+        PACKAGE_ACTIONS,
         PhoneTaskRun,
         ReadOnlyTaskRunner,
         RUN_CANCELLED,
@@ -70,8 +73,10 @@ try:
 except ImportError:  # pragma: no cover - direct-module test harness
     from task_runner import (
         APPROVAL_PENDING,
+        CURRENT_TASK_BINDING,
         ApprovalRequest,
         GRANT_SOURCE_APPROVAL,
+        PACKAGE_ACTIONS,
         PhoneTaskRun,
         ReadOnlyTaskRunner,
         RUN_CANCELLED,
@@ -165,13 +170,13 @@ class _PolicyLease:
     def __repr__(self) -> str:  # keep test failures readable
         return f"_PolicyLease(source={self.source!r}, until={self.until!r})"
 NG_RELEASE_RE = re.compile(
-    r"(解开|解除(限制|管控|暂停|视频限制)?|恢复(视频|应用|视频应用)?|"
-    r"让我(继续|用)|(继续|接着)刷|unsuspend|release|unlock)"
+    r"^\s*(?:请|帮我)?\s*(?:解开(?:限制)?|解除(?:限制|管控|暂停|视频限制)?|"
+    r"恢复(?:视频|应用|视频应用)|unsuspend|release|unlock)\s*[。.!！]?\s*$", re.IGNORECASE
 )
 
 # Chat-side approval: only a bare affirmative, and only while a proposal is
 # actually pending for this user. Anything longer stays a normal chat message.
-TASK_APPROVE_RE = re.compile(r"^\s*(可以|行|好|允许|确认|批准|同意|嗯|ok|okay)\s*[。.!！?？]?\s*$",
+TASK_APPROVE_RE = re.compile(r"^\s*(允许|确认|批准|同意|执行|ok|okay)\s*[。.!！]?\s*$",
                              re.IGNORECASE)
 TASK_REJECT_RE = re.compile(r"^\s*(拒绝|不要|不行|取消|算了|别|no)\s*[。.!！?？]?\s*$", re.IGNORECASE)
 
@@ -311,6 +316,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             run_timeout=self._task_float("task_run_timeout_seconds", 90.0, 10.0, 300.0),
             observation_max_age=float(self._night_guard_int("night_guard_status_max_age_seconds", 90, 10, 3600)),
             require_user_idle=self._bool_config("task_require_user_idle", True),
+            device_binding=self.device_app.binding,
         )
         self._load_reminders()
         self._load_notifications()
@@ -1017,8 +1023,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         return jsonify({"success": True, "result": result})
 
     async def _start_planned_task(self, goal, *, subject, device_id, grant=None, umo=""):
+        binding = self.device_app.binding()
         if not self._bool_config("enable_llm_task_planner", False):
-            return self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+            run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
+            run.summary["device_generation"] = binding[1]
+            return run
         if self._planning_lock.locked():
             raise ValueError("规划器正在处理另一项任务，请稍后再试。")
         async with self._planning_lock:
@@ -1035,7 +1044,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                     foreground=_text((self.device_app.last_status() or {}).get("foreground_package"), 160),
                     timeout=self._task_float("task_planner_timeout_seconds", 20, 3, 60),
                     max_steps=int(self._task_float("task_planner_max_steps", 6, 1, 10)))
-            if not self._enabled() or self._registered_device_id() != device_id:
+            if not self._enabled() or self._registered_device_id() != device_id or self.device_app.binding() != binding:
                 raise ValueError("规划期间设备或开关发生变化，请重新发起任务。")
             if result is None or result.reason == "model_unavailable":
                 if not simple_fallback_goal(goal):
@@ -1047,6 +1056,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                     raise ValueError("该操作尚未在服务端允许，请检查任务权限配置。")
                 run = self._task_runner.start(goal, subject=subject, device_id=device_id, grant=grant)
                 run.summary["planning"] = {"source": "rules", "reason": "model_unavailable"}
+                run.summary["device_generation"] = binding[1]
                 return run
             if result.reason:
                 raise ValueError(result.clarification or "目标暂不能安全规划，请补充具体动作。")
@@ -1055,6 +1065,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 run.add_step(step.action, step.args)
             run.transition("running")
             run.summary["planning"] = {"source": "llm", "steps": len(result.steps)}
+            run.summary["device_generation"] = binding[1]
             self._task_runs.add_run(run)
             return run
 
@@ -1149,12 +1160,14 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if not proposed_device:
             run.device_id = current_device
             approval.device_id = current_device
+            run.summary["device_generation"] = self.device_app.binding()[1]
         approval.decide(True, reason="approved")
         grant = ScopedGrant.issue(
             subject=approval.subject, device_id=approval.device_id,
             actions=list(approval.actions), packages=list(approval.packages),
             ttl_seconds=120.0, max_steps=max(1, sum(step.action in WRITE_ACTIONS for step in run.steps)),
             source=GRANT_SOURCE_APPROVAL,
+            run_id=run.run_id,
         )
         self._task_runs.add_grant(grant)
         # A human just approved this run, so the idle guard does not apply here:
@@ -1264,6 +1277,9 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         raw_packages = payload.get("packages")
         packages = raw_packages if isinstance(raw_packages, list) else re.split(r"[,\s]+", str(raw_packages or ""))
         packages = [item for item in (_text(value, 160) for value in packages) if PACKAGE_RE.fullmatch(item)]
+        if any(action in PACKAGE_ACTIONS for action in actions) and not packages:
+            return jsonify({"success": False, "error": "package actions require explicit packages",
+                            "error_code": "invalid_packages"}), 400
         try:
             ttl = max(30, min(int(payload.get("ttl_seconds") or 120), 600))
         except (TypeError, ValueError):
@@ -1289,7 +1305,10 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             max_steps=max_steps,
         )
         self._task_runs.add_grant(grant)
-        self._task_runs.save()
+        if not self._task_runs.save():
+            self._task_runs.revoke_grant(grant.grant_id)
+            return jsonify({"success": False, "error": "could not persist grant",
+                            "error_code": "storage_unavailable"}), 503
         self._audit("grant_issued", subject=subject, actions=actions, packages=packages, ttl_seconds=ttl)
         return jsonify({"success": True, "grant": grant.to_dict()}), 200
 
@@ -2340,17 +2359,28 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
 
     async def _task_act(self, action: str, args: dict[str, Any]) -> dict[str, Any]:
         """Run one device action on behalf of the task executor."""
+        if self._control_backend() != "app":
+            return {"success": False, "error_code": "unsupported_task_backend",
+                    "error": "verified task execution requires the phone App backend"}
+        args = dict(args)
+        device_id = args.pop("_expected_device_id", None)
+        generation = args.pop("_expected_generation", None)
+        binding = (device_id, generation) if device_id is not None and generation is not None else self.device_app.binding()
+        if self.device_app.binding() != binding:
+            return {"success": False, "error_code": "device_changed", "error": "device binding changed"}
         if action in {"suspend_app", "unsuspend_app"}:
             return await self._apply_app_policy(
                 _text(args.get("package"), 160),
                 "disable" if action == "suspend_app" else "enable",
+                expected_binding=binding,
             )
-        if self._control_backend() == "app":
-            return await asyncio.to_thread(self.device_app.execute, action, args, 8.0)
-        return await self._execute(action, args)
+        return await asyncio.to_thread(self.device_app.execute, action, args, 8.0, expected_binding=binding)
 
     async def _task_observe_cached(self) -> dict[str, Any]:
         """Heartbeat-backed observation used for planning."""
+        expected = CURRENT_TASK_BINDING.get()
+        if expected is not None and self.device_app.binding() != expected:
+            return {}
         return self.device_app.last_status() or {}
 
     async def _task_observe_live(self) -> dict[str, Any]:
@@ -2363,11 +2393,14 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         try:
             # quick_status skips the usage-stats aggregation, which costs ~10 s
             # and is irrelevant to verifying a step that just ran.
-            result = await asyncio.to_thread(self.device_app.execute, "quick_status", {}, 8.0)
+            binding = CURRENT_TASK_BINDING.get() or self.device_app.binding()
+            if self.device_app.binding() != binding:
+                return {}
+            result = await asyncio.to_thread(self.device_app.execute, "quick_status", {}, 8.0, expected_binding=binding)
         except Exception:
             return {}
         output = result.get("output") if isinstance(result, dict) else None
-        if not isinstance(output, dict) or not output:
+        if not isinstance(result, dict) or result.get("success") is not True or not isinstance(output, dict) or not output or self.device_app.binding() != binding:
             return {}
         return {
             "foreground_package": _text(output.get("foreground_package"), 160),
@@ -2375,9 +2408,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             "battery_percent": output.get("battery_percent"),
             "reported_at": time.time(),
             "source": "live",
+            "device_id": binding[0],
+            "binding_generation": binding[1],
         }
 
-    def _save_policy_state(self) -> None:
+    def _save_policy_state(self) -> bool:
         # P1-A: persist source + deadline per package so a restart restores the
         # ownership map as well as the countdown. Atomic replace keeps a crash
         # from leaving a half-written file behind.
@@ -2400,12 +2435,17 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
+            return True
         except Exception as exc:
             # Losing the file means losing the only record that an app is still
             # suspended, so this must not stay at debug level.
             logger.warning("phone agent policy state save failed: %s", exc)
+            return False
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _load_policy_state(self) -> None:
         try:
@@ -2709,7 +2749,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         expected = "suspended" if action == "disable" else "unsuspended"
         received_package = _text(payload.get("package"), 160) if payload else ""
         state = _text(payload.get("state"), 20).lower() if payload else "unknown"
-        verified = bool(payload.get("verified")) if payload else False
+        verified = payload.get("verified") is True if payload else False
         success = bool(payload and payload.get("success") is True and received_package == package and state == expected and verified)
         error = _text(payload.get("error"), 240) if payload else "Operit did not return a verifiable policy JSON result"
         if not success and not error:
@@ -3069,8 +3109,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             text = str(kwargs.get("text") or "")
             if not text or len(text) > 500 or any(char in text for char in ("\n", "\r")):
                 return {"success": False, "action": action, "error": "text is empty or contains a newline"}
-            encoded = text.replace("%", "%25").replace(" ", "%s").replace("&", "%26")
-            command = ("-s", serial, "shell", "input", "text", encoded)
+            encoded = text.replace(" ", "%s")
+            command = ("-s", serial, "shell", "input", "text", shlex.quote(encoded))
         elif action == "back":
             command = ("-s", serial, "shell", "input", "keyevent", "4")
         elif action == "home":
@@ -3298,11 +3338,13 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             payload = result.get("result") or {}
             status = _text(payload.get("status"), 20)
             if status == "pending" or status == "claimed" or status == "running":
-                self._relay_request(
-                    self._relay_url() + "/renew", self._relay_token(), "POST",
-                    {"task_id": task_id}, timeout=5,
-                )
+                # Only the claiming device may renew its lease. A submitter
+                # cannot impersonate that device, and must not reset its work.
                 continue
+            if status in {"unknown", "expired", "cancelled"}:
+                return {"success": False, "backend": "relay", "task_id": task_id,
+                        "error_code": "execution_unknown" if status == "unknown" else "relay_" + status,
+                        "error": "relay task " + status + "; inspect the phone before retrying"}
             if payload.get("ai_response") is not None or payload.get("finished_at") is not None:
                 return {
                     "success": bool(payload.get("success")),
@@ -3568,6 +3610,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
         action = _text(action, 20).lower()
+        if action not in {"add", "create", "set", "cancel", "remove", "delete"} and self._group_tool_blocked(event, "phone_reminder_list"):
+            return self._group_tool_error("phone_reminder_list")
         owner = self._event_owner(event)
         if action in {"add", "create", "set"}:
             try:
@@ -3668,6 +3712,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
         owner = self._event_owner(event)
         task = str(task or "").strip()
+        if self._group_tool_blocked(event, "operit_task"):
+            return self._group_tool_error("operit_task")
         if not task or len(task) > 2000:
             return json.dumps({"success": False, "error": "task must contain 1-2000 characters"}, ensure_ascii=False)
         if self._task_requires_confirmation(task) and not confirmed:
@@ -3712,6 +3758,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
     async def operit_task_status(self, event: AstrMessageEvent, task_id: str = "", **_kwargs: Any) -> str:
         if not self._enabled() or not self._authorized(event):
             return json.dumps({"success": False, "error": "user is not authorized"}, ensure_ascii=False)
+        if self._group_tool_blocked(event, "operit_task_status"):
+            return self._group_tool_error("operit_task_status")
         owner = self._event_owner(event)
         if task_id:
             item = self._operit_tasks.get(task_id)
@@ -3973,7 +4021,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             "success": True,
             "awaiting_approval": True,
             "approval_id": approval.approval_id,
-            "message": f"回「可以」即可批准，{remaining} 秒内有效。",
+            "message": f"回复「批准」执行，回复「取消」放弃，{remaining} 秒内有效。",
             "expires_in_seconds": remaining,
         }
 
@@ -4227,6 +4275,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             })
             added += 1
         if added:
+            candidate.sort(key=lambda item: float(item.get("posted_at") or 0), reverse=True)
             candidate = candidate[: self.MAX_NOTIFICATIONS]
             try:
                 self._save_notifications(candidate)
@@ -4401,7 +4450,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         )
         return due
 
-    async def _apply_app_policy(self, package: str, action: str) -> dict[str, Any]:
+    async def _apply_app_policy(self, package: str, action: str, *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
         package = self._resolve_package(package)
         action = _text(action, 20).lower()
         if action in {"suspend", "disable"}:
@@ -4417,7 +4466,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return {"success": False, "action": normalized, "package": package, "error": protected_error}
         if self._control_backend() == "app":
             action_name = "suspend_app" if normalized == "disable" else "unsuspend_app"
-            result = await asyncio.to_thread(self.device_app.execute, action_name, {"package": package})
+            binding = expected_binding if expected_binding is not None else self.device_app.binding()
+            result = await asyncio.to_thread(self.device_app.execute, action_name, {"package": package}, expected_binding=binding)
             # B07: parse the device's own output for package and state rather
             # than treating success==verified. The app's verifiedState() returns
             # {"package":"...","state":"suspended|unsuspended","verified":true};
@@ -4498,6 +4548,9 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         # Resolve once, so the lease key, the guard set and the device command
         # all use the same package name (aliases must not create two keys).
         package = self._resolve_package(package)
+        if not PACKAGE_RE.fullmatch(package) or self._protected_policy_error(package):
+            return {"success": False, "action": normalized, "package": package,
+                    "error": "invalid or protected Android package"}
         if normalized == "disable":
             # Register the lease before sending the command, so a crash between
             # the policy call and the bookkeeping does not lose the owner.
@@ -4505,8 +4558,27 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             lease = self._policy_leases.setdefault(package, {}).setdefault(
                 source, _PolicyLease(source=source)
             )
+            if existing is None:
+                # An unacknowledged permanent suspension is recoverable too.
+                # Commit its finite recovery intent before touching the phone.
+                self._schedule_policy_expiry(package, max(5, minutes), source)
+            if not self._save_policy_state():
+                if existing is None:
+                    self._cancel_policy_expiry(package, source)
+                    self._policy_leases.get(package, {}).pop(source, None)
+                    if not self._policy_leases.get(package):
+                        self._policy_leases.pop(package, None)
+                return {"success": False, "action": normalized, "package": package,
+                        "error_code": "state_persistence_failed", "state_persisted": False,
+                        "error": "could not persist policy recovery intent; no command sent"}
             try:
                 result = await self._apply_app_policy(package, normalized)
+            except asyncio.CancelledError:
+                # to_thread cancellation does not cancel an accepted phone
+                # command. Its already-durable deadline must survive the wait.
+                self._guard_suspended.add(package)
+                self._save_policy_state()
+                raise
             except Exception as exc:  # a raising backend must not lose the lease
                 result = {"success": False, "action": normalized, "package": package,
                           "error": _text(exc, 240)}
@@ -4514,10 +4586,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 leases = self._policy_leases.get(package, {})
                 # A failed renewal must not remove a previous suspension's
                 # owner, deadline or recovery timer.
-                if existing is None and leases.get(source) is lease:
-                    leases.pop(source, None)
-                if not leases:
-                    self._policy_leases.pop(package, None)
+                if existing is None:
+                    # An unsuccessful acknowledgement does not establish that
+                    # suspend never happened. Keep and retry the owed restore.
+                    self._guard_suspended.add(package)
+                    result.update({"restore_pending": True, "state_persisted": True})
                 return result
             self._guard_suspended.add(package)
             if minutes:
@@ -4529,7 +4602,14 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 result["mode"] = "disabled"
             result["lease_released"] = False
             result["owners"] = sorted(self._policy_leases.get(package, {}))
-            self._save_policy_state()
+            if not self._save_policy_state():
+                if existing is None:
+                    self._schedule_policy_expiry(package, max(5, minutes), source)
+                result.update({"success": False, "state_persisted": False,
+                               "error_code": "state_persistence_failed", "restore_pending": True,
+                               "error": "device responded but policy state could not be persisted"})
+            else:
+                result["state_persisted"] = True
             return result
         # Keep the final owner's lease and timer until the phone confirms the
         # restore. In particular, an early manual restore that fails must not
@@ -4859,6 +4939,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if not proposed_device:
             run.device_id = current_device
             approval.device_id = current_device
+            run.summary["device_generation"] = self.device_app.binding()[1]
         device_id = current_device
         approval.decide(True, reason="chat_approve")
         grant = ScopedGrant.issue(
@@ -4866,6 +4947,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             actions=list(approval.actions), packages=list(approval.packages),
             ttl_seconds=120.0, max_steps=max(1, sum(step.action in WRITE_ACTIONS for step in run.steps)),
             source=GRANT_SOURCE_APPROVAL,
+            run_id=run.run_id,
         )
         self._task_runs.add_grant(grant)
         try:
@@ -4938,7 +5020,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         if not message:
             return
         # A pending proposal can be approved or rejected from chat, so the phone
-        # does not have to be unlocked. Only a bare "可以" counts.
+        # does not have to be unlocked. Require an explicit approval word.
         if self._bool_config("enable_task_execute", False):
             chat_reply = await self._chat_task_decision(user_id, message)
             if chat_reply is not None:

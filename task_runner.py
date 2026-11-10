@@ -20,13 +20,18 @@ Design notes
 """
 import asyncio
 import json
+import logging
 import math
 import os
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+CURRENT_TASK_BINDING: ContextVar[tuple[str, int] | None] = ContextVar("phone_task_binding", default=None)
 
 # ---------------------------------------------------------------- constants
 
@@ -87,6 +92,17 @@ def _short(value: Any, limit: int = 160) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+def _record_time(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("invalid timestamp")
+    stamp = float(value)
+    if not math.isfinite(stamp):
+        raise ValueError("invalid timestamp")
+    return stamp
+
+
 # ---------------------------------------------------------------- grant
 
 
@@ -103,6 +119,7 @@ class ScopedGrant:
     expires_at: float
     max_steps: int = 1
     source: str = GRANT_SOURCE_MANUAL
+    run_id: str = ""
 
     @classmethod
     def issue(
@@ -115,6 +132,7 @@ class ScopedGrant:
         ttl_seconds: float = 300.0,
         max_steps: int = 1,
         source: str = GRANT_SOURCE_MANUAL,
+        run_id: str = "",
         now: float | None = None,
     ) -> "ScopedGrant":
         stamp = _now() if now is None else now
@@ -130,6 +148,7 @@ class ScopedGrant:
             expires_at=stamp + max(1.0, float(ttl_seconds)),
             max_steps=max(1, int(max_steps)),
             source=source if source in GRANT_SOURCES else GRANT_SOURCE_MANUAL,
+            run_id=_short(run_id, 64),
         )
 
     def active(self, now: float | None = None) -> bool:
@@ -142,6 +161,7 @@ class ScopedGrant:
         device_id: str,
         action: str,
         package: str = "",
+        run_id: str = "",
         now: float | None = None,
     ) -> tuple[bool, str]:
         """Return (allowed, reason). The first failing rule wins."""
@@ -151,10 +171,12 @@ class ScopedGrant:
             return False, "grant_subject_mismatch"
         if _short(device_id, 64) != self.device_id:
             return False, "grant_device_mismatch"
+        if self.run_id and self.run_id != run_id:
+            return False, "grant_run_mismatch"
         action = _short(action, 40)
         if action not in self.actions:
             return False, "grant_action_not_allowed"
-        if action in PACKAGE_ACTIONS and not package:
+        if action in PACKAGE_ACTIONS and (not package or not self.packages):
             return False, "grant_package_required"
         if package and self.packages and _short(package, 160) not in self.packages:
             return False, "grant_package_not_allowed"
@@ -171,6 +193,7 @@ class ScopedGrant:
             "expires_at": self.expires_at,
             "max_steps": self.max_steps,
             "source": self.source,
+            "run_id": self.run_id,
         }
 
     @classmethod
@@ -185,6 +208,7 @@ class ScopedGrant:
             expires_at=float(raw.get("expires_at") or 0.0),
             max_steps=max(1, int(raw.get("max_steps") or 1)),
             source=_short(raw.get("source"), 20) or GRANT_SOURCE_MANUAL,
+            run_id=_short(raw.get("run_id"), 64),
         )
 
 
@@ -347,8 +371,8 @@ class RunStep:
             grant_id=_short(raw.get("grant_id"), 64),
             observation_id=_short(raw.get("observation_id"), 64),
             command_id=_short(raw.get("command_id"), 64),
-            started_at=raw.get("started_at"),
-            finished_at=raw.get("finished_at"),
+            started_at=_record_time(raw.get("started_at")),
+            finished_at=_record_time(raw.get("finished_at")),
             verify=dict(raw.get("verify") or {}),
             error=_short(raw.get("error"), 200),
         )
@@ -558,7 +582,7 @@ class ApprovalRequest:
             packages=tuple(_short(item, 160) for item in (raw.get("packages") or [])),
             created_at=float(raw.get("created_at") or 0.0),
             expires_at=float(raw.get("expires_at") or 0.0),
-            status=status if status in APPROVAL_STATUSES else APPROVAL_PENDING,
+            status=status if status in APPROVAL_STATUSES else APPROVAL_EXPIRED,
             decided_at=float(raw.get("decided_at") or 0.0),
             reason=_short(raw.get("reason"), 160),
         )
@@ -573,6 +597,7 @@ class TaskRunStore:
         self._runs: dict[str, PhoneTaskRun] = {}
         self._grants: dict[str, ScopedGrant] = {}
         self._approvals: dict[str, ApprovalRequest] = {}
+        self._grant_usage: dict[str, int] = {}
 
     def load(self) -> None:
         try:
@@ -583,22 +608,53 @@ class TaskRunStore:
             return
         if not isinstance(data, dict):
             return
-        for raw in data.get("runs") or []:
+        records = lambda key: data.get(key) if isinstance(data.get(key), list) else []
+        for raw in records("runs"):
             if isinstance(raw, dict):
-                run = PhoneTaskRun.from_dict(raw)
+                try:
+                    run = PhoneTaskRun.from_dict(raw)
+                    if not all(math.isfinite(stamp) for stamp in (run.created_at, run.updated_at)):
+                        raise ValueError("invalid task timestamp")
+                except (TypeError, ValueError, KeyError, OverflowError):
+                    logger.warning("Ignoring an invalid task history record")
+                    continue
                 # A run interrupted by a restart would otherwise sit in
                 # "executing" forever and never report a result.
                 if run.status in {RUN_EXECUTING, RUN_VERIFYING, RUN_RUNNING}:
+                    for step in run.steps:
+                        if step.status == STEP_RUNNING:
+                            step.status = STEP_UNKNOWN
+                            step.error = "interrupted"
+                            step.finished_at = _now()
+                        elif step.status == STEP_PENDING:
+                            step.skip("interrupted")
                     run.transition(RUN_FAILED, error="interrupted")
                 self._runs[run.run_id] = run
-        for raw in data.get("grants") or []:
+        for raw in records("grants"):
             if isinstance(raw, dict):
-                grant = ScopedGrant.from_dict(raw)
-                if grant.active():
-                    self._grants[grant.grant_id] = grant
-        for raw in data.get("approvals") or []:
+                try:
+                    grant = ScopedGrant.from_dict(raw)
+                    # Version 1 had no durable usage ledger: old short-lived
+                    # permissions must be reissued rather than regain budget.
+                    usage = data.get("grant_usage", {}).get(grant.grant_id)
+                    if type(usage) is not int or usage < 0:
+                        continue
+                    if not all(math.isfinite(stamp) for stamp in (grant.issued_at, grant.expires_at)):
+                        continue
+                    if grant.active():
+                        self._grants[grant.grant_id] = grant
+                        self._grant_usage[grant.grant_id] = usage
+                except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+                    logger.warning("Ignoring an invalid grant record")
+        for raw in records("approvals"):
             if isinstance(raw, dict):
-                approval = ApprovalRequest.from_dict(raw)
+                try:
+                    approval = ApprovalRequest.from_dict(raw)
+                    if not all(math.isfinite(stamp) for stamp in (approval.created_at, approval.expires_at, approval.decided_at)):
+                        raise ValueError("invalid approval timestamp")
+                except (TypeError, ValueError, KeyError, OverflowError):
+                    logger.warning("Ignoring an invalid approval record")
+                    continue
                 if approval.approval_id:
                     approval.expire_if_due()
                     self._approvals[approval.approval_id] = approval
@@ -608,16 +664,17 @@ class TaskRunStore:
         """Atomic write; returns False instead of raising on IO failure."""
         self._trim()
         payload = {
-            "version": 1,
+            "version": 2,
             "runs": [run.to_dict() for run in self._ordered()],
             "grants": [grant.to_dict() for grant in self._grants.values() if grant.active()],
+            "grant_usage": dict(self._grant_usage),
             "approvals": [item.to_dict() for item in self._approvals.values()][-50:],
         }
         temporary = self._path.with_name(self._path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with temporary.open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self._path)
@@ -637,20 +694,56 @@ class TaskRunStore:
         ordered = self._ordered()
         for run in ordered[self._max_runs:]:
             self._runs.pop(run.run_id, None)
+        for grant_id, grant in list(self._grants.items()):
+            if not grant.active():
+                self._grants.pop(grant_id, None)
+                self._grant_usage.pop(grant_id, None)
+        for approval in self._approvals.values():
+            approval.expire_if_due()
+            if approval.status == APPROVAL_EXPIRED:
+                run = self._runs.get(approval.run_id)
+                if run is not None and run.status == RUN_WAITING_APPROVAL:
+                    for step in run.steps:
+                        if step.status == STEP_PENDING:
+                            step.skip("approval_expired")
+                    run.transition(RUN_CANCELLED, error="approval_expired")
+        ordered_approvals = sorted(self._approvals.values(), key=lambda item: item.created_at, reverse=True)
+        for approval in ordered_approvals[50:]:
+            if not approval.pending():
+                self._approvals.pop(approval.approval_id, None)
 
     # -- grants
 
     def add_grant(self, grant: ScopedGrant) -> None:
         self._grants[grant.grant_id] = grant
+        self._grant_usage.setdefault(grant.grant_id, 0)
+
+    def revoke_grant(self, grant_id: str) -> None:
+        self._grants.pop(grant_id, None)
+        self._grant_usage.pop(grant_id, None)
+
+    def grant_remaining(self, grant: ScopedGrant) -> int:
+        return max(0, grant.max_steps - self._grant_usage.get(grant.grant_id, 0))
+
+    def consume_grant(self, grant: ScopedGrant) -> str:
+        if self._grants.get(grant.grant_id) != grant or not grant.active():
+            return "grant_missing"
+        if self.grant_remaining(grant) <= 0:
+            return "grant_step_limit"
+        self._grant_usage[grant.grant_id] += 1
+        # Never refund an unknown or failed write. Failed persistence stops
+        # dispatch; the in-memory reservation remains consumed conservatively.
+        return "" if self.save() else "grant_persistence_failed"
 
     def grant(self, grant_id: str) -> ScopedGrant | None:
         grant = self._grants.get(grant_id)
-        if grant is not None and not grant.active():
+        if grant is not None and (not grant.active() or self.grant_remaining(grant) <= 0):
             return None
         return grant
 
     def grants(self) -> list[dict[str, Any]]:
-        return [grant.to_dict() for grant in self._grants.values() if grant.active()]
+        return [{**grant.to_dict(), "remaining_steps": self.grant_remaining(grant)}
+                for grant in self._grants.values() if grant.active() and self.grant_remaining(grant) > 0]
 
     def add_approval(self, approval: ApprovalRequest) -> None:
         self._approvals[approval.approval_id] = approval
@@ -793,6 +886,7 @@ class ReadOnlyTaskRunner:
         stamp = _now() if now is None else now
         observation: ObservationRef | None = None
         observed = simulated = blocked = failed = 0
+        remaining = self._store.grant_remaining(grant) if grant else 0
         for step in run.steps:
             if step.action == "observe":
                 step.start(now=stamp)
@@ -824,8 +918,14 @@ class ReadOnlyTaskRunner:
                     device_id=run.device_id,
                     action=step.action,
                     package=_short(step.args.get("package"), 160),
+                    run_id=run.run_id,
                     now=stamp,
                 )
+                if allowed:
+                    if remaining <= 0:
+                        allowed, reason = False, "grant_step_limit"
+                    else:
+                        remaining -= 1
             step.grant_id = grant.grant_id if grant else ""
             step.observation_id = observation.observation_id if observation else ""
             step.skip(reason="dry_run" if allowed else reason, now=stamp)
@@ -868,7 +968,7 @@ _LAUNCHER_HINTS = ("launcher", ".home", "homescreen")
 
 def _looks_idle(foreground: str) -> bool:
     lowered = foreground.lower()
-    return not lowered or any(hint in lowered for hint in _LAUNCHER_HINTS)
+    return bool(lowered) and any(hint in lowered for hint in _LAUNCHER_HINTS)
 
 
 @dataclass(frozen=True)
@@ -906,6 +1006,7 @@ class TaskExecutor:
         observation_max_age: float = 90.0,
         observation_wait: float = 3.0,
         require_user_idle: bool = True,
+        device_binding: Callable[[], tuple[str, int]] | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -923,6 +1024,21 @@ class TaskExecutor:
         self._observation_wait = max(0.5, float(observation_wait))
         self._require_user_idle = bool(require_user_idle)
         self._executing: set[str] = set()
+        self._device_binding = device_binding
+
+    def _binding_error(self, run: PhoneTaskRun) -> str:
+        if self._device_binding is None:
+            return ""
+        device_id, generation = self._device_binding()
+        expected = run.summary.setdefault("device_generation", generation)
+        return "" if device_id == run.device_id and generation == expected else "device_changed"
+
+    def _action_args(self, run: PhoneTaskRun, args: dict[str, Any]) -> dict[str, Any]:
+        result = dict(args)
+        if self._device_binding is not None:
+            result["_expected_device_id"] = run.device_id
+            result["_expected_generation"] = run.summary["device_generation"]
+        return result
 
     # -- helpers
 
@@ -1013,6 +1129,8 @@ class TaskExecutor:
             ok = observation.get("screen_interactive") is False
             return Verdict(ok, "ok" if ok else "screen_still_on", "", success, verified, observed_at)
         if action in {"home", "back"}:
+            if not before_foreground:
+                return Verdict(False, "observation_missing", "no prior foreground", success, verified, observed_at)
             ok = foreground != before_foreground
             return Verdict(ok, "ok" if ok else "no_change",
                            f"{before_foreground} -> {foreground}", success, verified, observed_at)
@@ -1031,12 +1149,13 @@ class TaskExecutor:
             allowed, _reason = grant.check(
                 subject=run.subject, device_id=run.device_id,
                 action="unsuspend_app", package=package, now=_now(),
+                run_id=run.run_id,
             )
-        if not allowed or package in self._protected:
+        if not allowed or package in self._protected or self._binding_error(run):
             return False
         try:
             result = await asyncio.wait_for(
-                self._act("unsuspend_app", {"package": package}), timeout=self._step_timeout)
+                self._act("unsuspend_app", self._action_args(run, {"package": package})), timeout=self._step_timeout)
         except Exception:
             return False
         return bool(isinstance(result, dict) and result.get("success"))
@@ -1058,6 +1177,8 @@ class TaskExecutor:
         if observation.get("screen_interactive") is False:
             return ""
         foreground = _short(observation.get("foreground_package"), 160)
+        if not foreground:
+            return "observation_unknown"
         if _looks_idle(foreground):
             return ""
         targets = {
@@ -1077,6 +1198,10 @@ class TaskExecutor:
             return run
         self._executing.add(run.run_id)
         self._store.add_run(run)
+        token = None
+        if self._device_binding is not None:
+            generation = run.summary.setdefault("device_generation", self._device_binding()[1])
+            token = CURRENT_TASK_BINDING.set((run.device_id, generation))
         try:
             return await self._execute(run, grant=grant, now=now, allow_active=allow_active)
         except asyncio.CancelledError:
@@ -1091,12 +1216,31 @@ class TaskExecutor:
             run.transition(RUN_CANCELLED, error="cancelled")
             self._store.save()
             raise
+        except Exception:
+            for step in run.steps:
+                if step.status == STEP_RUNNING:
+                    step.status = STEP_UNKNOWN
+                    step.error = "executor_error"
+                    step.finished_at = _now()
+                elif step.status == STEP_PENDING:
+                    step.skip("executor_error")
+            run.transition(RUN_FAILED, error="executor_error")
+            run.summary = {**run.summary, "dry_run": False, "error": "executor_error"}
+            self._store.save()
+            logger.warning("Task executor stopped after an internal error")
+            return run
         finally:
+            if token is not None:
+                CURRENT_TASK_BINDING.reset(token)
             self._executing.discard(run.run_id)
 
     async def _execute(self, run: PhoneTaskRun, *, grant: ScopedGrant | None = None,
                        now: float | None = None, allow_active: bool = False) -> PhoneTaskRun:
         started = _now() if now is None else now
+        if self._binding_error(run):
+            run.transition(RUN_FAILED, error="device_changed")
+            self._store.save()
+            return run
         if self._require_user_idle and not allow_active and not run.cancel_requested:
             refusal = await self._active_guard(run)
             if refusal:
@@ -1112,8 +1256,12 @@ class TaskExecutor:
         counts = {"executed": 0, "verified": 0, "unverified": 0, "failed": 0,
                   "rolled_back": 0, "restore_pending": 0, "cancelled": 0}
         before = await self._read_observation()
-        steps_used = 0
         for step in run.steps:
+            if self._binding_error(run):
+                step.skip("device_changed")
+                run.transition(RUN_FAILED, error="device_changed")
+                counts["failed"] += 1
+                break
             if run.cancel_requested:
                 step.skip("cancelled", now=_now())
                 counts["cancelled"] += 1
@@ -1154,6 +1302,7 @@ class TaskExecutor:
                 allowed, reason = grant.check(
                     subject=run.subject, device_id=run.device_id,
                     action=step.action, package=package, now=_now(),
+                    run_id=run.run_id,
                 )
             if not allowed:
                 step.grant_id = grant.grant_id if grant else ""
@@ -1161,23 +1310,25 @@ class TaskExecutor:
                 counts["failed"] += 1
                 run.transition(RUN_FAILED, error=reason)
                 break
-            steps_used += 1
-            if grant is not None and steps_used > grant.max_steps:
-                step.grant_id = grant.grant_id
-                step.finish(ok=False, verify={"reason": "grant_step_limit"}, error="grant_step_limit", now=_now())
-                counts["failed"] += 1
-                run.transition(RUN_FAILED, error="grant_step_limit")
-                break
-
+            # Persist the running-step intent together with its budget before
+            # dispatch. A restart must not present an in-flight write as pending.
             step.start(command_id="", now=_now())
             step.grant_id = grant.grant_id if grant else ""
+            budget_error = self._store.consume_grant(grant) if grant else "grant_missing"
+            if budget_error:
+                step.grant_id = grant.grant_id
+                step.finish(ok=False, verify={"reason": budget_error}, error=budget_error, now=_now())
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error=budget_error)
+                break
+
             act_started = _now()
             try:
-                result = await asyncio.wait_for(self._act(step.action, dict(step.args)), timeout=self._step_timeout)
+                result = await asyncio.wait_for(self._act(step.action, self._action_args(run, step.args)), timeout=self._step_timeout)
             except asyncio.TimeoutError:
                 verdict, observation = await self._settle(step, {"success": False}, before)
-                step.status = STEP_DONE if verdict.ok else STEP_UNKNOWN
-                step.verify = {"reason": "timeout", "observed": bool(observation)}
+                step.status = STEP_UNKNOWN
+                step.verify = {"reason": "timeout", "observed": bool(observation), "detail": verdict.detail}
                 step.finished_at = _now()
                 counts["failed"] += 1
                 run.transition(RUN_FAILED, error="timeout")
@@ -1192,7 +1343,21 @@ class TaskExecutor:
             act_ms = round((_now() - act_started) * 1000)
             result = result if isinstance(result, dict) else {"success": False}
             step.command_id = _short(result.get("command_id"), 64)
+            if self._binding_error(run):
+                step.status = STEP_UNKNOWN
+                step.error = "device_changed"
+                step.finished_at = _now()
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="device_changed")
+                break
             verdict, observation = await self._settle(step, result, before)
+            if self._binding_error(run):
+                step.status = STEP_UNKNOWN
+                step.error = "device_changed"
+                step.finished_at = _now()
+                counts["failed"] += 1
+                run.transition(RUN_FAILED, error="device_changed")
+                break
             verify_ms = round((_now() - act_started) * 1000) - act_ms
             step.verify = {
                 "ok": verdict.ok,

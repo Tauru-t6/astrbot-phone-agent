@@ -9,6 +9,10 @@ Android 前端：[AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-p
 
 [项目主页](README.md) · [English Guide](README.en.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
 
+## 0.9.1 审查修复
+
+本版收紧设备绑定、授权累计预算、核验布尔值、取消恢复和聊天确认边界。旧短期 grant 需重新签发；受限任务通过 Relay 兜底时须一起更新 Relay。App 0.3.26 与关怀桥接 0.3.0 保持兼容。详见 [升级说明](docs/REVIEW_FIXES_0_9_1.md)。
+
 ## 0.9.0 自主决策与 7.x 适配
 
 开启 `enable_llm_task_planner` 可生成有序多步提案；未知应用或含糊目标会要求澄清，现有审批、动作范围和逐步核验继续生效。关怀桥接 0.3.0 适配 Private Companion 7.x，参考对应私聊的近期对话，减少忙碌时和重复内容的打扰。详见[适配说明](docs/PRIVATE_COMPANION_719_ADAPTATION.md)和[真机验证记录](docs/PHYSICAL_DEVICE_VALIDATION.md)。
