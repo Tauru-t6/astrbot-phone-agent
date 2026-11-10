@@ -28,6 +28,8 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Star
 from quart import jsonify, request
 from .model_planning import plan_goal, simple_fallback_goal
+from .health_connect import HealthConnectStore
+from .location_bridge import normalize_location, map_capabilities, map_handoff
 
 try:
     from .storage import read_jsonl_tail, write_json_atomic
@@ -292,6 +294,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._notifications: list[dict[str, Any]] = []
         self._load_policy_state()
         self.device_app = DeviceAppBackend(config, self._audit)
+        self._health_connect = HealthConnectStore(self._plugin_data_path("health_connect_path", "phone_agent_health_connect.json"))
         # P1-E stage 2: run records are persisted, but only read-only steps
         # (observe) ever touch the device; write steps are simulated.
         self._task_runs = TaskRunStore(self._task_run_path())
@@ -429,6 +432,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             ("/app_policy", self._web_app_policy, ["POST"], "Apply an on-demand app policy", "policy_tools"),
             ("/sleep_mode", self._web_sleep_mode, ["POST"], "Control temporary sleep mode", "policy_tools"),
             ("/location", self._web_location, ["GET"], "Read phone location on demand", "location_tool"),
+            ("/map/status", self._web_map_status, ["GET"], "Inspect registered map tools without acquiring location", None),
             ("/health", self._web_health, ["GET"], "Read phone health summary", "health_tools"),
             ("/tasks", self._web_tasks, ["GET"], "List Operit tasks", None),
             ("/operit_task_cancel", self._web_operit_task_cancel, ["POST"], "Cancel an Operit task", None),
@@ -443,6 +447,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             ("/device/test", self._web_device_test, ["POST"], "Ping the phone app through the current backend", None),
             ("/device/timeline", self._web_device_timeline, ["GET"], "Timeline items for the phone app sync", None),
             ("/app/state", self._web_app_state, ["GET"], "AstrBot Phone Agent App state snapshot", None),
+            ("/app/health/snapshot", self._web_health_connect_upload, ["POST"], "Upload a device-scoped health summary", None),
+            ("/app/health/clear", self._web_health_connect_clear, ["POST"], "Remove this phone's uploaded health summary", None),
             ("/app/care/preview", self._web_app_care_preview, ["POST"], "Preview one care decision without sending a message", "observe_tool"),
             ("/app/reminders", self._web_app_reminder_create, ["POST"], "Create an App reminder", None),
         ("/app/task/plan", self._web_app_task_plan, ["POST"],
@@ -558,6 +564,21 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         )
         return jsonify(result), 200 if result.get("success") else 502
 
+    async def _web_map_status(self):
+        return jsonify({"success": True, "map": map_capabilities(self.context)})
+
+    def _location_with_map_handoff(self, result: dict[str, Any]) -> dict[str, Any]:
+        if result.get("success") is True and isinstance(result.get("location"), dict):
+            result["map_handoff"] = map_handoff(result["location"], map_capabilities(self.context))
+        return result
+
+    def _app_location_result(self, raw: dict[str, Any]) -> dict[str, Any]:
+        if raw.get("success") is not True:
+            return {"success": False, "backend": "app", "error_code": _text(raw.get("error_code"), 80),
+                    "error": "手机定位失败，请检查权限、定位开关和连接"}
+        result = normalize_location(raw.get("output"), "app")
+        return self._location_with_map_handoff(result)
+
     async def _web_location(self):
         if not self._enabled():
             return jsonify({"success": False, "error": "phone agent disabled"})
@@ -571,12 +592,13 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             high_accuracy, include_address, timeout_seconds = False, False, 10
         try:
             if self._control_backend() == "app":
-                return jsonify(await asyncio.to_thread(self.device_app.execute, "location", {
-                    "high_accuracy": high_accuracy, "include_address": include_address, "timeout_seconds": timeout_seconds}))
+                result = await asyncio.to_thread(self.device_app.execute, "location", {
+                    "high_accuracy": high_accuracy, "include_address": include_address, "timeout_seconds": timeout_seconds})
+                return jsonify(self._app_location_result(result))
             result = await asyncio.to_thread(self._operit_location_sync, high_accuracy, timeout_seconds, include_address)
             return jsonify(result)
-        except Exception as exc:
-            return jsonify({"success": False, "error": _text(exc, 240)}), 502
+        except Exception:
+            return jsonify({"success": False, "error": "定位请求失败，请检查手机连接后重试"}), 502
 
     async def _web_test_operit(self):
         try:
@@ -625,6 +647,8 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             "operit": None if backend == "app" else operit,
             "device_last_status": self.device_app.last_status(),
             "health": {
+                "source": health.get("source"),
+                "origin_packages": health.get("origin_packages", []),
                 "available": health.get("available", False),
                 "fresh": health.get("fresh", False),
                 "days": len(health.get("days", [])),
@@ -701,7 +725,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             days = max(1, min(int(request.args.get("days", "7")), 30))
         except ValueError:
             days = 7
-        if not self._health_db():
+        if not self._health_db() and self.config.get("health_data_source", "auto") == "health_db":
             return jsonify({
                 "success": True,
                 "health": {
@@ -1021,6 +1045,47 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         except Exception:
             return jsonify({"success": False, "error_code": "care_preview_failed"}), 503
         return jsonify({"success": True, "result": result})
+
+    async def _web_health_connect_upload(self):
+        allowed, error = self._app_api_write_allowed("health_tools")
+        if not allowed:
+            return jsonify({"success": False, "error_code": "forbidden", "error": error}), 403
+        if request.content_length is not None and request.content_length > 65536:
+            return jsonify({"success": False, "error_code": "payload_too_large"}), 413
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict) or not self._finite_json(payload):
+            return jsonify({"success": False, "error_code": "invalid_json"}), 400
+        binding = self.device_app.binding()
+        if not binding[0] or payload.get("device_id") != binding[0]:
+            return jsonify({"success": False, "error_code": "device_changed"}), 409
+        try:
+            result = await asyncio.to_thread(self._health_connect.accept, payload,
+                                            binding_valid=lambda: self.device_app.binding() == binding)
+        except ValueError as exc:
+            code = str(exc)
+            return jsonify({"success": False, "error_code": code}), 409 if code in {"device_changed", "snapshot_conflict", "snapshot_older_than_current"} else 400
+        except OSError:
+            return jsonify({"success": False, "error_code": "storage_unavailable"}), 503
+        if self.device_app.binding() != binding:
+            return jsonify({"success": False, "error_code": "device_changed"}), 409
+        # No health values, user messages or credentials in the audit log.
+        self._audit("health_connect_synced", day_count=len(payload.get("days", [])), status=payload.get("status"))
+        return jsonify({"success": True, **result, "source_mode": self.config.get("health_data_source", "auto")})
+
+    async def _web_health_connect_clear(self):
+        if not self._web_write_allowed():
+            return jsonify({"success": False, "error_code": "forbidden"}), 403
+        payload = await request.get_json(silent=True)
+        device = payload.get("device_id") if isinstance(payload, dict) else None
+        if not device or device != self._registered_device_id():
+            return jsonify({"success": False, "error_code": "device_changed"}), 409
+        try:
+            await asyncio.to_thread(self._health_connect.clear, device)
+        except ValueError:
+            return jsonify({"success": False, "error_code": "device_changed"}), 409
+        except OSError:
+            return jsonify({"success": False, "error_code": "storage_unavailable"}), 503
+        return jsonify({"success": True, "cleared": True})
 
     async def _start_planned_task(self, goal, *, subject, device_id, grant=None, umo=""):
         binding = self.device_app.binding()
@@ -2764,52 +2829,20 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             "error": error if not success else "",
         }
 
-    @staticmethod
-    def _gcj02_to_bd09(latitude: float, longitude: float) -> tuple[float, float]:
-        """Baidu's published GCJ02 -> BD09 shift (api.map.baidu.com/geoconvert)."""
-        x_pi = math.pi * 3000.0 / 180.0
-        z = math.sqrt(longitude * longitude + latitude * latitude) + 0.00002 * math.sin(latitude * x_pi)
-        theta = math.atan2(latitude, longitude) + 0.000003 * math.cos(longitude * x_pi)
-        return z * math.sin(theta) + 0.006, z * math.cos(theta) + 0.0065
-
     def _parse_location_result(self, raw: dict[str, Any]) -> dict[str, Any]:
-        payload = _first_json_object(raw.get("ai_response")) if raw.get("success") else None
+        payload = _first_json_object(raw.get("ai_response")) if raw.get("success") is True else None
         if not payload:
             return {"success": False, "backend": "operit", "error": "Operit did not return a location JSON result"}
-        latitude = self._float_in_range(payload.get("latitude"), -90, 90)
-        longitude = self._float_in_range(payload.get("longitude"), -180, 180)
-        if latitude is None or longitude is None:
-            return {"success": False, "backend": "operit", "error": "Operit location result did not contain valid coordinates"}
-        in_china = 3.86 <= latitude <= 53.56 and 73.55 <= longitude <= 135.09
-        location: dict[str, Any] = {"latitude": latitude, "longitude": longitude, "coord_type": "gcj02"}
-        if in_china:
-            # Android GPS/network fixes are GCJ02; Baidu Map APIs expect BD09.
-            location["bd09_latitude"], location["bd09_longitude"] = (
-                round(value, 6) for value in self._gcj02_to_bd09(latitude, longitude)
-            )
-        else:
-            # Outside China the fix is plain WGS84 and Baidu's overseas APIs
-            # accept it directly; no shift is applied.
-            location["coord_type"] = "wgs84"
-        result: dict[str, Any] = {"success": True, "backend": "operit", "location": location}
-        accuracy = self._float_in_range(payload.get("accuracy_m"), 0, 100000)
-        if accuracy is not None:
-            result["location"]["accuracy_m"] = accuracy
-        address = _text(payload.get("address"), 400)
-        if address:
-            result["location"]["address"] = address
-        provider = _text(payload.get("provider"), 80)
-        if provider:
-            result["location"]["provider"] = provider
-        return result
+        return self._location_with_map_handoff(normalize_location(payload, "operit"))
 
     def _operit_location_sync(self, high_accuracy: bool, timeout_seconds: int, include_address: bool) -> dict[str, Any]:
         task = (
             "在手机本机调用 Operit 系统定位工具 Tools.System.getLocation("
             f"{str(bool(high_accuracy)).lower()}, {max(3, min(int(timeout_seconds), 30))}, {str(bool(include_address)).lower()})。"
-            "只读取这一次当前位置，不保存、不追踪、不打开地图、不发送给第三方。"
+            "只读取这一次位置，不保存、不追踪、不打开地图。仅在 include_address=true 时允许系统地址解析；否则不发送给地图服务。"
+            "保留定位工具实际返回的坐标系和采集时间，不按地理范围猜测，不把请求完成时间当采集时间；未知字段填 null。定位失败时 success=false，不编造坐标。"
             + self._json_line_prompt(
-                '{"latitude":0,"longitude":0,"accuracy_m":0,"address":"","provider":""}'
+                '{"success":true|false,"latitude":number|null,"longitude":number|null,"coord_type":"wgs84|gcj02|bd09ll|unknown","captured_at":unix_seconds|null,"age_seconds":number|null,"accuracy_m":number|null,"address":"","provider":""}'
             )
         )
         return self._parse_location_result(self._operit_task_sync(task, False, "WINDOW"))
@@ -3173,6 +3206,23 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return None
 
     def _read_health_db_sync(self, days: int) -> dict[str, Any]:
+        """Compatibility entry point used by tools and the care bridge."""
+        mode = self.config.get("health_data_source", "auto")
+        if mode not in {"auto", "health_db", "health_connect"}:
+            return {"source": "unknown", "available": False, "fresh": False, "days": [], "error": "invalid_health_source"}
+        if mode != "health_db":
+            binding = self.device_app.binding()
+            snapshot = self._health_connect.read(binding[0], days)
+            if self.device_app.binding() != binding:
+                return {"source": "health_connect", "available": False, "fresh": False, "days": [], "error": "device_changed"}
+            if mode == "health_connect" or (snapshot["available"] and snapshot["fresh"]):
+                return snapshot
+        database = self._read_health_database_sync(days)
+        if mode == "auto":
+            database["fallback_from"] = "health_connect"
+        return database
+
+    def _read_health_database_sync(self, days: int) -> dict[str, Any]:
         try:
             days = max(1, min(int(days or 1), 30))
         except (TypeError, ValueError):
@@ -3489,7 +3539,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 telemetry = None
         return json.dumps({
             "success": bool(health.get("available")),
-            "source": "health_db",
+            "source": health.get("source", "health_db"),
             "health": health,
             "telemetry": telemetry,
             "error": health.get("error", "") if not health.get("available") else "",
@@ -3906,22 +3956,23 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         confirmed: bool = False,
         **_kwargs: Any,
     ) -> str:
-        """Read the phone's current location on demand through Operit.
+        """Read the phone's location on demand through the configured App or Operit.
 
         Call this only when the user explicitly asks for their location or the
         current task needs it. It never runs in the background and does not
         retain the coordinates. Address lookup or high-accuracy location needs
         an explicit confirmation because they are more sensitive.
-        Chain with Baidu Map MCP: inside China the fix is GCJ02 and
-        location.bd09_latitude/bd09_longitude are already converted for Baidu
-        tools — pass those two fields as latitude/longitude to map_reverse_geocode,
-        map_search_places (location), map_directions, or map_road_traffic. Do
-        not pass the raw gcj02 latitude/longitude to Baidu tools; outside China
-        use the raw wgs84 values. When the user asks "我在哪", call
-        phone_location first, then map_reverse_geocode with the bd09 pair.
+        The response has location.coord_type, freshness, accuracy when available,
+        and map_handoff. This tool does not call Baidu or convert coordinates.
+        Only continue to map tools when the user asked for a map/address/nearby
+        query and the actual tool is available in this conversation. Follow its
+        registered schema. Baidu reverse geocoding requires BD09: convert known
+        WGS84/GCJ02 with a registered conversion tool first; never relabel them.
+        Unknown, stale, mock or undated fixes must not be presented as verified
+        current locations. A successful phone fix is not a successful map query.
         Args:
             high_accuracy(boolean): Request a high-accuracy fix when true.
-            include_address(boolean): Ask the phone to reverse geocode the fix.
+            include_address(boolean): Request address metadata. Current App location provider reports not_supported; the Baidu MCP handoff remains separate and schema-gated.
             timeout_seconds(number): Location timeout from 3 to 30 seconds.
             confirmed(boolean): Set true when the user confirmed sensitive location details.
         """
@@ -3951,20 +4002,14 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             result = await asyncio.to_thread(
                 self.device_app.execute,
                 "location",
-                {"high_accuracy": high_accuracy, "include_address": include_address},
+                {"high_accuracy": high_accuracy, "include_address": include_address, "timeout_seconds": timeout_seconds},
             )
+            result = self._app_location_result(result)
             result["action"] = "location"
-            result["backend"] = "app"
             return json.dumps(result, ensure_ascii=False)
         available = await asyncio.to_thread(self._operit_health_sync)
         if not available.get("available"):
             return json.dumps({"success": False, "backend": "operit", "operit": available}, ensure_ascii=False)
-        self._audit(
-            "phone_location",
-            high_accuracy=high_accuracy,
-            include_address=include_address,
-            timeout_seconds=timeout_seconds,
-        )
         result = await asyncio.to_thread(
             self._operit_location_sync,
             high_accuracy,

@@ -10,6 +10,7 @@ __pycache__/
 phone_agent_reminders.json
 phone_agent_policies.json
 phone_agent_tasks.json
+phone_agent_health_connect.json
 
 # runtime artifacts (B10: cover all state files so real runtime data is never committed)
 phone_agent_audit.jsonl

@@ -49,9 +49,10 @@ Chat platform -> AstrBot -> Phone Agent plugin
 
 App chat -> AstrBot chat API -> AstrBot model and enabled plugins
 Xiaomi Fitness -> server-side xiaomi-sync -> SQLite -> phone_health
+Xiaomi Fitness -> Health Connect -> Phone Agent App -> latest summary -> phone_health
 ```
 
-Health data is a separate path: the server-side `xiaomi-sync` deployment (the `xiaomi-health-sync` repository) synchronizes Xiaomi Fitness data into SQLite, and `phone_health` reads that database. Android Health Bridge is not part of this path.
+Health data is separate from phone control. Plugin 0.9.3 and App 0.3.28 add a selectable Health Connect source, while the server-side `xiaomi-sync` deployment (the `xiaomi-health-sync` repository) remains available as a SQLite source. `phone_health` selects one source per query; it never adds their metrics together. An independent Android Health Bridge is not required.
 
 ## 2. Prerequisites
 
@@ -62,7 +63,7 @@ Health data is a separate path: the server-side `xiaomi-sync` deployment (the `x
 - Shizuku access granted to the selected phone app's tools or workflows.
 - For Operit mode, at least one working chat model configured in Operit. Verify that it can answer and call tools from a normal Operit chat before enabling remote control.
 - AstrBot 4.22 or newer.
-- A Xiaomi Fitness account and the server-side `xiaomi-sync` deployment if health queries are needed.
+- For optional health queries, either Xiaomi Fitness writing to Health Connect plus Phone Agent App, or a separate server-side `xiaomi-sync` deployment.
 
 For App mode, install [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app). For Operit mode, install [Operit](https://github.com/AAswordman/Operit), configure a working model, and enable External HTTP. Names such as `PHONE_TAILSCALE_IP`, `<astrbot-data>`, and `YOUR_ASTRBOT_USER_ID` below are placeholders; never copy a real private address, token, or password into this document.
 
@@ -359,7 +360,7 @@ Validate in this order after saving:
 
 1. WebUI shows the Token as configured.
 2. Test Operit succeeds and shows the Operit version.
-3. Refresh Health. “Not configured” is expected when no health database is configured.
+3. Refresh Health and check the selected source, record dates and freshness. No health data is expected until Health Connect uploads or a SQLite database is configured.
 4. If phone observation is needed, first set `enable_observe_tool=true`, then in an authorized private chat send:
 
    ```text
@@ -459,14 +460,22 @@ Relay supports device isolation. Set `RELAY_REQUIRE_DEVICE_ID=1` and send `X-Rel
 
 ## 9. Health data (optional)
 
-The phone plugin does not read Xiaomi credentials directly. Deploy the server-side `xiaomi-sync` (`xiaomi-health-sync`) separately:
+The phone plugin does not read health app credentials directly. Enable `enable_health_tools` and choose a source.
+
+**Health Connect (plugin 0.9.3 + App 0.3.28):** select one source app package that writes records to Health Connect, grant the desired categories in App **我的 → Health Connect**, and turn on **同步健康摘要到服务器**. The upload switch defaults to off and is separate from system read permissions. Partial grants are supported. Only `com.mi.health` has been verified on a real device so far. Xiaomi Fitness is hidden by default in the mainland China build; users can explore enabling it themselves.
+
+The App reads only the selected app's records from the last seven local dates: steps, sleep, heart rate, oxygen saturation and active calories. It uploads daily summaries, not individual measurements; missing metrics stay absent. Actual data depends on the selected app's writes. It never writes to or deletes Health Connect records. Summaries may be used by enabled health queries and care features, including the user's configured model service.
+
+`health_data_source=auto` prefers a fresh summary from the current registered phone and otherwise falls back to SQLite. `health_connect` uses only the phone snapshot; `health_db` always uses SQLite. These sources are never combined. The App attempts synchronization about every 15 minutes while its connection service runs; background health-read permission is not requested, so a denied background read requires a manual foreground retry. Disabling sync stops reads and requests server snapshot deletion, with persistent retry when offline. System permission changes are reported on the next read; an offline phone cannot immediately clear the server copy. See [Health Connect details](docs/HEALTH_CONNECT.md).
+
+**Existing xiaomi-sync / SQLite:** deploy the server-side `xiaomi-sync` (`xiaomi-health-sync`) separately:
 
 1. Install the project and its dependencies on the server.
 2. Use its QR login flow for the Xiaomi account.
 3. Install the timer templates in [`deploy/xiaomi-sync`](deploy/xiaomi-sync), then set `health_db_path` to `/srv/xiaomi-health-sync/data/health.db` (a directory containing `health.db` is also accepted).
 4. Run synchronization periodically with a systemd timer or another scheduler.
 
-The plugin only reads the `xiaomi-sync` SQLite database. Xiaomi tokens are never uploaded to GitHub or chat. Health responses include the latest sync time, success state, and staleness; a failed sync is reported as unavailable instead of success. Example queries:
+For this source the plugin reads the `xiaomi-sync` SQLite database without modifying it. Xiaomi tokens stay in that tool. Health responses identify the selected `source` (`health_connect` or `health_db`) and report availability, synchronization status and freshness. A failed SQLite sync or a Health Connect snapshot older than three hours is not fresh. Check each record's date even when its upload is recent. Example queries:
 
 ```text
 How many steps did I take today?
@@ -625,9 +634,9 @@ The screen collector still calls Operit directly and is not an App-only screen b
 
 ## 14. Data and capability details
 
-Health reads support 1–30 days of `daily_metrics`, plus available weight/BMI/body fat, blood pressure and sleep-segment tables. If a requested date is absent, the plugin can return the newest available historical day. `available` means there are records; `fresh` separately requires a successful sync within 180 minutes. Missing sync records or failed syncs are stale.
+SQLite health reads support 1–30 days of `daily_metrics`, plus available weight/BMI/body fat, blood pressure and sleep-segment tables. Health Connect summaries cover at most seven local dates and the five categories listed above. If a requested date is absent, results may contain a historical day instead. `available` means there are records; `fresh` separately requires a recent successful sync or snapshot within 180 minutes. Missing SQLite sync records or failed syncs are stale.
 
-App location returns native WGS84 under the structured command result's `output`; it does not supply Operit's BD09 conversion or implement address lookup. Operit retains its GCJ02-to-BD09 path for China-region coordinates, but the legacy parser infers the input system from location bounds. Verify your provider and `coord_type` before passing coordinates to Baidu MCP reverse geocoding, place search or routing.
+App location reports native WGS84. Operit locations retain their reported coordinate type. The plugin does not guess or shift coordinates based on geography. Baidu's China reverse-geocoding MCP requires BD09LL; the currently connected tool set has no coordinate-conversion tool, so WGS84/GCJ02 fixes are not sent to Baidu. The WebUI map check reads registered tool metadata only and never requests or transmits phone coordinates. Address lookup remains unimplemented on the App location provider.
 
 `phone_app_policy(minutes=0)` keeps a restriction until explicit restoration. Timed restore is an attempt on expiry; an offline phone can miss it, and the code does not continuously retry at that point. Failed batch restrictions trigger rollback attempts, with results reported. Policy files survive restarts.
 
@@ -640,7 +649,7 @@ The audit log avoids message bodies and tokens, but reminder, timeline and backg
 - **App state works but phone commands fail:** the App-to-server route and server-to-phone route differ. Check LAN/Tailscale routing, `app_direct_urls`, `:8260`, the shared token and Shizuku separately.
 - **App reports an unsupported UI action:** use Operit mode for arbitrary taps/swipes/text input. Do not route around the error through an arbitrary shell tool.
 - **Reminder is late:** check which source created it (App or chat), notification permissions, phone background limits and relay/sync cadence.
-- **Health is available but stale:** verify the external synchronizer's latest successful run and the returned record date; old records are not real-time readings.
+- **Health is unavailable or stale:** check the selected `source` first. For Health Connect, inspect Xiaomi Fitness writes, App permissions, the sync switch and the last upload result. For SQLite, verify the external synchronizer and database path. Check record dates in either case; `auto` falling back to SQLite does not confirm a successful phone upload.
 - **Private Companion has no context:** check separate bridge installation, both enable switches, its allowlist, user role/private scope, and the Private Companion API version.
 
 ## License

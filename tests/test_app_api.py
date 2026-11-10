@@ -66,7 +66,7 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         self.config = {"enabled": True, "control_backend": "app", "enable_reminder_tools": True,
                        "enable_audit_tool": True, "enable_observe_tool": True}
         for key in ("reminders_path", "app_state_path", "audit_log_path", "tasks_path", "policy_state_path",
-                    "notification_path", "task_runs_path"):
+                    "notification_path", "task_runs_path", "health_connect_path"):
             self.config[key] = str(Path(self.temp.name) / (key + ".json"))
         self.plugins = []
         self.create_plugin()

@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.9.3] - 2026-11-10
+
+- Allow one validated Health Connect origin package per snapshot so the App can
+  select the actual writing health app. Keep Xiaomi as the existing default.
+- Normalize location fixes without guessing coordinate systems, expose Baidu
+  MCP registry status, and provide an explicit schema-based handoff. No phone
+  coordinates are sent during status checks.
+- Update the plugin dashboard for source-aware health summaries, clear
+  connection and care states, and responsive navigation.
+- Preserve SQLite as a selectable health source and document the read/write and
+  coordinate-system limits.
+
+## [0.9.2] - 2026-11-10
+
+- Add opt-in Health Connect daily-summary ingestion from App 0.3.27, scoped to
+  the registered phone and explicit read permissions. Validate bounded numeric
+  fields, idempotent uploads, capture times and revocation states.
+- Select one health source: auto prefers fresh phone summaries, health_connect
+  selects them explicitly, and health_db preserves xiaomi-sync. Never add the
+  sources together. Health queries and care share the same selection.
+- Persist only the latest summary snapshot and provide authenticated removal;
+  the phone stops reading on disable and retries remote deletion when offline.
+- Keep original cloud synchronization available. See docs/HEALTH_CONNECT.md for
+  supported types, background limits, permissions and the upload contract.
+- Update the bundled companion bridge to 0.3.1: invalidate phone health caches
+  on consent or binding changes, map the new summary fields for care decisions,
+  and interpret phone summary dates in the phone's time zone. Adapt dashboard
+  metrics and source labels while preserving the SQLite format.
+- Prevent delayed uploads from an old binding from replacing a new phone's
+  snapshot, and allow a newly registered phone to clear its absent snapshot.
+
 ## [0.9.1] - 2026-11-10
 
 - Pin task execution, observations and direct routing to a device binding; stop

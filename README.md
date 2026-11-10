@@ -10,6 +10,8 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 ## 5 分钟上手（自有 App 模式）
 
+0.9.3 配合 App 0.3.28 新增 Health Connect 来源选择和定位 / 百度地图 MCP 状态检查。原有 xiaomi-sync 可继续使用，配置方法见 [健康接入说明](docs/HEALTH_CONNECT.md)。
+
 0.9.1 修复设备中途换绑、授权累计步数、严格核验和取消后的恢复责任。升级时重新签发旧 grant；使用受限任务的 Relay 兜底时须同步更新 Relay。现有 App 0.3.26 可继续使用，详见 [升级说明](docs/REVIEW_FIXES_0_9_1.md)。
 
 0.9.0 新增可选 LLM 多步规划与 Private Companion 7.x 关怀适配。开启 enable_llm_task_planner 后，模型只生成受限计划，执行仍需审批；关怀会参考同一私聊的近期对话并抑制重复打扰。配置及边界见 docs/PRIVATE_COMPANION_719_ADAPTATION.md。
@@ -59,7 +61,7 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 | 应用使用统计 | `phone_usage` | `enable_usage_tool`；依赖执行端权限 |
 | 聊天会话提醒 | `phone_reminder` | `enable_reminder_tools`；添加、列出、取消，到期回原会话 |
 | 手机操作审计 | `phone_audit` | `enable_audit_tool`；动作元数据，不含聊天正文和 Token |
-| 小米运动健康查询 | `phone_health` | `enable_health_tools`；读取独立同步的 SQLite，和手机执行模式无关 |
+| 小米运动健康查询 | `phone_health` | `enable_health_tools`；选择 App 上传的 Health Connect 摘要或独立同步的 SQLite，和手机执行模式无关 |
 | 私人陪伴授权复用 | `extensions/private_companion_auth.md` | 可选 `use_private_companion_auth`，不要求安装私人陪伴插件 |
 | 主动陪伴中的手机 / 健康上下文 | `companion-context/` | 独立可选桥接插件，默认关闭；另有显式开启的关系语气和主动决策配置 |
 | 无 VPN 的中继兜底 | `deploy/relay/` | Bearer 鉴权、任务租约、续租、领取者校验、限流及持久化 |
@@ -77,7 +79,8 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
                     ├─ operit：自然语言任务 ──> OperitAI / Shizuku
                     └─ 直连传输失败 ──> Relay ──> 对应手机端轮询
 
-小米运动健康 ──> 独立 xiaomi-sync ──> SQLite ──> phone_health
+小米运动健康 ──> Health Connect ──> Phone Agent App ──> 手机健康快照 ──┐
+             └─> 独立 xiaomi-sync ──> SQLite ─────────────────────┴─> phone_health（选择一个来源）
 Private Companion <── 可选 companion-context 手机 / 健康摘要
 ```
 
@@ -292,21 +295,29 @@ App 另外提供创建与取消接口，通过 `GET /app/state` 拉取待办、�
 
 开启 `enable_location_tool` 后，`phone_location` 按需读取一次位置，不后台追踪。高精度定位和地址请求需要会话确认；App 模式还需要手机系统权限和手机端确认。
 
-Operit 路径保留 GCJ02 → BD09 的处理，可返回 `bd09_latitude` / `bd09_longitude`，供百度地图 MCP 的 `map_reverse_geocode`、`map_search_places`、路线规划等工具继续使用。地图 MCP 是独立服务，需要在 AstrBot 另行配置。
+App 返回原生 WGS84，Operit 返回其实际报告的坐标系；插件不按地理范围猜坐标，也不伪造转换值。WebUI 的「检查地图接入」只检查 AstrBot 已注册的 MCP 工具，不采集或发送手机坐标。
 
-**先核对 `coord_type`**：当前 App 使用 Android 原生位置接口，返回 `wgs84`；不可把它直接当 BD09 传入百度地图。旧 Operit 解析逻辑在中国范围内按 GCJ02 输入处理，也应核实你的定位提供方。没有地址或坐标转换结果时，不要把能力表理解为自动完成了地图查询。
+百度地图 MCP 的逆地理编码要求 BD09LL。当前已核验的百度 MCP 工具列表没有坐标转换工具，因此 WGS84 / GCJ02 定位会明确提示需要转换，不会直接把原坐标交给百度或误报地址查询成功。使用前需确认地图工具 schema 中的坐标系与参数；地址和高精度定位仍需用户明确请求和确认。更多接入状态见 [百度地图 MCP 对接说明](docs/BAIDU_MAP_MCP.md)。
 
 ## 小米运动健康
 
-原有健康功能独立保留，不依赖选择 App 还是 Operit：
+健康查询与 App / Operit 控制模式独立。服务端开启 `enable_health_tools` 后，可选择以下来源；同一次查询只返回一个来源，不叠加步数等指标。
+
+支持对接可接入 Health Connect 的健康 App，小米运动健康国区默认隐藏了，需要的可自行探索。
+
+**Health Connect（插件 0.9.3 + App 0.3.28）**：先在 Health Connect 中选定一个实际写入记录的 App，再到 Phone Agent App「我的 → Health Connect」填写该 App 的 Android 包名、授予需要的读取权限并开启「同步健康摘要到服务器」。每次只读取一个来源最近 7 天的步数、睡眠、心率、血氧和活动热量，发送按日摘要；缺失数据不补零。同步默认关闭，支持部分授权。可读取的数据类别取决于所选 App 实际写入的记录；目前只有 `com.mi.health` 完成过实机验证。
+
+`health_data_source=auto` 默认优先使用当前手机的新鲜快照，否则回退 SQLite；`health_connect` 只使用手机快照；`health_db` 固定使用 SQLite。App 约每 15 分钟尝试同步，系统可能拒绝后台读取，此时请保持 App 在前台手动同步。关闭同步会停止读取并请求清除服务器快照，离线清除会重试；系统撤权在下次读取时上报。详见 [Health Connect 接入与数据使用](docs/HEALTH_CONNECT.md)。
+
+**原有 xiaomi-sync / SQLite**：
 
 1. 部署 [xiaomi-health-sync](https://github.com/ridd1ot/xiaomi-health-sync) 并完成它自己的登录/同步。
 2. 使用 [`deploy/xiaomi-sync/`](deploy/xiaomi-sync/README.md) 中的脚本和 systemd timer 模板定期同步。
 3. 将生成的 `health.db` 路径填入 `health_db_path`，开启 `enable_health_tools`。
 
-插件只读 SQLite，支持步数、睡眠、心率、血氧等每日指标；数据库存在相应表时还返回体重/BMI/体脂、血压、睡眠分段。查询支持最近 1–30 天，缺少当天数据时会标明并返回最近可用日期。
+选择 SQLite 时，插件只读数据库，支持步数、睡眠、心率、血氧等每日指标；数据库存在相应表时还返回体重/BMI/体脂、血压、睡眠分段。此来源查询支持最近 1–30 天，缺少当天数据时会标明并返回最近可用日期。
 
-响应保留 `source=xiaomi-sync`、`available`、`fresh` 和最近同步状态；同步失败、缺少同步记录或超过 180 分钟会标记过期。不要把缓存数据当作实时测量。小米登录凭据留在同步工具中，不需要交给手机控制插件。
+响应带实际 `source`（`health_connect` 或 `health_db`）、`available`、`fresh` 和同步状态。SQLite 同步失败、缺少同步记录或超过 180 分钟会标记过期；Health Connect 快照超过 180 分钟也会过期。新鲜快照不代表其中每条测量刚刚发生，应核对记录日期。小米登录凭据留在同步工具中。
 
 ```text
 今天走了多少步
@@ -375,7 +386,7 @@ Token 字段不回显，输入留空保留原值。审计不含正文并不意�
 - **手机离线**：检查当前执行端的 HTTP 服务、内网/Tailscale 路由和后台策略；App 状态同步成功不等于服务器能反向直连手机。
 - **Operit 连接成功但不执行**：先在手机验证模型和工具调用，再验证 Shizuku；重装插件不能修复手机模型故障。
 - **重启后 Shizuku 不可用**：按 Shizuku 页面重新启动并检查授权。
-- **健康无数据/过期**：检查同步工具、数据库路径、实际日期和同步记录。
+- **健康无数据/过期**：先核对 `health_data_source` 和实际返回来源。Health Connect 检查小米写入、App 授权和上传结果；SQLite 检查同步工具、数据库路径和同步记录。两者都需核对实际日期。
 - **主动消息不带上下文**：核对桥接独立安装、开关、白名单和 Private Companion 版本兼容性。
 
 ```bash

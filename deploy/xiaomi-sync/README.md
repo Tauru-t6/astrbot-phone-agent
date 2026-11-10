@@ -2,8 +2,14 @@
 
 This directory contains the server-side timer wrapper for
 [`xiaomi-health-sync`](https://github.com/ridd1ot/xiaomi-health-sync).
-It is the only health-data ingestion path used by the AstrBot phone plugin.
-Android Health Bridge is not required for health monitoring.
+It provides the SQLite health-data source and remains available alongside the
+optional [Health Connect source](../../docs/HEALTH_CONNECT.md) in plugin 0.9.2
+and App 0.3.27. An independent Android Health Bridge is not required.
+
+Set `health_data_source=health_db` to always query this database, or use `auto`
+to fall back to it when the current phone has no fresh Health Connect summary.
+The plugin selects one source per query and never adds their metrics together.
+Enabling Health Connect does not stop this timer.
 
 The expected server layout is:
 

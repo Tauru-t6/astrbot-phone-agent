@@ -211,3 +211,53 @@ test('reminder validation rejects fractional and empty minutes without a server 
   }
   assert.equal(d.calls.filter(call=>call.method==='post').length,0);
 });
+
+test('Health Connect and SQLite summaries render without losing zero or missing values',async()=>{
+  const d=await dashboard();
+  const latest={date:'2026-11-10',steps:120,sleep_minutes:0,heart_rate_avg:71,active_calories_kcal:150};
+  d.context.renderStatus({...status(),health:{source:'health_connect',available:true,fresh:true,latest,sync:{finished_at:1794312000}}});
+  const rendered=d.elements.get('healthRows').innerHTML;
+  assert.match(rendered,/睡眠（分钟）<\/span><span class="value">0<\/span>/);
+  assert.match(rendered,/平均心率<\/span><span class="value">71<\/span>/);
+  assert.match(rendered,/活动热量（kcal）<\/span><span class="value">150<\/span>/);
+  assert.match(d.elements.get('statusRows').innerHTML,/Health Connect/);
+  assert.doesNotMatch(d.elements.get('healthDate').textContent,/1794312000/);
+  d.transport.get=async()=>({success:true,health:{days:[latest]}});
+  await d.context.loadHealth();
+  assert.equal(d.elements.get('healthRows').innerHTML,rendered);
+  d.transport.get=async()=>({success:true,health:{days:[{sleep_total_min:420,hr_avg:72}]}});
+  await d.context.loadHealth();
+  assert.match(d.elements.get('healthRows').innerHTML,/睡眠（分钟）<\/span><span class="value">420<\/span>/);
+  assert.match(d.elements.get('healthRows').innerHTML,/平均心率<\/span><span class="value">72<\/span>/);
+  assert.match(d.elements.get('healthRows').innerHTML,/血氧均值<\/span><span class="value">--<\/span>/);
+});
+
+test('map connection diagnostics read registered tools without requesting location',async()=>{
+  const d=await dashboard();
+  d.transport.get=async name=>name==='map/status'?{success:true,map:{
+    status:'ready',reverse_geocode_available:true,coordinate_convert_available:false,
+    sent_to_map:false,tools:[{name:'map_reverse_geocode'},{name:'map_search_places'}],
+  }}:{success:true};
+  await d.context.loadMapStatus();
+  assert.deepEqual(d.calls.map(call=>call.name),['map/status']);
+  assert.match(d.elements.get('mapRows').innerHTML,/百度地图逆地理编码已连接/);
+  assert.match(d.elements.get('mapRows').innerHTML,/map_reverse_geocode/);
+  assert.match(d.elements.get('mapRows').innerHTML,/不可用/);
+  assert.match(d.elements.get('mapNotice').textContent,/WGS84\/GCJ02 不能直接用于百度国内逆地理编码/);
+});
+
+test('failed initial refresh ends loading placeholders and preserves an existing snapshot',async()=>{
+  const d=await dashboard();
+  vm.runInContext('hasStatusSnapshot = false',d.context);
+  d.transport.get=async()=>{throw Error('offline');};
+  await d.context.refresh();
+  assert.equal(d.elements.get('healthState').textContent,'待确认');
+  assert.match(d.elements.get('healthRows').innerHTML,/暂时无法读取/);
+  d.transport.get=async()=>({...status(),health:{available:true,fresh:true,source:'health_connect',latest:{date:'2026-11-10',steps:123}}});
+  await d.context.refresh();
+  const snapshot=d.elements.get('healthRows').innerHTML;
+  d.transport.get=async()=>{throw Error('offline');};
+  await d.context.refresh();
+  assert.equal(d.elements.get('healthRows').innerHTML,snapshot);
+  assert.equal(d.elements.get('headerStatus').textContent,'状态读取失败');
+});

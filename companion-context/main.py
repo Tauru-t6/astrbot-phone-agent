@@ -14,6 +14,7 @@ from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Star
@@ -56,7 +57,7 @@ class PhoneCompanionContext(Star):
         self._last_outcome: dict[str, dict[str, Any]] = {}
         self._observe_lock = asyncio.Lock()
         self._screen_cache: tuple[int, datetime, dict[str, Any]] | None = None
-        self._health_cache: tuple[datetime, dict[str, Any]] | None = None
+        self._health_cache: tuple[tuple[int, str, int], datetime, dict[str, Any]] | None = None
         self._bridge_status: dict[str, Any] = {"enabled": self._enabled(), "installed": False}
         self._load_decision_budget()
 
@@ -1126,13 +1127,30 @@ class PhoneCompanionContext(Star):
         return signal
 
     async def _health_snapshot(self, phone: Any) -> dict[str, Any]:
+        key = self._health_source_key(phone)
+        # A phone snapshot can be cleared or invalidated immediately after the
+        # user withdraws consent. Always consult its current source selection;
+        # a bridge TTL must not preserve data the phone plugin has removed.
+        cache_allowed = getattr(phone, "_health_connect", None) is None or key[1] == "health_db"
+        if not cache_allowed or (self._health_cache and self._health_cache[0] != key):
+            self._health_cache = None
         ttl = self._cache_seconds("health_cache_seconds", 900, 3600)
-        if self._health_cache and datetime.now() - self._health_cache[0] < timedelta(seconds=ttl):
-            return dict(self._health_cache[1])
+        if self._health_cache and datetime.now() - self._health_cache[1] < timedelta(seconds=ttl):
+            return dict(self._health_cache[2])
         result = await asyncio.to_thread(phone._read_health_db_sync, 1)
+        if self._health_source_key(phone) != key:
+            self._health_cache = None
+            return {}
         snapshot = result if isinstance(result, dict) else {}
-        self._health_cache = (datetime.now(), snapshot)
+        if cache_allowed:
+            self._health_cache = (key, datetime.now(), snapshot)
         return dict(snapshot)
+
+    @staticmethod
+    def _health_source_key(phone: Any) -> tuple[int, str, int]:
+        config = getattr(phone, "config", {})
+        mode = str(config.get("health_data_source", "auto"))
+        return id(phone), mode, PhoneCompanionContext._device_generation(phone)
 
     async def _screen_snapshot(self, phone: Any) -> dict[str, Any]:
         # Keep proactive context observation behind the phone plugin's explicit
@@ -1319,6 +1337,11 @@ class PhoneCompanionContext(Star):
                 health_fresh = bool(result.get("fresh") and sync.get("ok") and not sync.get("stale"))
                 health_date = _clean(latest.get("date"), 20)
                 today_str = datetime.now().date().isoformat()
+                if result.get("source") == "health_connect":
+                    try:
+                        today_str = datetime.now(ZoneInfo(str(result.get("zone_id")))).date().isoformat()
+                    except (ZoneInfoNotFoundError, ValueError):
+                        today_str = ""  # An unknown phone timezone cannot establish "today".
                 # If the health record's date is not today, it is historical.
                 is_today = bool(health_date and health_date == today_str)
                 health_signal = {
@@ -1326,6 +1349,12 @@ class PhoneCompanionContext(Star):
                     for key in ("date", "steps", "sleep_total_min", "sleep_score", "hr_avg", "hr_resting", "hr_latest", "spo2_avg")
                     if latest.get(key) is not None
                 }
+                if result.get("source") == "health_connect":
+                    # Keep the persisted/API Health Connect schema intact;
+                    # adapt its units/names only for existing care consumers.
+                    for source, target in (("sleep_minutes", "sleep_total_min"), ("heart_rate_avg", "hr_avg")):
+                        if latest.get(source) is not None:
+                            health_signal[target] = latest[source]
                 health_signal["fresh"] = health_fresh and is_today
 
         fragments: list[str] = []

@@ -37,7 +37,7 @@ Android 前端：[AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-p
                          \-- operit: External HTTP -> OperitAI -> Shizuku
 ```
 
-健康数据是独立链路：服务器上的 `xiaomi-sync`（仓库 `xiaomi-health-sync`）定时同步小米运动健康数据到 SQLite，然后由 `phone_health` 查询。Android Health Bridge 不参与这条链路。
+健康数据是独立链路：App 0.3.28 可让用户选择一个 Health Connect 来源 App 并上传按日摘要；插件 0.9.3 同时保留服务器 `xiaomi-sync`（仓库 `xiaomi-health-sync`）同步到 SQLite 的方式。`phone_health` 按配置选择一个来源，独立 Android Health Bridge 不是必需组件。
 
 ## 二、前置条件
 
@@ -47,7 +47,7 @@ Android 前端：[AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-p
 - 在 Shizuku 中授权实际使用的手机应用；不要求两个前端同时安装。
 - 仅 Operit 模式需要在 Operit 配置可用的聊天模型，并确认模型能正常回复和调用工具；App 模式的聊天由 AstrBot 提供。
 - AstrBot 4.22 或更高版本。
-- 如果需要健康数据，再准备小米运动健康账号和服务器端 `xiaomi-sync`。
+- 如果需要健康数据，选择能向 Health Connect 写入所需类型记录的健康 App → Phone Agent App，或单独部署服务器端 `xiaomi-sync`。
 
 手机可以使用 Wi-Fi 或移动数据。Operit HTTP 通过 Tailscale 工作，不依赖 ADB 无线调试。Shizuku 在手机重启后可能需要重新启动一次。
 
@@ -357,7 +357,7 @@ Operit 模式最少需要配置：
 
 1. WebUI 中 Token 状态显示“已配置”。
 2. 点击“测试当前后端”，预期显示当前配置模式在线；Operit 可返回其版本，App 使用手机命令服务的健康结果。
-3. 点击“刷新健康”。未配置健康库时显示未配置是正常的。
+3. 点击“刷新健康”，核对返回的数据来源、日期和新鲜度。未接入 Health Connect 且未配置 SQLite 时，显示暂无可用健康数据是正常的。
 4. 如果需要使用手机观察功能，先在配置中开启 `enable_observe_tool=true`，再在和 AstrBot 的授权私聊中发送：
 
    ```text
@@ -506,7 +506,7 @@ cp -R astrbot_plugin_phone_agent/companion-context astrbot_plugin_phone_companio
 
 当前实现还要求 `relationship_mode_enabled=true` 才会执行上下文扩充；`allowed_user_ids` 为空时不会观察任何用户。需要屏幕粗粒度信号时，必须同时开启主插件的 `enable_observe_tool=true` 和桥接的 `include_screen=true`。
 
-屏幕桥接当前直接调用 Operit，只采集前台包名、活动类别和电量，不返回屏幕原文、联系人或消息文本。纯 App 部署应保持 `include_screen=false`；它不会自动改用 App `screen_text`。健康上下文读取服务器 SQLite，与控制模式无关。
+屏幕桥接当前直接调用 Operit，只采集前台包名、活动类别和电量，不返回屏幕原文、联系人或消息文本。纯 App 部署应保持 `include_screen=false`；它不会自动改用 App `screen_text`。健康上下文遵循主插件的 `health_data_source`，选择 Health Connect 快照或 SQLite，与控制模式无关。
 
 默认整体等待上限为 `timeout_seconds=20`，屏幕缓存 `screen_cache_seconds=90` 秒，健康缓存 `health_cache_seconds=900` 秒。接口不兼容或目标插件不可用时跳过桥接，可在日志检查桥接状态。
 
@@ -514,14 +514,27 @@ cp -R astrbot_plugin_phone_agent/companion-context astrbot_plugin_phone_companio
 
 ## 九、健康数据（可选）
 
-手机插件本身不读取小米账号。App/Operit 控制和健康数据是独立链路。需要单独部署 `xiaomi-health-sync`：
+手机插件本身不读取健康 App 账号。App/Operit 控制和健康数据是独立链路。插件 0.9.3 提供两种健康数据来源，开启 `enable_health_tools` 后按需选择。
+
+**Health Connect（App 0.3.28）**：
+
+1. 选择实际写入数据的健康 App，并在 Health Connect 中核对来源包名；“最近访问”不代表已经写入每种数据。
+2. 打开 App「我的 → Health Connect」，输入来源 App 包名并授权需要的类别，支持部分授权。
+3. 开启默认关闭的「同步健康摘要到服务器」，点击「立即同步健康摘要」。上传只沿用已配置的插件地址与 Dashboard JWT。
+4. 设置 `health_data_source`：`auto` 优先当前手机的新鲜快照，否则回退原 SQLite；`health_connect` 只用手机快照；`health_db` 只用 SQLite。不会把两个来源的指标相加。
+
+支持对接可接入 Health Connect 的健康 App，小米运动健康国区默认隐藏了，需要的可自行探索。
+
+选择 App 包名后只读取单一来源最近 7 天已授权且实际写入的步数、睡眠、心率、血氧和活动热量，按日汇总后上传，缺失数据不补零。系统授权与服务器同步是两个独立开关。App 约每 15 分钟尝试同步，没有申请后台健康读取权限，系统拒绝时请回到 App 手动同步。关闭同步会停止读取并请求清除服务器快照，离线清除会在恢复连接后重试；系统撤权在下次读取时上报。其他 App 写入类别与兼容性取决于其实现，目前仅 `com.mi.health` 完成过实机验证。摘要用于已开启的健康查询和关怀，可能交给用户配置的模型服务。详细边界见 [Health Connect 接入说明](docs/HEALTH_CONNECT.md)。
+
+**原有 xiaomi-sync / SQLite**：需要单独部署 `xiaomi-health-sync`，下方 9.1–9.3 是这条来源的安装与验证步骤。
 
 1. 在服务器安装项目及依赖。
 2. 用项目提供的二维码登录小米账号。
 3. 使用仓库内 [`deploy/xiaomi-sync`](deploy/xiaomi-sync) 的定时任务，并将 `/home/YOUR_USER/data/xiaomi_health_sync/data/health.db` 配置到 `health_db_path`（也可以填包含该文件的目录）。
 4. 用 systemd timer 或其他计划任务定期同步。
 
-插件只读查询 `xiaomi-sync` 的 SQLite，不会把小米 Token 上传到 GitHub 或聊天平台。健康查询会同时返回最近一次同步时间、成功状态和是否过期；同步失败时不会伪装成成功。成功后可以问：
+选择此来源时，插件只读查询 `xiaomi-sync` 的 SQLite，不会把小米 Token 上传到 GitHub 或聊天平台。健康查询返回实际 `source`（`health_connect` 或 `health_db`）、最近同步时间、成功状态和是否过期；同步失败时不会伪装成成功。成功后可以问：
 
 ```text
 我今天走了多少步？
@@ -589,28 +602,13 @@ timer 在启动后约 3 分钟运行，此后每 30 分钟调度。对常驻服�
 
 开启 `enable_health_tools=true`，设置 `health_db_path` 后，先用 WebUI“刷新健康”验证。插件以只读 SQLite 连接读取 `daily_metrics` 和 `sync_runs`，返回最近一次同步的 `ok`、`finished_at`、`age_minutes`、`stale` 和错误。
 
-最近一次同步失败、没有同步记录或完成时间超过 180 分钟时，数据会标为 stale；`available=true` 只代表有可查询数据，不代表 `fresh=true`。某天暂无数据时可能返回最近可用一天，因此回答“今天”问题要核对返回的 `date`。这条同步链路不需要 Android Health Bridge，也不能代替医疗判断。
+SQLite 最近一次同步失败、没有同步记录或完成时间超过 180 分钟时，数据会标为 stale；Health Connect 快照采集超过 180 分钟也会过期。`available=true` 只代表有可查询数据，不代表 `fresh=true`。某天暂无数据时可能返回最近可用一天，因此回答“今天”问题要核对返回的 `date`。这两条同步链路都不需要独立 Android Health Bridge。
 
 ## 位置坐标和百度地图链路
 
-开启 `enable_location_tool=true` 后，`phone_location` 按需获取一次位置。高精度 `high_accuracy=true`、地址请求 `include_address=true` 需要用户确认。两种控制模式的坐标语义不同：
+开启 `enable_location_tool=true` 后，`phone_location` 按需获取一次位置。高精度 `high_accuracy=true`、地址请求 `include_address=true` 需要用户确认。App 返回 WGS84，Operit 返回其实际报告的坐标系；插件不按地理范围猜坐标，也不伪造转换值。
 
-| 模式 | 返回字段和坐标系 | 地图使用方式 |
-| --- | --- | --- |
-| App | `output.latitude`、`output.longitude`、`coord_type=wgs84`、精度和 provider | 用明确接受 WGS84 的接口，或先通过地图服务转换成其要求的坐标系 |
-| Operit | `location.latitude/longitude`；插件按中国区域判断为 GCJ02，并计算 `bd09_latitude/bd09_longitude` | 在中国调用百度工具时用 BD09 字段 |
-| Operit 境外 | 插件标记 `coord_type=wgs84`，不添加 BD09 偏移 | 按地图服务的境外坐标约定使用 |
-
-Operit 的 GCJ02 判断是当前插件的来源假设，并非对所有 Android 定位提供者都成立；若上游提供的是 WGS84，应先核实来源。App 使用 Android 原生定位并明确标为 WGS84，不能沿用旧教程把所有返回都当作 GCJ02。
-
-与百度地图 MCP 的典型流程：
-
-1. 用户说“我在哪”“附近有什么好吃的”，调用 `phone_location`。
-2. 确认 `success=true`，检查当前后端和 `coord_type`。
-3. Operit 的中国结果使用 `location.bd09_latitude` 和 `location.bd09_longitude`。
-4. 调用 `map_reverse_geocode` 获取地址，或 `map_search_places` 查附近地点；需要路线、路况时再使用 `map_directions`、`map_road_traffic`，字段名以已连接地图工具 schema 为准。
-
-不要把 GCJ02 原始字段直接传给要求 BD09 的工具，也不要对已为 BD09 的字段再次转换。App 当前定位实现返回坐标，不自带地址反查；`include_address` 的实际结果能力与 Operit 不同。插件不保存坐标，也不后台定时追踪位置。
+WebUI 的「检查地图接入」只检查 AstrBot 已注册的 MCP 工具，不采集或发送手机坐标。百度地图国内逆地理编码要求 BD09LL。当前启用的 MCP 包含逆地理编码、地点和路线工具，但没有坐标转换工具，因此 WGS84 / GCJ02 定位会明确提示转换缺失，不会直接把原坐标交给百度或误报地址查询成功。`include_address` 在当前 App 定位端返回 `not_supported`；App 会报告采集时间、时效、精度与模拟位置标记。插件不保存坐标，也不后台追踪。更多接入状态见 [百度地图 MCP 对接说明](docs/BAIDU_MAP_MCP.md)。
 
 ## Relay 兜底部署
 
@@ -831,7 +829,7 @@ App 提醒网络重试应复用同一个 `request_id`；重复请求会返回原
 
 ### 健康页面显示 stale、未配置或没有同步记录
 
-确认 `health_db_path` 是 AstrBot 用户或容器真正可读的文件，检查 `systemctl --user status xiaomi-health-sync.timer` 和同步服务日志。超过 180 分钟、最后一次同步失败或没有 `sync_runs` 记录都不会标为新鲜。若账号过期，回到上游工具重新登录；不要把 Xiaomi Token 填入 AstrBot 配置。
+先检查 `health_data_source` 与响应的 `source`。使用 Health Connect 时，在 App 检查健康权限、同步开关、最近上传及具体错误，并确认小米运动健康已写入记录；`auto` 回退 SQLite 不代表手机上传成功。使用 SQLite 时，确认 `health_db_path` 是 AstrBot 用户或容器真正可读的文件，检查 `systemctl --user status xiaomi-health-sync.timer` 和同步服务日志。超过 180 分钟、最后一次同步失败或没有 `sync_runs` 记录都不会标为新鲜。若账号过期，回到上游工具重新登录；不要把 Xiaomi Token 填入 AstrBot 配置。
 
 ### 地图定位有偏移
 

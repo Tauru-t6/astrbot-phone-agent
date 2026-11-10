@@ -19,6 +19,11 @@
     "default": "",
     "description": "Read-only SQLite path containing daily_metrics and sync_runs (usually .../data/health.db)"
   },
+  "health_data_source": {
+    "type": "text",
+    "default": "auto",
+    "description": "Health source: auto prefers fresh Health Connect summaries, otherwise health_db; health_connect and health_db force one source. Sources are never added together."
+  },
   "operit_base_url": {
     "type": "text",
     "default": "http://127.0.0.1:8094",
