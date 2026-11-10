@@ -11,6 +11,12 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
+
+# Load the C extension before the host shim snapshots/restores sys.modules.
+# Python 3.11 can otherwise retain a ZoneInfo class whose module state was
+# cleared by patch.dict, causing SystemError on its first real constructor.
+_HEALTH_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 ROOT = Path(__file__).parents[1] / "companion-context"
 api = types.ModuleType("astrbot.api")
