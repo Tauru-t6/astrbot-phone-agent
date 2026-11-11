@@ -279,6 +279,26 @@
     "default": false,
     "description": "Execute granted phone tasks instead of only dry-running them. Keep false until the dry-run history looks right."
   },
+  "enable_ui_tasks": {
+    "type": "bool",
+    "default": false,
+    "description": "启用经用户批准的界面任务：读屏、点击、输入批准的文字、滚动并核验。需 App 0.4.0+、Shizuku，以及 task_execute 和 observe_tool；默认关闭。"
+  },
+  "ui_task_allowed_packages": {
+    "type": "text",
+    "default": "tv.danmaku.bili,com.android.chrome,com.android.settings,com.tencent.mobileqq",
+    "description": "允许界面任务操作的应用包名（逗号分隔）。每个任务仍须单独批准一个包名；发送、支付、登录等敏感步骤交人工接手。"
+  },
+  "ui_task_max_steps": {
+    "type": "int",
+    "default": 8,
+    "description": "每次界面任务最多执行的动作数，包含打开应用，范围 1–12。"
+  },
+  "ui_task_provider_id": {
+    "type": "text",
+    "default": "",
+    "description": "界面决策的 AstrBot 模型提供商 ID。留空沿用任务规划模型或当前会话模型；模型会收到目标应用当前可见节点文字。"
+  },
   "task_execute_allowed_actions": {
     "type": "text",
     "default": "open_app,home,back",

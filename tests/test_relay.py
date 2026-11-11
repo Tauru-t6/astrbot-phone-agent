@@ -84,6 +84,37 @@ class RelayQueueTests(unittest.TestCase):
             self.assertIsNone(relay.poll_task("phone-a"))
         persist.assert_not_called()
 
+    def test_targeted_poll_skips_legacy_and_other_device_without_claiming_them(self):
+        legacy = relay.push_task({"message": "legacy personal task"})
+        personal = relay.push_task({"message": "personal task", "target_device_id": "personal-1"})
+        bot = relay.push_task({"message": "bot task", "target_device_id": "bot-1"})
+        claimed = relay.poll_task("bot-1", targeted_only=True)
+        self.assertEqual(claimed["id"], bot["id"])
+        self.assertEqual(claimed["device_id"], "bot-1")
+        self.assertEqual(relay.get_result(legacy["id"])["status"], "pending")
+        self.assertEqual(relay.get_result(personal["id"])["status"], "pending")
+        self.assertIsNone(relay.poll_task("bot-1", targeted_only=True))
+        self.assertEqual(relay.poll_task("personal-1")["id"], legacy["id"])
+        self.assertEqual(relay.poll_task("personal-1")["id"], personal["id"])
+
+    def test_targeted_poll_requires_identity_even_when_legacy_mode_is_enabled(self):
+        task = relay.push_task({"message": "legacy"})
+        for device_id in [None, ""]:
+            with self.subTest(device_id=device_id), self.assertRaises(ValueError):
+                relay.poll_task(device_id, targeted_only=True)
+        self.assertEqual(relay.get_result(task["id"])["status"], "pending")
+
+    def test_target_survives_restart_and_expired_claim_cannot_move_to_other_device(self):
+        task = relay.push_task({"message": json.dumps({"type": "command", "schema_version": 1,
+            "command_id": "targeted-retry", "action": "ping"}), "target_device_id": "bot-1"})
+        relay.poll_task("bot-1", targeted_only=True)
+        relay._state["tasks"][0]["claimed_at"] = time.time() - relay.CLAIM_LEASE_SECONDS - 1
+        relay._persist()
+        relay._state = {"tasks": [], "results": {}}
+        relay._load()
+        self.assertIsNone(relay.poll_task("personal-1"))
+        self.assertEqual(relay.poll_task("bot-1", targeted_only=True)["id"], task["id"])
+
     def test_result_requires_a_live_claim(self):
         task = relay.push_task({"message": "hello"})
         self.assertFalse(relay.submit_result(task["id"], True, "done", device_id="phone-a"))
@@ -132,6 +163,13 @@ class RelayQueueTests(unittest.TestCase):
 
 class RelayHttpTests(unittest.TestCase):
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        for name, value in [("STATE_PATH", Path(temporary.name) / "relay.json"),
+                            ("_state", {"tasks": [], "results": {}}), ("_rate_buckets", {})]:
+            setting = patch.object(relay, name, value)
+            setting.start()
+            self.addCleanup(setting.stop)
         self.token = patch.object(relay, "TOKEN", "test-only-token")
         self.token.start()
         self.server = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.RelayHandler)
@@ -154,6 +192,57 @@ class RelayHttpTests(unittest.TestCase):
         result = response.status, response.getheader("Connection"), json.loads(response.read())
         connection.close()
         return result
+
+    def get(self, path, device_header=None):
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+        headers = {"Authorization": "Bearer test-only-token"}
+        if device_header is not None:
+            headers[relay.DEVICE_HEADER] = device_header
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        result = response.status, json.loads(response.read())
+        connection.close()
+        return result
+
+    def test_health_advertises_targeted_polling_capability(self):
+        status, body = self.get("/health")
+        self.assertEqual(status, 200)
+        self.assertIs(body["targeted_tasks"], True)
+        self.assertIs(body["targeted_polling"], True)
+
+    def test_query_targeted_poll_claims_only_exact_device_and_leaves_legacy_for_personal(self):
+        legacy = relay.push_task({"message": "personal legacy"})
+        bot = relay.push_task({"message": "bot command", "target_device_id": "bot-1"})
+        status, body = self.get("/poll?device_id=bot-1&targeted_only=true", "bot-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["task"]["id"], bot["id"])
+        self.assertEqual(relay.get_result(legacy["id"])["status"], "pending")
+        status, body = self.get("/poll?device_id=bot-1&targeted_only=true", "bot-1")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["task"])
+        status, body = self.get("/poll", "personal-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["task"]["id"], legacy["id"])
+
+    def test_targeted_poll_accepts_query_identity_in_strict_mode(self):
+        task = relay.push_task({"message": "bot command", "target_device_id": "bot-1"})
+        with patch.object(relay, "REQUIRE_DEVICE_ID", True):
+            status, body = self.get("/poll?device_id=bot-1&targeted_only=true")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["task"]["id"], task["id"])
+
+    def test_invalid_targeted_query_cannot_degrade_to_legacy_claim(self):
+        task = relay.push_task({"message": "personal legacy"})
+        cases = [("/poll?targeted_only=true", None), ("/poll?device_id=&targeted_only=true", None),
+                 ("/poll?device_id=bot-1&targeted_only=yes", "bot-1"),
+                 ("/poll?device_id=bot-1&targeted_only=true&targeted_only=false", "bot-1"),
+                 ("/poll?device_id=bot-1&device_id=personal-1&targeted_only=true", None),
+                 ("/poll?device_id=bot-1&targeted_only=true", "personal-1"),
+                 ("/poll?device_id=bad%20id&targeted_only=true", None)]
+        for path, header in cases:
+            with self.subTest(path=path, header=header):
+                self.assertEqual(self.get(path, header)[0], 400)
+                self.assertEqual(relay.get_result(task["id"])["status"], "pending")
 
     def test_array_payloads_are_rejected_without_handler_crash(self):
         for path in ("/task", "/renew", "/result"):

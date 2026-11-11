@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Compile plugin modules
-        run: python -m py_compile main.py model_planning.py device_app.py task_runner.py care_scheduler.py storage.py health_connect.py location_bridge.py http_transport.py companion-context/main.py companion-context/v2_adapter.py deploy/relay/relay_server.py
+        run: python -m py_compile main.py model_planning.py device_app.py device_fleet.py ui_task.py task_runner.py care_scheduler.py storage.py health_connect.py location_bridge.py http_transport.py companion-context/main.py companion-context/v2_adapter.py deploy/relay/relay_server.py
       - name: Validate configuration JSON
         run: python -m json.tool _conf_schema.json >/dev/null && python -m json.tool companion-context/_conf_schema.json >/dev/null
       - name: Install test dependencies

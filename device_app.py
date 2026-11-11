@@ -77,6 +77,8 @@ COMMAND_ACTIONS = frozenset({
     "scroll",
     "input_text",
     "key_event",
+    "ui_snapshot",
+    "ui_action",
 })
 
 # Actions that change device state or expose screen content. The app prompts for
@@ -95,6 +97,8 @@ DANGEROUS_ACTIONS = frozenset({
     "key_event",
     "screen_text",
     "screenshot",
+    "ui_snapshot",
+    "ui_action",
 })
 
 # Screenshots ride inside the result envelope as base64, so both ends need an
@@ -115,7 +119,7 @@ _REGISTER_TIMEOUT_SECONDS = 8
 # per-attempt window than the fast-path cap; everything else answers in
 # milliseconds and keeps the short cap so a dead route cannot eat the budget.
 SLOW_ACTIONS = frozenset({
-    "status", "quick_status", "screen_text", "screenshot", "usage_stats", "location",
+    "status", "quick_status", "screen_text", "screenshot", "usage_stats", "location", "ui_snapshot", "ui_action",
 })
 SLOW_ACTION_ATTEMPT_SECONDS = 35.0
 
@@ -285,7 +289,7 @@ class DeviceAppBackend:
 
     # ---------- registration ----------
 
-    def register(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def register(self, payload: dict[str, Any], *, before_commit=None) -> dict[str, Any]:
         device_id = _text(payload.get("device_id"), 64)
         base_url = _text(payload.get("base_url"), 500).rstrip("/")
         base_urls = payload.get("base_urls") if isinstance(payload.get("base_urls"), list) else []
@@ -322,6 +326,8 @@ class DeviceAppBackend:
         ):
             return {"success": False, "error": "token fingerprint mismatch; update app_shared_token on one side"}
         with self._lock:
+            if before_commit is not None:
+                before_commit()
             previous = self._registration
             rebind = (previous is None or previous.get("device_id") != device_id
                       or sorted(previous.get("base_urls") or []) != sorted(base_urls or [base_url]))
@@ -548,7 +554,7 @@ class DeviceAppBackend:
         return self._active_url
 
     def _direct_command(self, envelope: dict[str, Any], timeout: float,
-                        *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
+                        *, expected_binding: tuple[str, int] | None = None, dispatch_allowed=None) -> dict[str, Any]:
         if expected_binding is not None:
             with self._lock:
                 if ((self._registration or {}).get("device_id", ""), self._registration_generation) != expected_binding:
@@ -584,10 +590,16 @@ class DeviceAppBackend:
             # uiautomator dump that took >15 s). The app bounds screen_text to
             # ~29 s worst case, so 35 s covers it; fast actions keep the short
             # cap so a hanging route cannot eat the shared budget.
+            ui_command = envelope["action"] in {"ui_snapshot", "ui_action"}
             attempt_cap = SLOW_ACTION_ATTEMPT_SECONDS if envelope["action"] in SLOW_ACTIONS else 8.0
-            attempt_timeout = min(remaining, max(4.0, min(attempt_cap, remaining / routes_left)))
+            # UI input may need two fresh dumps plus an IME switch. Give the
+            # reachable route the caller's budget; once posted, an uncertain
+            # write must never be retried through another route.
+            attempt_timeout = remaining if ui_command else min(remaining, max(4.0, min(attempt_cap, remaining / routes_left)))
             if expected_binding is not None and self.binding() != expected_binding:
                 return self._device_changed(envelope)
+            if dispatch_allowed is not None and dispatch_allowed() is not True:
+                return {"success": False, "error_code": "cancelled", "command_id": envelope["command_id"], "action": envelope["action"]}
             result = self._http_json(base_url + "/command", self.shared_token(), method="POST", payload=envelope, timeout=attempt_timeout)
             if expected_binding is not None and self.binding() != expected_binding:
                 return self._device_changed(envelope)
@@ -598,6 +610,9 @@ class DeviceAppBackend:
                 return self._normalize_result(result, envelope)
             if result.get("error_code") in {"denied", "bad_args", "unsupported_action", "unauthorized"}:
                 return {**result, "command_id": envelope["command_id"], "action": envelope["action"]}
+            if ui_command:
+                return {**result, "success": False, "command_id": envelope["command_id"],
+                        "action": envelope["action"], "outcome": "unknown"}
             last = result
         return last
 
@@ -608,7 +623,7 @@ class DeviceAppBackend:
                 or result.get("action") != envelope["action"]
                 or not isinstance(result.get("success"), bool)):
             return {"success": False, "error_code": "invalid_result", "error": "phone result does not match the command",
-                    "command_id": envelope["command_id"], "action": envelope["action"]}
+                    "command_id": envelope["command_id"], "action": envelope["action"], "outcome": "unknown"}
         result = dict(result)
         output = result.get("output")
         if isinstance(output, str):
@@ -622,11 +637,18 @@ class DeviceAppBackend:
         return result
 
     def _relay_submit(self, envelope: dict[str, Any], timeout: float,
-                      *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
+                      *, expected_binding: tuple[str, int] | None = None, dispatch_allowed=None) -> dict[str, Any]:
         if not self.relay_enabled():
             return {"success": False, "error_code": "relay_unconfigured", "error": "relay is not configured"}
         deadline = time.monotonic() + timeout
         payload = {"message": json.dumps(envelope, ensure_ascii=False)}
+        # Also target ordinary commands that originated from a known registered
+        # device, even when the legacy caller did not provide a binding tuple.
+        if expected_binding is None and envelope.get("target_device_id"):
+            current = self.binding()
+            if current[0] != envelope["target_device_id"]:
+                return self._device_changed(envelope)
+            expected_binding = current
         if expected_binding is not None:
             health = self._http_json(self.relay_url() + "/health", self.relay_token(), timeout=min(5, timeout))
             if health.get("targeted_tasks") is not True:
@@ -635,6 +657,8 @@ class DeviceAppBackend:
             if self.binding() != expected_binding:
                 return self._device_changed(envelope)
             payload["target_device_id"] = expected_binding[0]
+        if dispatch_allowed is not None and dispatch_allowed() is not True:
+            return {"success": False, "error_code": "cancelled", "command_id": envelope["command_id"], "action": envelope["action"]}
         push = self._http_json(
             self.relay_url() + "/task",
             self.relay_token(),
@@ -701,12 +725,16 @@ class DeviceAppBackend:
         }
 
     def execute(self, action: str, args: dict[str, Any] | None = None,
-                timeout: float | None = None, *, expected_binding: tuple[str, int] | None = None) -> dict[str, Any]:
+                timeout: float | None = None, *, expected_binding: tuple[str, int] | None = None,
+                dispatch_allowed=None) -> dict[str, Any]:
         """Run one command: direct first, relay as fallback."""
         try:
             envelope = self.build_envelope(action, args)
         except ValueError as exc:
             return {"success": False, "action": action, "error_code": "unsupported_action", "error": str(exc)[:200]}
+        target_device = expected_binding[0] if expected_binding else self.binding()[0]
+        if target_device:
+            envelope["target_device_id"] = target_device
         # Callers that cannot wait (task verification) pass a tighter budget.
         try:
             timeout = self.command_timeout() if timeout is None else float(timeout)
@@ -720,8 +748,11 @@ class DeviceAppBackend:
         # transport budget has elapsed. Wire deadlines use whole seconds.
         envelope["deadline"] = max(1, math.ceil(timeout))
         deadline = time.monotonic() + timeout
-        direct = (self._direct_command(envelope, timeout, expected_binding=expected_binding)
-                  if expected_binding is not None else self._direct_command(envelope, timeout))
+        if dispatch_allowed is not None and dispatch_allowed() is not True:
+            return {"success": False, "error_code": "cancelled", "command_id": envelope["command_id"], "action": action}
+        options = {"dispatch_allowed": dispatch_allowed} if dispatch_allowed is not None else {}
+        direct = (self._direct_command(envelope, timeout, expected_binding=expected_binding, **options)
+                  if expected_binding is not None else self._direct_command(envelope, timeout, **options))
         if direct.get("command_id") or direct.get("success") or not self.relay_enabled():
             self._audit("device_command", action=action, command_id=envelope["command_id"], backend="direct", success=bool(direct.get("success")), error=_text(direct.get("error"), 160))
             direct["backend"] = "direct"
@@ -732,8 +763,8 @@ class DeviceAppBackend:
         if remaining <= 0:
             return {"success": False, "action": action, "command_id": envelope["command_id"], "backend": "direct",
                     "error_code": "timeout", "error": "command transport budget exhausted"}
-        relay_result = (self._relay_submit(envelope, remaining, expected_binding=expected_binding)
-                        if expected_binding is not None else self._relay_submit(envelope, remaining))
+        relay_result = (self._relay_submit(envelope, remaining, expected_binding=expected_binding, **options)
+                        if expected_binding is not None else self._relay_submit(envelope, remaining, **options))
         relay_result.setdefault("action", action)
         relay_result["backend"] = "relay"
         self._audit("device_command", action=action, command_id=envelope["command_id"], backend="relay", success=bool(relay_result.get("success")))

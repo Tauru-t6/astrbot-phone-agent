@@ -1,8 +1,12 @@
-# AstrBot Phone Agent
+# Phone Control · AstrBot Phone Control Plugin
 
-[中文](README.md) · [Android App](https://github.com/Tauru-t6/astrbot-phone-agent-app) · [App API v2](docs/APP_API_V2.md)
+[中文](README.md) · [Android App](https://github.com/Tauru-t6/astrbot-phone-agent-app) · [UI tasks and two devices](docs/UI_TASKS.md) · [App API v2](docs/APP_API_V2.md)
 
-Control an Android phone from AstrBot through either **AstrBot Phone Agent App** or **OperitAI**. AstrBot interprets requests and delegates them to the selected backend. App mode executes a closed set of structured commands through Shizuku; Operit mode owns screenshot/OCR, UI interaction, text input, and Shizuku-backed natural-language operations.
+Control an Android phone from AstrBot through **Phone Control / Phone Control Bot** or **OperitAI**. App mode executes structured commands through Shizuku and can optionally use a server model for bounded UI tasks. Operit mode uses its phone-side model and tools.
+
+**0.10.0, paired with App 0.4.0.** UI tasks follow observe → choose a current node → act → observe again. Review the exact device, single app, permitted input text, completion conditions and step limit before each task. The App includes a Bilibili search template and custom tasks for browsing, non-sensitive settings and drafting. Login, payments, sending/publishing, deletion and permission grants require manual handoff. This is not a promise of universal app automation.
+
+Install **Phone Control** on your personal phone and the separate **Phone Control Bot** on the Bot's phone. The Bot APK has its own package/storage and excludes the Health Connect SDK, health permissions, readers and sync implementation. Roles route tasks to their chosen device; an offline Bot phone never falls back to the personal phone. Roles do not create separate account security boundaries. See the [setup and limitations](docs/UI_TASKS.md).
 
 Version 0.9.1 fixes task device binding, durable grant budgets, strict verification
 and cancellation recovery. Reissue legacy grants and update the relay when using
@@ -14,9 +18,9 @@ The default control backend is Operit. Set `control_backend=app` for the standal
 | | App mode | OperitAI mode |
 | --- | --- | --- |
 | Phone endpoint | AstrBot Phone Agent App, normally port `8260` | Operit External HTTP, normally port `8094` |
-| Execution | Structured Android/Shizuku commands | Model-driven screen reasoning and tool calls |
-| Supports | Status, app launch/close, navigation, lock/wake, usage, location, notifications, policies, reminders and timeline | Screen-aware tasks, taps, swipes, text input and workflows |
-| Does not support | Arbitrary tap/swipe/text-input workflows | — |
+| Execution | Structured commands and optional server-model decisions grounded in current UI nodes | Phone-model screen reasoning and tool calls |
+| Supports | Status, app control, approved UI tasks, usage, location, notifications, policies, personal reminders/health and a separate Bot device | Screen-aware tasks, taps, swipes, text input and workflows |
+| UI task boundary | One approved app and device, exact allowed texts, at most 8 actions by default (configurable to 12), manual sensitive steps | Operit configuration and approval policy |
 | Phone model | Not required | A working model with tool calling is required |
 
 Legacy backend aliases `phone_buddy`, `native_app`, and `own_frontend` map to `app`; `operitai` and `operit_ai` map to `operit`. `adb` remains diagnostic-only.
@@ -138,7 +142,9 @@ Install the App release, let its foreground connection service run, then open **
 }
 ```
 
-The public App contains no preset service URL, token, display name, or avatar. It supports status, structured actions, reminders, timeline, local name/avatar, and system permission entries. Its closed command set includes taps, long presses, swipes, scrolling, text input and key events with explicit parameters and on-device confirmation. This does not provide an automatic visual loop for arbitrary natural-language UI tasks. `phone_observe` in App mode is a structured device-status read; screenshots are a separate explicit action.
+The public App contains no preset service URL or credentials. Its closed command set includes taps, long presses, swipes, scrolling, text input and key events with explicit parameters and on-device confirmation. Plugin 0.10.0 and App 0.4.0 add approved single-app UI tasks through `phone_ui_task`; `phone_task_status` reports progress. `phone_observe` remains a structured device-status read, and screenshots remain a separate action.
+
+For UI tasks, enable `enable_ui_tasks`, `enable_task_execute` and `enable_observe_tool`, configure `ui_task_allowed_packages`, and optionally select `ui_task_provider_id`. The model receives visible page-node text. On the execution device, manually enable the Phone Control input method; it is temporarily selected for text input, then restoration of the previous input method is attempted. Continuous execution also requires explicit opt-in to the **Read UI nodes** and **Operate UI** no-confirmation switches. Both default off. This trusts the connected server for those command types; server-side full task approval remains separate. See [UI tasks](docs/UI_TASKS.md).
 
 | App field | What to enter |
 | --- | --- |
@@ -644,7 +650,7 @@ The audit log avoids message bodies and tokens, but reminder, timeline and backg
 ## 15. Additional troubleshooting
 
 - **App state works but phone commands fail:** the App-to-server route and server-to-phone route differ. Check LAN/Tailscale routing, `app_direct_urls`, `:8260`, the shared token and Shizuku separately.
-- **App reports an unsupported UI action:** use Operit mode for arbitrary taps/swipes/text input. Do not route around the error through an arbitrary shell tool.
+- **App reports an unsupported UI action:** check the action name and installed versions; `ui_snapshot` and `ui_action` require App 0.4.0+. Use `phone_ui_task` for the approved UI loop, not a free-text command body. Do not route around a rejection through an arbitrary shell tool.
 - **Reminder is late:** check which source created it (App or chat), notification permissions, phone background limits and relay/sync cadence.
 - **Health is unavailable or stale:** check the selected `source` first. For Health Connect, inspect Xiaomi Fitness writes, App permissions, the sync switch and the last upload result. For SQLite, verify the external synchronizer and database path. Check record dates in either case; `auto` falling back to SQLite does not confirm a successful phone upload.
 - **Private Companion has no context:** check separate bridge installation, both enable switches, its allowlist, user role/private scope, and the Private Companion API version.

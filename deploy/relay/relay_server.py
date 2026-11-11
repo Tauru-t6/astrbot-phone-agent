@@ -19,7 +19,7 @@ import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 STATE_PATH = Path(os.environ.get("RELAY_STATE", Path(__file__).parent / "relay_state.json"))
 TOKEN = os.environ.get("RELAY_TOKEN", "").strip()
@@ -167,12 +167,16 @@ def push_task(payload: dict) -> dict:
         return dict(task)
 
 
-def poll_task(device_id: str | None = None) -> dict | None:
+def poll_task(device_id: str | None = None, *, targeted_only: bool = False) -> dict | None:
+    if targeted_only and not device_id:
+        raise ValueError("device_id required for targeted polling")
     now = time.time()
     with _lock:
         changed = _gc_locked(now)
         for task in _state["tasks"]:
             if task["status"] != "pending":
+                continue
+            if targeted_only and task.get("target_device_id") != device_id:
                 continue
             if task.get("target_device_id") and task["target_device_id"] != device_id:
                 continue
@@ -303,18 +307,36 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._reply(401, {"success": False, "error": "unauthorized"})
             return
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if self._rate_limited("get"):
             return
         if path == "/health":
-            self._reply(200, {"success": True, "service": "phone-agent-relay", "version": "0.9.1", "require_device_id": REQUIRE_DEVICE_ID,
-                              "targeted_tasks": True})
+            self._reply(200, {"success": True, "service": "phone-agent-relay", "version": "0.10.0", "require_device_id": REQUIRE_DEVICE_ID,
+                              "targeted_tasks": True, "targeted_polling": True})
             return
         if path == "/poll":
-            device_id = self._require_device()
-            if REQUIRE_DEVICE_ID and device_id is None:
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            targeted_values = query.get("targeted_only", ["false"])
+            device_values = query.get("device_id", [])
+            if (len(targeted_values) != 1 or targeted_values[0] not in {"true", "false"}
+                    or len(device_values) > 1):
+                self._reply(400, {"success": False, "error": "invalid poll parameters"})
                 return
-            task = poll_task(device_id)
+            targeted_only = targeted_values[0] == "true"
+            header_device = self._device_id()
+            query_device = device_values[0] if device_values else None
+            if query_device is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", query_device):
+                self._reply(400, {"success": False, "error": "invalid device_id"})
+                return
+            if header_device and query_device and header_device != query_device:
+                self._reply(400, {"success": False, "error": "device_id disagrees with device header"})
+                return
+            device_id = query_device or header_device
+            if (REQUIRE_DEVICE_ID or targeted_only) and not device_id:
+                self._reply(400, {"success": False, "error": "device_id required"})
+                return
+            task = poll_task(device_id, targeted_only=targeted_only)
             self._reply(200, {"success": True, "task": task})
             return
         if path.startswith("/result/"):

@@ -1,6 +1,6 @@
 # Phone Control · AstrBot 手机控制插件
 
-[完整中文教程](README.zh-CN.md) · [English guide](README.en.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
+[完整中文教程](README.zh-CN.md) · [English guide](README.en.md) · [界面任务与双设备](docs/UI_TASKS.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
 
 DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GPT 太贵了
 
@@ -10,13 +10,9 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 ## 5 分钟上手（自有 App 模式）
 
-0.9.4 修复市场审核指出的日志接口用法，并补齐运行中关闭功能后的健康/关怀读取和任务派发检查。使用关怀桥接时同步升级至 0.3.2；App 0.3.28 继续兼容。完整复检范围与修复见 [0.9.4 复检记录](docs/REVIEW_0_9_4.md)。
+**0.10.0，配套 App 0.4.0**：新增有范围、有步数上限的界面任务。服务器模型根据当前页面节点决定下一步，手机执行后重新观察；先支持 B 站搜索模板，也可填写单个 App 的浏览、非敏感设置或草稿任务。每次必须核对设备、应用、允许输入原文和完成条件后批准；登录、付款、发送、删除和权限授予等步骤交人工接手。设置与限制见[界面任务与双设备](docs/UI_TASKS.md)。历史修复见[更新日志](CHANGELOG.md)。
 
-0.9.3 配合 App 0.3.28 新增 Health Connect 来源选择和定位 / 百度地图 MCP 状态检查。原有 xiaomi-sync 可继续使用，配置方法见 [健康接入说明](docs/HEALTH_CONNECT.md)。
-
-0.9.1 修复设备中途换绑、授权累计步数、严格核验和取消后的恢复责任。升级时重新签发旧 grant；使用受限任务的 Relay 兜底时须同步更新 Relay。现有 App 0.3.26 可继续使用，详见 [升级说明](docs/REVIEW_FIXES_0_9_1.md)。
-
-0.9.0 新增可选 LLM 多步规划与 Private Companion 7.x 关怀适配。开启 enable_llm_task_planner 后，模型只生成受限计划，执行仍需审批；关怀会参考同一私聊的近期对话并抑制重复打扰。配置及边界见 docs/PRIVATE_COMPANION_719_ADAPTATION.md。
+个人手机安装 **Phone Control**，Bot 专用第二台手机安装独立的 **Phone Control Bot**。Bot 版有独立包名和存储，不包含 Health Connect SDK、健康权限或读取功能。设备按「我的手机 / Bot 的手机」分别选择，第二台离线不会转而操作第一台；角色划分不是不同账户之间的权限隔离。
 
 1. **装插件**：在 AstrBot 插件市场搜索 `Phone Control` 安装，或按[安装与升级](#安装与升级)用 Git 拉取。
 2. **装 App**：从 [App Releases](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases/latest) 下载最新 APK，安装后把 Shizuku 启动并授权。
@@ -39,9 +35,10 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 | --- | --- | --- |
 | 配置值 | `control_backend=app` | `control_backend=operit`，默认值 |
 | 手机端 | [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) + Shizuku | [OperitAI](https://github.com/Mavaebrook/Operit) + Shizuku |
-| 执行方式 | 固定指令集合、结构化 JSON | 手机端 Agent 解析自然语言并操作 UI |
+| 执行方式 | 结构化命令；可选服务器模型驱动的单应用界面任务 | 手机端 Agent 解析自然语言并操作 UI |
 | 手机端模型 | 执行指令不需要额外模型（聊天在 QQ 侧，App 不承载对话） | 需要可用模型及工具调用 |
-| 结构化界面操作 | `phone_action` 支持点击、长按、滑动、滚动、输入文字和按键 | 通过 `operit_task` 由手机端模型自行决定操作 |
+| 结构化界面操作 | `phone_action` 保留固定动作；`phone_ui_task` 经批准后按页面节点点击、输入、滚动和返回 | 通过 `operit_task` 由手机端模型自行决定操作 |
+| 第二台设备 | 独立 Phone Control Bot App；任务明确绑定设备 | 沿用 Operit 配置 |
 | 网络 | 有序局域网 / Tailscale 直连 → Relay | Operit HTTP 直连 → Relay 工作流 |
 | 前端能力 | 任务记录、提醒、时间线、连接设置、夜间守护与自主关怀诊断；名称与头像由用户设置 | 使用 Operit 自己的界面 |
 
@@ -54,6 +51,7 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 | 自然语言手机任务 | `operit_task` | OperitAI 模式；App 模式明确拒绝自由文本执行 |
 | 后台任务查询、取消、重试 | `operit_task_status` / `operit_task_cancel` / `operit_task_retry` | 保留 Operit 后台任务、并发限制与任务元数据持久化 |
 | 白名单手机操作 | `phone_action` | 两模式支持各自执行端的动作，App 不会误走 ADB |
+| 有范围的界面任务 | `phone_ui_task` / `phone_task_status` | App 0.4.0+；开启 `enable_ui_tasks`、`enable_task_execute`、`enable_observe_tool`，每个任务先审批 |
 | 观察前台与屏幕 | `phone_observe` | `enable_observe_tool`；Operit 可读屏，App 返回设备状态 |
 | 截图回传聊天 | `phone_screenshot` | `enable_screenshot_tool`；仅 App 模式，图片直接发进当前会话 |
 | 手机通知转发 | `phone_notifications` | `enable_notification_tool`；App 端需授予通知读取权限 |
@@ -185,7 +183,9 @@ App 端凭据各有用途：
 
 可选 Relay 另用独立 `relay_token`。App 初始不含任何角色名字、头像、服务器地址或密钥。
 
-**当前能力边界**：底层 App 命令包括电量/状态、打开/关闭应用、返回/主页/按键、锁屏/唤醒、截图、读屏、点击/长按/滑动/滚动、输入文字、应用暂停/恢复、定位、使用统计、通知和 ping。App 模式现在可以完成结构化的界面操作（`phone_action` 的 tap / long_press / swipe / scroll / input_text / key_event），与 OperitAI 模式对齐；差别在于 App 模式由插件按坐标下发指令，Operit 模式由手机端模型自己看图决策多步任务。`phone_observe` 仍只返回 App 设备状态，需要"看懂屏幕再决定点哪里"的通用任务请使用 OperitAI，或先用 `phone_screenshot` 把画面发进会话再决定坐标。
+**当前能力边界**：底层 App 保留状态、应用管理、导航、截图、读屏、固定界面动作、定位、通知等指令。0.10.0 的 `phone_ui_task` 增加单应用的「观察 → 模型选择节点 → 执行 → 再观察」，默认最多 8 步，配置上限为 12 步。模型会收到目标页面的可见节点文字，只能输入已批准原文；它不是任意 App 的通用自动操作保证。`phone_observe` 仍返回设备状态，截图是独立能力。完整准备、搜索验收与人工接手规则见[界面任务说明](docs/UI_TASKS.md)。
+
+连续界面任务需在**执行设备**的「隐私与自动化」明确打开「读取界面节点」和「操作界面」免确认，并在 Android 设置手动启用 Phone Control 输入法。输入时临时切换、结束后尝试恢复原输入法。两项免确认默认关闭；开启代表信任已连接服务器发送该类命令，服务端每次任务的完整范围审批仍保留。
 
 App 内的专注 / 批量应用限制按钮尚未具备完整的目标应用与恢复策略配置；插件侧的 `phone_app_policy`、`phone_sleep_mode` 能力仍保留。
 
@@ -233,6 +233,8 @@ App 内的专注 / 批量应用限制按钮尚未具备完整的目标应用与�
 `phone_action` 保留白名单动作，App 模式只下发其支持的结构化指令；不支持的动作返回错误，不会偷偷改走 ADB。
 
 ### 手机任务与审批（按范围授权）
+
+下述固定动作提案继续保留。新的界面任务通过 App「让手机完成一件事」或聊天工具 `phone_ui_task` 发起，在完整任务详情中批准；不能用只显示一句话的悬浮卡片代替范围核对。它的取消会阻止后续步骤，已经发出的动作可能仍完成，结果未知时先检查手机，不自动重放。见[详细说明](docs/UI_TASKS.md)。
 
 `task_execute_allowed_actions` 打开的那几类动作（默认 `open_app,home,back`）走**提案制**：模型不会直接执行，而是生成一条待批准任务，手机在你点头之前不会发生任何变化。
 

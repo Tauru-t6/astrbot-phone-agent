@@ -1,13 +1,21 @@
-# AstrBot 手机控制插件
+# Phone Control · AstrBot 手机控制插件
 
 让 AstrBot 连接 Android 手机的插件，提供两个主控制模式：
 
-- `app`：AstrBot Phone Agent App + Shizuku，执行固定的结构化命令、设备状态、提醒和时间线。
+- `app`：Phone Control / Phone Control Bot + Shizuku，执行结构化命令；可选启用服务器模型驱动、每步重新观察的单应用界面任务。
 - `operit`：OperitAI External HTTP，执行自然语言手机任务、截图/OCR、点击、滑动、输入和工作流。
 
 Android 前端：[AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app)。旧配置别名 `phone_buddy`、`native_app`、`own_frontend` 映射到 `app`，`operitai`、`operit_ai` 映射到 `operit`。默认 `control_backend` 仍为 `operit`。
 
-[项目主页](README.md) · [English Guide](README.en.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
+[项目主页](README.md) · [English Guide](README.en.md) · [界面任务与双设备](docs/UI_TASKS.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
+
+## 0.10.0 界面任务与第二台手机
+
+配套 App 0.4.0 增加独立 **Phone Control Bot**：个人版保留健康同步，Bot 版仅承担设备控制，不包含 Health Connect SDK、健康权限、健康读取和同步实现。两者包名、存储和安装身份独立。服务端按设备分别保存注册、状态和任务路由，保留原个人主设备；Bot 手机离线不会回退到个人手机。这是同一部署内的设备分工，不是不同账户之间的安全隔离。
+
+`phone_ui_task` / App「让手机完成一件事」先提出范围，再由你核对设备、单个应用、允许输入原文、完成条件与步数后批准。B 站搜索提供模板；浏览、非敏感设置和草稿使用自定义任务，敏感步骤人工接手，草稿不自动发送。默认最多 8 步、配置最多 12 步，不承诺所有 App 都可操作。
+
+需同时开启 `enable_ui_tasks`、`enable_task_execute`、`enable_observe_tool`，并设置应用白名单；执行设备要手动启用任务输入法，连续操作还需明确打开两项 UI 免确认。模型会收到当前页面节点文字。配置、完成判定、取消与排障详见[界面任务与双设备](docs/UI_TASKS.md)。
 
 ## 0.9.1 审查修复
 
@@ -103,7 +111,7 @@ App 模式使用 [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-p
 
 允许 App、Tailscale 在后台运行，并按使用功能授予通知、定位和使用情况访问等权限。Shizuku 可用并不等于系统已经给了定位或通知权限；状态页显示哪些能力不可用时，先按 App 提示补齐对应权限。
 
-App 只接受固定命令和结构化参数：状态、打开/关闭应用、前台应用、返回/主页、锁屏/唤醒、截图、读屏、使用统计、应用暂停/恢复、定位、通知和 ping。App 不解释自然语言，不执行任意 shell，也不提供通用点击、滑动、输入或工作流执行器；这些能力请使用 Operit 模式。App 的危险命令仍由手机端二次确认。
+App 只接受受支持的命令和结构化参数，包括状态、应用管理、导航、截图、读屏、点击、长按、滑动、输入、定位和通知等。App 0.4.0 与插件 0.10.0 另提供按页面节点执行的单应用界面任务，由服务器模型规划下一步，App 本身不解释自由文本、不执行任意 shell。敏感命令仍受手机本地确认控制；两项 UI 免确认必须由执行设备用户明确开启，服务端任务审批不会替代这项设置。
 
 App 通过 `POST /device/register` 注册地址。旧版本只发送一个 `base_url` 也兼容；服务器上的 `app_direct_urls` 不会被旧的 Tailscale 注册覆盖。`GET /app/state` 不探测手机，手机离线时也能返回提醒、最近命令和最近 100 条时间线。
 
@@ -815,7 +823,7 @@ QQ 聊天通道、插件管理端和手机命令服务分别连接。先检查 D
 
 ### App 提示 `invalid_result`、`denied` 或 `unsupported_action`
 
-`invalid_result` 表示返回结果的类型、命令 ID、动作或协议版本不匹配，检查 App 与插件版本。`denied` 先检查手机确认和系统权限；它不是需要换 Relay 重做的网络故障。`unsupported_action` 检查是否把通用点击、输入或自然语言任务发给了 App 模式；这类任务需要 Operit。
+`invalid_result` 表示返回结果的类型、命令 ID、动作或协议版本不匹配，检查 App 与插件版本。`denied` 先检查手机确认和系统权限；它不是需要换 Relay 重做的网络故障。`unsupported_action` 先核对动作名称和版本；新的 `ui_snapshot` / `ui_action` 需要 App 0.4.0+，不能把自由文本直接当作 App 命令。界面任务暂停原因与准备步骤见[界面任务说明](docs/UI_TASKS.md)。
 
 ### App 状态正常，但手机离线
 

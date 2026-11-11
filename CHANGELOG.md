@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.10.0] - 2026-11-11
+
+- Add optional, human-approved UI tasks for App 0.4.0+: observe current nodes,
+  select one action, execute and observe again. Bind each proposal to one device,
+  one app, exact permitted text, visible completion conditions and a bounded
+  action budget (default 8, configurable up to 12).
+- Add `phone_ui_task`, `phone_task_status`, App task proposals and a Bilibili
+  search template. A search requires actual result-page evidence; an opened app,
+  accepted command or populated search box alone never proves completion.
+- Support custom browsing, non-sensitive settings and drafting attempts. Hand
+  login, payment, sending/publishing, deletion, permission and ambiguous controls
+  back to the user. Cancel stops further steps; already dispatched actions can
+  have an unknown result and are not automatically replayed.
+- Add per-device registration, status and task routing with personal/Bot roles.
+  Pin the original personal phone and never reroute a Bot task to it on failure.
+  Roles share the deployment's authentication and are not tenant isolation.
+- Pair with independent Phone Control and Phone Control Bot APKs in App 0.4.0.
+  Bot excludes Health Connect dependencies, permissions and implementations.
+  Preserve personal health/source selection and existing control integrations.
+- Add explicit local opt-in for continuous UI reading/operation and a manually
+  enabled input method for approved Unicode text. Guard node identity, snapshot
+  expiry, foreground changes, obscured targets and input-editor changes.
+- Document setup, model visibility, approval, device roles and practical limits
+  in [UI tasks and two devices](docs/UI_TASKS.md). Release validation and package
+  publication are tracked separately; this heading does not claim publication.
+
 ## [0.9.4] - 2026-11-11
 
 - Use `astrbot.api.logger` in the task runner, fixing the v0.9.3 marketplace
