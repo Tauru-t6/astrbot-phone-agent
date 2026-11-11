@@ -2,6 +2,8 @@
 
 ## [0.10.0] - 2026-11-11
 
+- Real-device acceptance fixes: match unchanged controls across unrelated feed refreshes; support editor hints during input; avoid requiring a missing Bilibili video tab; verify search results locally with a fresh confirmation read. Compact the model context and report model timeouts as a manual handoff.
+
 - Add optional, human-approved UI tasks for App 0.4.0+: observe current nodes,
   select one action, execute and observe again. Bind each proposal to one device,
   one app, exact permitted text, visible completion conditions and a bounded

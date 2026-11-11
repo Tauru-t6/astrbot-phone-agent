@@ -31,7 +31,7 @@ from .model_planning import plan_goal, simple_fallback_goal
 from .health_connect import HealthConnectStore
 from .location_bridge import normalize_location, map_capabilities, map_handoff
 from .device_fleet import DeviceFleet
-from .ui_task import UiTaskError, UiTaskRunner
+from .ui_task import UiTaskError, UiTaskRunner, compact_model_context
 
 try:
     from .storage import read_jsonl_tail, write_json_atomic
@@ -1295,8 +1295,11 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 "只有新页面显示全部完成条件且非输入框内容时才能{\"action\":\"done\",\"evidence_node_id\":\"n4\"}。"
                 "打开应用、按键返回success或输入框含关键词都不代表目标已完成。搜索任务必须实际进入结果页，不点搜索历史/联想词冒充结果。"
             )
-            response = await asyncio.wait_for(provider.text_chat(
-                prompt=json.dumps(material, ensure_ascii=False), system_prompt=system), timeout=20)
+            try:
+                response = await asyncio.wait_for(provider.text_chat(
+                    prompt=json.dumps(compact_model_context(material), ensure_ascii=False, separators=(",", ":")), system_prompt=system), timeout=25)
+            except asyncio.TimeoutError:
+                raise UiTaskError("ui_model_timeout") from None
             return getattr(response, "completion_text", "")
 
         grant = ScopedGrant.issue(subject=approval.subject, device_id=approval.device_id,

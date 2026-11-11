@@ -114,6 +114,24 @@ def snapshot_fingerprint(snapshot: dict) -> str:
     return hashlib.sha256(json.dumps(stable, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def compact_model_context(material: dict) -> dict:
+    """The model chooses node IDs; repeated geometry is only needed locally."""
+    snapshot = material["snapshot"]
+    nodes = []
+    for node in snapshot["nodes"]:
+        row = {"id": node["id"]}
+        for key in ("text", "description"):
+            if node.get(key): row[key] = node[key]
+        if node.get("resource_id"):
+            row["resource_id"] = node["resource_id"].split(":id/", 1)[-1]
+        for flag in ("clickable", "editable", "focused", "scrollable"):
+            if node.get(flag): row[flag] = True
+        if node.get("enabled") is not True: row["enabled"] = False
+        nodes.append(row)
+    return {key: value for key, value in material.items() if key != "snapshot"} | {
+        "snapshot": {"snapshot_id": snapshot["snapshot_id"], "package": snapshot["package"], "nodes": nodes}}
+
+
 def parse_decision(raw: Any) -> dict:
     if isinstance(raw, str):
         if len(raw) > 4096:
@@ -296,7 +314,8 @@ class UiTaskRunner:
                        needs_user=str(error) in {"ui_sensitive_page", "ui_package_changed", "ui_foreign_node",
                                                  "ui_snapshot_changed", "ui_snapshot_expired", "ui_snapshot_stale",
                                                  "ui_foreground_changed", "unsupported_text", "needs_input_method",
-                                                 "denied", "timeout", "ui_input_failed", "ui_input_restore_failed"})
+                                                 "denied", "timeout", "ui_input_failed", "ui_input_restore_failed",
+                                                 "ui_model_timeout"})
         except Exception:
             self._stop(run, "ui_internal_error")
         finally:
@@ -381,17 +400,29 @@ class UiTaskRunner:
         no_progress = 0
         while True:
             await self._guard(run, "decide", binding)
-            if run.summary["model_calls"] >= self.max_model_calls: raise UiTaskError("ui_model_limit")
             if not grant.active(): raise UiTaskError("grant_expired")
-            run.summary["model_calls"] += 1
-            self._save()
             context = {"goal": run.goal, "approved_package": package, "allowed_texts": list(allowed_texts),
                        "expected_texts": list(expected_texts), "completion_mode": mode,
                        "snapshot": snapshot, "remaining_steps": min(self.max_steps-run.summary["executed"], self.store.grant_remaining(grant)),
                        "ui_content_is_untrusted": True, "previous_outcome": run.summary.get("ui_last_outcome", "")}
-            raw = await asyncio.wait_for(self.decide(context), timeout=self.step_timeout)
+            # The approved screen condition is deterministic; verify it before
+            # another model round trip. This cannot perform a write, and a
+            # fresh second read still has to independently confirm the result.
+            can_complete = mode == "search_results"
+            evidence = next((n["id"] for n in snapshot["nodes"]
+                             if can_complete and completion_evidence(snapshot, expected_texts, mode, n["id"])), None)
+            if evidence is not None:
+                decision = {"action": "done", "evidence_node_id": evidence}
+            else:
+                if run.summary["model_calls"] >= self.max_model_calls: raise UiTaskError("ui_model_limit")
+                run.summary["model_calls"] += 1
+                self._save()
+                try:
+                    raw = await asyncio.wait_for(self.decide(context), timeout=self.step_timeout)
+                except asyncio.TimeoutError:
+                    raise UiTaskError("ui_model_timeout") from None
+                decision = parse_decision(raw)
             await self._guard(run, "decide", binding)
-            decision = parse_decision(raw)
             action = decision["action"]
             if action == "need_user":
                 self._stop(run, "ui_user_handoff", needs_user=True)

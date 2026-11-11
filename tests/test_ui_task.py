@@ -41,6 +41,19 @@ def results():
 
 
 class ContractTests(unittest.TestCase):
+    def test_model_context_keeps_current_ids_and_labels_without_geometry_or_repeated_packages(self):
+        screen=ui.normalize_snapshot(snapshot([node(editable=True,focused=True)]),APP)
+        material={"snapshot":screen,"goal":"search demo","allowed_texts":["demo"],"ui_content_is_untrusted":True}
+        compact=ui.compact_model_context(material)
+        row=compact["snapshot"]["nodes"][0]
+        self.assertEqual(row["id"],"n1")
+        self.assertEqual(row["text"],"搜索")
+        self.assertTrue(row["focused"])
+        self.assertNotIn("bounds",row)
+        self.assertNotIn("package",row)
+        self.assertEqual(compact["allowed_texts"],["demo"])
+        self.assertTrue(compact["ui_content_is_untrusted"])
+
     def test_password_values_are_removed_before_model_input(self):
         value = ui.normalize_snapshot(snapshot([node(text="private secret", password=True, description="private alt")]), APP)
         self.assertEqual(value["nodes"][0]["text"], "")
@@ -151,7 +164,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         result = await self.execute()
         self.assertEqual(result.status, "done")
         self.assertTrue(result.summary["completion_verified"])
-        self.assertEqual((self.reads, self.calls, len(self.writes)), (3, 2, 1))
+        self.assertEqual((self.reads, self.calls, len(self.writes)), (3, 1, 1))
         self.assertEqual(self.writes[0][0], "ui_action")
         self.assertEqual(self.writes[0][1]["snapshot_id"], "s-1")
         self.assertEqual(self.store.grant_remaining(self.grant),11)
@@ -168,6 +181,23 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.writes,[("open_app",{"package":APP})])
         self.assertEqual(self.store.grant_remaining(self.grant),11)
         self.assertEqual(result.steps[0].verify["reason"],"foreground_matches")
+
+    async def test_search_result_completion_needs_no_extra_model_call(self):
+        self.screens=[results(),results()]
+        async def unavailable(context): raise AssertionError("completion must be local")
+        result=await self.execute(self.runner(decide=unavailable))
+        self.assertEqual(result.status,"done")
+        self.assertTrue(result.summary["completion_verified"])
+        self.assertEqual(result.summary["model_calls"],0)
+        self.assertEqual(self.reads,2)
+
+    async def test_model_timeout_pauses_without_dispatching_an_action(self):
+        async def slow(context): await asyncio.sleep(1)
+        result=await self.execute(self.runner(decide=slow,step_timeout=0.05))
+        self.assertEqual(result.status,"waiting_approval")
+        self.assertEqual(result.last_error,"ui_model_timeout")
+        self.assertTrue(result.summary["needs_user"])
+        self.assertFalse(self.writes)
 
     async def test_done_cannot_be_proved_by_input_field_or_a_model_assertion(self):
         self.screens = [[node("query","demo",editable=True,focused=True),node("tab1","综合"),node("tab2","视频")]]
@@ -272,6 +302,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.writes)
 
     async def test_model_call_budget_is_bounded_separately_from_write_budget(self):
+        self.screens=[[node()],[node(text="下一页")]]
         result = await self.execute(self.runner(max_model_calls=1))
         self.assertEqual(result.last_error,"ui_model_limit")
         self.assertEqual(self.calls,1)

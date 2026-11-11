@@ -83,7 +83,7 @@ Phone Control Bot 只使用按 `device_id` 定向的轮询，不参加没有设�
 
 ## 每次任务如何批准
 
-从 App「让手机完成一件事」或聊天工具 `phone_ui_task` 提出任务。生成提案本身不会操作手机。
+从 Bot App 首页「让手机完成一件事」、个人版设置中的自主功能或聊天工具 `phone_ui_task` 提出任务。生成提案本身不会操作手机。
 
 在完整任务详情中核对：
 
@@ -167,3 +167,5 @@ Enable `enable_ui_tasks`, `enable_task_execute` and `enable_observe_tool`; set a
 Default action budget is 8, configurable to at most 12, including app launch. Bilibili search needs actual result-page evidence. Drafts are never sent automatically; editable text alone does not prove overall completion. Sensitive settings, login, payment, deletion and publishing hand off to the user. Cancellation stops later steps, but an already dispatched action can have an unknown result. Check the phone before creating a new attempt.
 
 填写了允许输入文字的自定义任务，必须至少完成一次输入并在新观察中核对原文，才允许结合页面条件判定完成；原先就存在的“聊天”等标题不能跳过这一步。允许文字列表表示可用原文范围，不代表全部文字都必须输入。
+
+个人版首页保留个人状态和健康摘要，不显示新增的大块任务入口；Bot 专用版首页显示发起任务与审批进度。B 站版本之间的结果标签可能不同，模板只要求关键词和“综合”，同时仍检查结果页上下文与非输入框中的匹配结果，并以第二次读屏确认。
