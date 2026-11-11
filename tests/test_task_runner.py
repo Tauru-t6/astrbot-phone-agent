@@ -6,13 +6,18 @@ import tempfile
 import time
 import unittest
 import asyncio
+import types
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).parents[1]
 spec = importlib.util.spec_from_file_location("task_runner_under_test", ROOT / "task_runner.py")
 module = importlib.util.module_from_spec(spec)
 sys.modules["task_runner_under_test"] = module
-spec.loader.exec_module(module)
+host_api = types.ModuleType("astrbot.api")
+host_api.logger = Mock()
+with patch.dict(sys.modules, {"astrbot": types.ModuleType("astrbot"), "astrbot.api": host_api}):
+    spec.loader.exec_module(module)
 
 VIDEO = "tv.danmaku.bili"
 USER = "u-10001"

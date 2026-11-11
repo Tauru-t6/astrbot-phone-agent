@@ -158,6 +158,7 @@ class AutonomyDecisionTests(unittest.IsolatedAsyncioTestCase):
             registration_generation=lambda: state["generation"],
         )
         phone = types.SimpleNamespace(
+            _enabled=lambda: True,
             _tool_enabled=lambda name: True,
             _control_backend=lambda: "app",
             device_app=device_app,
@@ -197,6 +198,7 @@ class AutonomyDecisionTests(unittest.IsolatedAsyncioTestCase):
         """R06: screen snapshot from App heartbeat cache, not Operit."""
         import time as _time
         phone = types.SimpleNamespace(
+            _enabled=lambda: True,
             _tool_enabled=lambda name: True,
             _control_backend=lambda: "app",
             device_app=types.SimpleNamespace(
@@ -220,6 +222,7 @@ class AutonomyDecisionTests(unittest.IsolatedAsyncioTestCase):
     def test_r06_app_mode_screen_off_returns_idle(self):
         import time as _time
         phone = types.SimpleNamespace(
+            _enabled=lambda: True,
             _tool_enabled=lambda name: True,
             _control_backend=lambda: "app",
             device_app=types.SimpleNamespace(
@@ -272,6 +275,7 @@ class AutonomyDecisionTests(unittest.IsolatedAsyncioTestCase):
         """R04-v3: missing or old reported_at returns empty, not fabricated activity."""
         import time as _time
         phone = types.SimpleNamespace(
+            _enabled=lambda: True,
             _tool_enabled=lambda name: True,
             _control_backend=lambda: "app",
             device_app=types.SimpleNamespace(
@@ -292,6 +296,7 @@ class AutonomyDecisionTests(unittest.IsolatedAsyncioTestCase):
     def test_r04_old_reported_at_returns_empty(self):
         import time as _time
         phone = types.SimpleNamespace(
+            _enabled=lambda: True,
             _tool_enabled=lambda name: True,
             _control_backend=lambda: "app",
             device_app=types.SimpleNamespace(

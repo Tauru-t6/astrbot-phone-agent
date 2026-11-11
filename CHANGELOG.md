@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.4] - 2026-11-11
+
+- Use `astrbot.api.logger` in the task runner, fixing the v0.9.3 marketplace
+  rejection. Add runtime-module logger checks and isolated host logger tests.
+- Respect runtime health/observation opt-out in the dashboard and companion
+  bridge, including cached and in-flight reads. Bundle companion bridge 0.3.2.
+- Recheck enabled state and current action policy before each task write;
+  bound rollback may still restore an app. Quote legacy ADB workflow extras.
+- Fence uploads accepted before snapshot deletion so delayed worker commits
+  cannot restore cleared data. Enforce the 64 KiB request-body limit for
+  chunked uploads and reject oversized integers/deep JSON as client errors.
+- Remove goal, warning-message and raw model text from new audit entries.
+  Normalize confirmation values before sensitive workflow/task dispatch.
+- Correct outdated README descriptions and document the review scope and limits.
+
 ## [0.9.3] - 2026-11-10
 
 - Allow one validated Health Connect origin package per snapshot so the App can

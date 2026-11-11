@@ -31,7 +31,9 @@ ORIGIN_PACKAGE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*
 
 
 def finite(value: Any) -> bool:
-    return type(value) in {int, float} and math.isfinite(value)
+    # JSON integers are finite even when converting them to float would
+    # overflow; callers subsequently enforce the field's numeric range.
+    return type(value) is int or (type(value) is float and math.isfinite(value))
 
 
 def normalize(payload: Any, *, now: float | None = None) -> dict:
@@ -97,6 +99,12 @@ class HealthConnectStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.lock = threading.RLock()
+        self._generation = 0
+
+    def generation(self) -> int:
+        """Fence uploads already received before a successful deletion."""
+        with self.lock:
+            return self._generation
 
     def _load(self) -> dict:
         try:
@@ -111,14 +119,17 @@ class HealthConnectStore:
             value = normalize({**raw, "days": [{"date": row["date"], "metrics": {k: v for k, v in row.items() if k != "date"}} for row in raw.get("days", [])]}, now=captured)
             value["received_at"] = raw.get("received_at")
             return value
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             return {}
 
     def accept(self, payload: dict, *, now: float | None = None,
-               binding_valid: Callable[[], bool] | None = None) -> dict:
+               binding_valid: Callable[[], bool] | None = None,
+               expected_generation: int | None = None) -> dict:
         now = time.time() if now is None else now
         value = normalize(payload, now=now)
         with self.lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise ValueError("snapshot_invalidated")
             # Serialize the binding check with all snapshot writes. An old
             # request must not overwrite a new device after waiting for I/O.
             if binding_valid is not None and not binding_valid():
@@ -142,8 +153,10 @@ class HealthConnectStore:
             if old and old.get("device_id") != device_id:
                 # This device has no stored snapshot. Keep the other device's
                 # data untouched without wedging the caller's clear retry queue.
+                self._generation += 1
                 return
             self.path.unlink(missing_ok=True)
+            self._generation += 1
 
     def read(self, device_id: str, days: int = 7, *, now: float | None = None) -> dict:
         now = time.time() if now is None else now

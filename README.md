@@ -10,6 +10,8 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 ## 5 分钟上手（自有 App 模式）
 
+0.9.4 修复市场审核指出的日志接口用法，并补齐运行中关闭功能后的健康/关怀读取和任务派发检查。使用关怀桥接时同步升级至 0.3.2；App 0.3.28 继续兼容。完整复检范围与修复见 [0.9.4 复检记录](docs/REVIEW_0_9_4.md)。
+
 0.9.3 配合 App 0.3.28 新增 Health Connect 来源选择和定位 / 百度地图 MCP 状态检查。原有 xiaomi-sync 可继续使用，配置方法见 [健康接入说明](docs/HEALTH_CONNECT.md)。
 
 0.9.1 修复设备中途换绑、授权累计步数、严格核验和取消后的恢复责任。升级时重新签发旧 grant；使用受限任务的 Relay 兜底时须同步更新 Relay。现有 App 0.3.26 可继续使用，详见 [升级说明](docs/REVIEW_FIXES_0_9_1.md)。
@@ -156,7 +158,7 @@ python deploy\relay\relay_server.py
 
 ## 模式一：自有 App
 
-下载 [App Release](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases)，启动 Shizuku 并授权。在 App 的连接设置中分别填写聊天 API、插件认证及手机共享 Token。
+下载 [App Release](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases)，启动 Shizuku 并授权。在 App 的连接设置中填写插件地址、Dashboard JWT 和手机共享 Token。聊天在 QQ 等 AstrBot 会话中进行，当前 App 不需要配置聊天 API。
 
 ```json
 {
@@ -174,11 +176,10 @@ python deploy\relay\relay_server.py
 
 **确认机制**：读屏（`screen_text`）、截图（`screenshot`）和全部界面操作（点击、长按、滑动、滚动、输入、按键）默认都需要在手机上确认；定位、关闭/暂停应用、发送通知同理。可以在 App 的「纸笺 → 隐私与自动化」里逐项关闭确认，默认只预先放行截图。
 
-App 端三类凭据各有用途：
+App 端凭据各有用途：
 
 | 凭据 | 用途 |
 | --- | --- |
-| AstrBot OpenAPI Key | 聊天 `/api/v1/chat` |
 | AstrBot Dashboard 认证令牌 | `/api/plug/astrbot_plugin_phone_agent/` 下的状态、注册、提醒接口 |
 | `app_shared_token` | 插件访问手机 `:8260` 命令服务，两端必须一致 |
 
@@ -237,14 +238,14 @@ App 内的专注 / 批量应用限制按钮尚未具备完整的目标应用与�
 
 ```text
 你：帮我把抖音暂停
-她：已在手机上发起待批准任务：暂停 com.ss.android.ugc.aweme.lite。回「可以」即可批准，180 秒内有效。
-你：可以
+她：已在手机上发起待批准任务：暂停 com.ss.android.ugc.aweme.lite。回「批准」执行，180 秒内有效。
+你：批准
 她：照做了（核验通过 1 步）。
 ```
 
 批准有三条等价的路，任选其一：
 
-1. **聊天里回「可以」/「算了」**——不依赖 App 是否在运行；
+1. **聊天里回「批准」/「取消」**——手机须在线才能实际执行；
 2. **App 的自主功能页 →「待你决定」**；
 3. **手机屏幕上的悬浮卡片**（需要「显示在其他应用的上层」权限）。
 
@@ -332,9 +333,9 @@ App 返回原生 WGS84，Operit 返回其实际报告的坐标系；插件不按
 - **授权复用**：`use_private_companion_auth`，详见 [extensions/private_companion_auth.md](extensions/private_companion_auth.md)。
 - **主动消息上下文桥接**：`companion-context/` 是独立可选插件，目录应单独安装为 `astrbot_plugin_phone_companion_context`。复制主插件不会自动启用它。
 
-桥接的配置模板默认 `enabled=false`。实际注入还要求 `relationship_mode_enabled=true`、它自己的 `allowed_user_ids`，以及 Private Companion 将用户识别为 owner/primary/self；默认限制私聊。满足条件后可把最小化的手机/健康摘要交给主动消息生成。读屏还需要同时启用主插件 `enable_observe_tool` 与桥接 `include_screen`，且此桥接目前仍直接调用 Operit，尚未适配 App-only 的读屏链路。健康与屏幕分别有缓存和超时。
+桥接的配置模板默认 `enabled=false`，还需开启 `relationship_mode_enabled`、配置独立的 `allowed_user_ids` 并满足私聊与用户角色检查。手机状态摘要需要主插件 `enable_observe_tool` 和桥接 `include_screen`：App 模式使用当前绑定手机的新鲜心跳，Operit 模式请求一次粗粒度观察；不会把屏幕原文交给关怀模型。健康读取需要主插件健康开关和桥接 `include_health`，遵循主插件的来源选择与撤权状态。
 
-桥接还保留显式开启的关系语气/日常关心和主动决策配置，包括 `relationship_mode_enabled`、`autonomous_decision_enabled`、`autonomous_decision_mode`（`preview` / `low_risk_auto`）、冷却时间、每日次数、安静时段、私聊范围、语气和自定义提示。目前自主决策主要是提示注入，决策结果解析与计数更新未形成完整调度闭环，不能当作成熟的自主消息调度器。它依赖所用 Private Companion 版本的内部接口，也不授予无人确认的手机控制权。默认不开启这些增强。
+主动关怀需要显式开启 `autonomous_decision_enabled` 与主插件调度器。桥接使用 AstrBot 当前私聊的人格、近期对话和手机/健康摘要，解析 `no_action` / `send_message` 决策，并执行静默时段、冷却、评估与发送配额、去重和投递结果检查。`preview` 只预览，`care_auto` 允许符合授权范围的关怀投递；`low_risk_auto` 是兼容别名。Private Companion 7.x 通过扩展门面发现，关怀调度独立于其原生主动联系；不接管长期记忆，也不授予手机动作权限。详见 [7.x 适配与自主决策](docs/PRIVATE_COMPANION_719_ADAPTATION.md)。
 
 ## Relay 兜底部署与工作流
 
@@ -365,7 +366,7 @@ App 直接轮询中继。OperitAI 保留定时工作流接法：
 
 ## WebUI 与文件配置
 
-Phone Control 保留后端连接测试、配置修改、健康摘要、按需应用策略、守夜控制、一次性定位、Operit 任务列表、提醒取消、审计，以及可选自动刷新。现在还支持 App / Operit 模式选择、对应字段与 App 注册/直连信息。当前页面上的旧任务取消/重试按钮尚缺对应 Web 路由，应通过 `operit_task_cancel` / `operit_task_retry` 聊天工具操作。
+Phone Control 提供后端连接测试、配置修改、健康摘要、按需应用策略、守夜控制、一次性定位、Operit 任务取消/重试、提醒和审计，以及可选自动刷新。页面支持 App / Operit 模式选择、对应字段与 App 注册/直连信息。Operit 取消只停止本地等待；重试创建新任务，仍检查后端、任务状态、确认记录和并发预算。
 
 | 配置 | 内容 |
 | --- | --- |

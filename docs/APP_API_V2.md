@@ -109,7 +109,8 @@ the next read; offline revocation cannot immediately remove a server copy.
 | 401 | Dashboard authentication rejected or expired; response format is owned by AstrBot |
 | 403 | `forbidden`: plugin/health feature disabled or write-origin check failed; the host may also reject authentication |
 | 404 | Wrong plugin URL or server version without this endpoint |
-| 409 | `device_changed`, `snapshot_conflict`, `snapshot_older_than_current` |
+| 408 | `body_timeout`: health upload body was not received within the allowed time |
+| 409 | `device_changed`, `snapshot_conflict`, `snapshot_older_than_current`, `snapshot_invalidated` (an earlier in-flight upload lost a race with explicit clear) |
 | 413 | `payload_too_large` |
 | 503 | `storage_unavailable` |
 

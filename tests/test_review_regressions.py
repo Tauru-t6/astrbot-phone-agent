@@ -9,7 +9,7 @@ import tempfile
 import time
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).parents[1]
 
@@ -22,7 +22,10 @@ def load(name, path):
     return module
 
 
-runner = load("review_runner", ROOT / "task_runner.py")
+runner_api = types.ModuleType("astrbot.api")
+runner_api.logger = Mock()
+with patch.dict(sys.modules, {"astrbot": types.ModuleType("astrbot"), "astrbot.api": runner_api}):
+    runner = load("review_runner", ROOT / "task_runner.py")
 api_fixture = load("review_api_fixture", ROOT / "tests/test_app_api.py")
 plugin_module = api_fixture.module
 relay = load("review_relay_server", ROOT / "deploy/relay/relay_server.py")

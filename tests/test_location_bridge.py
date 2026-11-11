@@ -46,7 +46,8 @@ class LocationContractTests(unittest.TestCase):
 
     def test_failed_boolean_nonfinite_and_out_of_bounds_fixes_are_rejected(self):
         for values in [{"success": False}, {"success": "true"}, {"latitude": True}, {"latitude": float("nan")},
-                       {"longitude": float("inf")}, {"latitude": 91}, {"longitude": "116.4"}]:
+                       {"longitude": float("inf")}, {"latitude": 91}, {"longitude": "116.4"},
+                       {"latitude": 10 ** 400}, {"longitude": -(10 ** 400)}]:
             with self.subTest(values=values): self.assertFalse(bridge.normalize_location(fix(**values), "app")["success"])
 
     def test_old_and_undated_fixes_are_not_marked_current(self):

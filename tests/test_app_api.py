@@ -113,6 +113,46 @@ class AppApiTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(data["reminders"], [])
 
+    async def test_dashboard_discards_health_if_disabled_during_read(self):
+        self.config["enable_health_tools"] = True
+        def read_and_disable(days):
+            self.config["enable_health_tools"] = False
+            return {"source": "health_connect", "available": True, "fresh": True,
+                    "days": [{"date": "2026-11-11", "steps": 123}]}
+        with patch.object(self.plugin.device_app, "health", return_value={"available": False}), \
+             patch.object(self.plugin, "_read_health_db_sync", side_effect=read_and_disable):
+            response = await self.client.get("/astrbot_plugin_phone_agent/status")
+        health = (await response.get_json())["health"]
+        self.assertFalse(health["available"])
+        self.assertIsNone(health["latest"])
+        self.assertEqual(health["error"], "health_tools_disabled")
+
+    async def test_dashboard_status_does_not_read_health_when_switches_are_disabled(self):
+        self.config["enable_health_tools"] = True
+        sample = {"source": "health_connect", "available": True, "fresh": True,
+                  "days": [{"date": "2026-11-11", "steps": 123}]}
+        with patch.object(self.plugin.device_app, "health", return_value={"available": False}), \
+                patch.object(self.plugin, "_read_health_db_sync", return_value=sample) as read:
+            first = await self.client.get("/astrbot_plugin_phone_agent/status")
+            self.assertEqual((await first.get_json())["health"]["latest"]["steps"], 123)
+            self.assertEqual(read.call_count, 1)
+            for enabled, feature, error in [(True, False, "health_tools_disabled"),
+                                            (False, True, "phone_agent_disabled")]:
+                with self.subTest(enabled=enabled, feature=feature):
+                    self.config["enabled"] = enabled
+                    self.config["enable_health_tools"] = feature
+                    response = await self.client.get("/astrbot_plugin_phone_agent/status")
+                    self.assertEqual(response.status_code, 200)
+                    data = await response.get_json()
+                    self.assertFalse(data["health"]["available"])
+                    self.assertFalse(data["health"]["fresh"])
+                    self.assertIsNone(data["health"]["source"])
+                    self.assertIsNone(data["health"]["latest"])
+                    self.assertEqual(data["health"]["days"], 0)
+                    self.assertEqual(data["health"]["origin_packages"], [])
+                    self.assertEqual(data["health"]["error"], error)
+                    self.assertEqual(read.call_count, 1)
+
     async def test_app_state_exposes_night_guard_and_device_status(self):
         """G2: /app/state must include night_guard, device_last_status, and sleep_mode."""
         self.plugin.device_app.record_device_status(

@@ -14,7 +14,7 @@ from typing import Any
 def _number(value: Any, low: float, high: float) -> float | None:
     if type(value) not in (int, float):
         return None
-    return float(value) if math.isfinite(value) and low <= value <= high else None
+    return float(value) if low <= value <= high and (type(value) is int or math.isfinite(value)) else None
 
 
 def normalize_location(payload: Any, backend: str, *, now: float | None = None) -> dict:

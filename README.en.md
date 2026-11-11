@@ -47,7 +47,7 @@ Chat platform -> AstrBot -> Phone Agent plugin
                            |
                            +-> Optional relay <- phone polls, executes and reports
 
-App chat -> AstrBot chat API -> AstrBot model and enabled plugins
+QQ / another chat platform -> AstrBot model and enabled plugins
 Xiaomi Fitness -> server-side xiaomi-sync -> SQLite -> phone_health
 Xiaomi Fitness -> Health Connect -> Phone Agent App -> latest summary -> phone_health
 ```
@@ -127,7 +127,7 @@ Wireless debugging here is only a way to start Shizuku. It is not the AstrBot se
 
 ### 4.2 App mode setup
 
-Install the App release, let its foreground connection service run, then open **Paper / 纸笺 -> Server connection**. Enter the AstrBot chat base URL, plugin route base URL, chat identity, and their separate credentials. The phone command token must match `app_shared_token`; App chat API credentials and the plugin Dashboard JWT are separate. Save, then use the App's independent connection test. Configure ordered LAN/Tailscale endpoints on the plugin:
+Install the App release, let its foreground connection service run, then open **我的 -> 服务器连接**. Enter the plugin route base URL, Dashboard JWT and phone command token matching `app_shared_token`. Save and test the plugin connection. Chat stays in QQ or another AstrBot conversation; the current App has no chat UI and needs no chat API credentials. Configure ordered LAN/Tailscale endpoints on the plugin:
 
 ```json
 {
@@ -138,21 +138,18 @@ Install the App release, let its foreground connection service run, then open **
 }
 ```
 
-The public App contains no preset service URL, token, display name, or avatar. Its UI supports status, structured actions, reminders, timeline, local name/avatar, and system permission entries. It does not provide arbitrary `click`, `type`, tap, swipe, or natural-language UI execution; use Operit mode for those operations. `phone_observe` in App mode is a structured device-status read.
+The public App contains no preset service URL, token, display name, or avatar. It supports status, structured actions, reminders, timeline, local name/avatar, and system permission entries. Its closed command set includes taps, long presses, swipes, scrolling, text input and key events with explicit parameters and on-device confirmation. This does not provide an automatic visual loop for arbitrary natural-language UI tasks. `phone_observe` in App mode is a structured device-status read; screenshots are a separate explicit action.
 
 | App field | What to enter |
 | --- | --- |
-| AstrBot chat address | Base URL exposing `POST /api/v1/chat`, for example `https://chat.example` |
-| Chat API Key | Credential for the chat/OpenAPI endpoint |
-| Chat identity | Identity used by your server to associate the conversation and memory |
 | Plugin address | Full plugin route base, normally `https://astrbot.example/api/plug/astrbot_plugin_phone_agent` |
 | Plugin Token | AstrBot Dashboard token/JWT accepted by its plugin router |
 | Phone control Token | Random secret matching `app_shared_token` |
 | Relay address and Token | Optional; matching the plugin's relay address and secret |
 
-Include your reverse proxy's path prefix where applicable. The App appends `/app/state` and other paths to the plugin base; do not enter a specific route such as `/app/state` as the base URL. Chat API keys, plugin Dashboard JWTs and the shared phone command token are not interchangeable.
+Include your reverse proxy's path prefix where applicable. The App appends `/app/state` and other paths to the plugin base; do not enter a specific route such as `/app/state` as the base URL. Plugin Dashboard JWTs and the shared phone command token are not interchangeable.
 
-The settings UI never echoes stored secrets. Empty replacement fields preserve existing credentials. **Test saved connection** uses the last saved configuration, so save edits before testing them. The local name/avatar settings only affect display and do not replace a server persona or the chat identity.
+The settings UI never echoes stored secrets. Empty replacement fields preserve existing credentials. **Save and test connection** saves edits before testing; **Test saved connection** uses the saved configuration when the form is unchanged. The local name/avatar settings affect display and do not replace a server persona or chat identity.
 
 Allow background operation and notification permission for reminders. App usage queries require Android Usage access; location requires location permission and enabled system location services. Sensitive commands may wait for the App's confirmation dialog: only explicit approval executes them, and dismissing rejects them.
 
@@ -454,7 +451,7 @@ Messages, comments, likes, shares, deletes, uninstallations, payments, typing, a
 
 ### Private Companion bridge
 
-`companion-context` is optional and defaults to `enabled=false`. It is installed only when explicitly enabled. To let proactive messages inspect the current app, also enable `enable_observe_tool=true` in the phone plugin and `include_screen=true` in the bridge config. Otherwise it does not call Operit.
+`companion-context` is an optional, separately installed plugin and defaults to `enabled=false`. To include current-app activity, enable `enable_observe_tool=true` in the phone plugin and `include_screen=true` in the bridge. App mode reads a fresh heartbeat from the current device binding; Operit mode requests a coarse observation.
 
 Relay supports device isolation. Set `RELAY_REQUIRE_DEVICE_ID=1` and send `X-Relay-Device-ID` from the phone workflow for polling, lease renewal, and result submission. The default is disabled for compatibility. Rate limits default to 120 requests per minute and 30 task creations per minute, configurable with `RELAY_RATE_LIMIT` and `RELAY_TASK_RATE_LIMIT`.
 
@@ -619,18 +616,18 @@ Context injection currently requires `enabled=true`, `relationship_mode_enabled=
 | --- | --- |
 | `include_health` | true; read coarse health summaries from the phone plugin |
 | `include_screen` | false; additionally requires the main plugin observation flag |
-| `health_cache_seconds` | 900 seconds |
+| `health_cache_seconds` | 900 seconds for a fixed SQLite source; Health Connect and auto modes recheck the current snapshot |
 | `screen_cache_seconds` | 90 seconds |
 | `timeout_seconds` | 20 seconds |
 | `relationship_mode_enabled` | false; enables relationship/context prompt enrichment |
-| `autonomous_decision_enabled` | false; adds an autonomy decision prompt |
-| `autonomous_decision_mode` | `preview` or `low_risk_auto` |
+| `autonomous_decision_enabled` | false; enables bounded care decisions when the phone scheduler is configured |
+| `autonomous_decision_mode` | `preview` or `care_auto`; `low_risk_auto` is a compatibility alias |
 | `decision_cooldown_minutes` / `decision_daily_limit` | 180 / 3 configuration defaults |
 | `quiet_hours` | 00:30–08:00 |
 
 The remaining settings control tone, health care, daily rituals, playful wording, optional forms of address, fictional gestures, custom prompts and closing text. They remain available in the separate bridge schema. They are not mandatory for basic phone control.
 
-The screen collector still calls Operit directly and is not an App-only screen bridge. Health context may include cached or stale values, so consumers must check the date and synchronization status. The autonomy fields mostly enrich prompts: decision result parsing and counters do not form a complete autonomous scheduler. This bridge does not execute phone commands or grant permission for uncontrolled phone actions. Compatibility depends on Private Companion's internal interfaces.
+The activity collector uses the bound App's fresh heartbeat or a coarse Operit observation, depending on the selected backend. It does not forward raw screen text. Health context respects the main health switch and source selection; consumers must check the record date and synchronization status. Care decisions parse `no_action` / `send_message` and enforce quiet hours, cooldowns, evaluation/send quotas, deduplication and delivery checks. Private Companion 7.x is discovered through its extension facade; this separate care scheduler does not take over its native proactive messages or long-term memory. The bridge does not execute phone commands or grant phone permissions. See [7.x adaptation](docs/PRIVATE_COMPANION_719_ADAPTATION.md).
 
 ## 14. Data and capability details
 

@@ -95,7 +95,7 @@ tailscale ping PHONE_TAILSCALE_IP
 
 ## 四、App 模式：AstrBot Phone Agent App
 
-App 模式使用 [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) 和 Shizuku。安装 App 后按其引导启动 Shizuku、授权 App，并在 App 设置中填写 AstrBot 聊天 API、插件地址和共享命令 Token。App 命令服务通常监听 `8260`，具体以 App 页面为准。
+App 模式使用 [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) 和 Shizuku。安装 App 后按其引导启动 Shizuku、授权 App，并在连接设置中填写插件地址、Dashboard JWT 和共享命令 Token。聊天在 QQ 等 AstrBot 会话中进行，当前 App 不需要聊天 API 配置。App 命令服务通常监听 `8260`，具体以 App 页面为准。
 
 先在手机开发者选项打开无线调试，按 Shizuku 的配对指引启动服务；确认 Shizuku 首页显示运行中，再启动 App 并允许授权。手机重启后通常要重新启动 Shizuku，手机与服务器之间的控制链路仍是 HTTP，不需要服务器持续连着 ADB。
 
@@ -477,7 +477,7 @@ Operit 后台任务会返回任务 ID，可查询、取消或重试。`backgroun
 
 ### 高风险操作
 
-Operit 自然语言任务中的发消息、评论、点赞、转发、删除、卸载、支付、输入文字和点击按钮类任务会要求显式确认。App 模式不支持这些通用自然语言 UI 任务；关闭应用、暂停应用、定位、通知等列入手机端危险命令确认。普通的打开 App、返回、锁屏和读取状态可以直接执行。结果 `success=false` 时应按错误处理，不应在聊天中宣称已经完成。
+Operit 自然语言任务中的发消息、评论、点赞、转发、删除、卸载、支付、输入文字和点击按钮类任务会要求显式确认。App 支持封闭指令集内的点击、长按、滑动、滚动、输入和按键，由插件传入明确参数；它不具备自动看图规划任意界面任务的循环。界面操作、读屏、定位、关闭/暂停应用和通知默认需要手机端确认，截图默认预先允许。任务提案还须批准并逐步核验。结果 `success=false` 时应按错误处理，不应在聊天中宣称已经完成。
 
 ### Private Companion 桥接
 
@@ -506,11 +506,11 @@ cp -R astrbot_plugin_phone_agent/companion-context astrbot_plugin_phone_companio
 
 当前实现还要求 `relationship_mode_enabled=true` 才会执行上下文扩充；`allowed_user_ids` 为空时不会观察任何用户。需要屏幕粗粒度信号时，必须同时开启主插件的 `enable_observe_tool=true` 和桥接的 `include_screen=true`。
 
-屏幕桥接当前直接调用 Operit，只采集前台包名、活动类别和电量，不返回屏幕原文、联系人或消息文本。纯 App 部署应保持 `include_screen=false`；它不会自动改用 App `screen_text`。健康上下文遵循主插件的 `health_data_source`，选择 Health Connect 快照或 SQLite，与控制模式无关。
+手机状态桥接只采集前台包名、粗粒度活动类别和电量，不返回屏幕原文、联系人或消息文本。App 模式使用当前绑定手机的新鲜心跳，Operit 模式请求一次粗粒度观察；两者都受主插件观察开关与 `include_screen` 控制。健康上下文需要主插件健康开关和桥接 `include_health`，并遵循 `health_data_source`，选择 Health Connect 快照或 SQLite。
 
-默认整体等待上限为 `timeout_seconds=20`，屏幕缓存 `screen_cache_seconds=90` 秒，健康缓存 `health_cache_seconds=900` 秒。接口不兼容或目标插件不可用时跳过桥接，可在日志检查桥接状态。
+默认整体等待上限为 `timeout_seconds=20`，手机状态缓存最多 `screen_cache_seconds=90` 秒且受原始采样时间限制。固定 SQLite 来源可使用 `health_cache_seconds=900` 秒缓存；Health Connect 和 `auto` 每次核对当前快照，关闭、撤权或换绑后不继续使用旧摘要。接口不兼容或目标插件不可用时跳过桥接，可在日志检查桥接状态。
 
-关系语气和自治消息是额外选择：`autonomous_decision_enabled` 默认关闭，模式默认 `preview`；启用后还可配置 `decision_cooldown_minutes`、`decision_daily_limit`、`quiet_hours`、`romance_intensity` 等。它不会因此取得手机动作权限，也不是定时封禁手机的守护程序。桥接不重写持久人格和记忆，但显式开启关系提示会影响该次主动回复的语气。配置字段见 [`companion-context/_conf_schema.json`](companion-context/_conf_schema.json)。
+关系语气和主动关怀是额外选择：`autonomous_decision_enabled` 默认关闭，模式默认 `preview`。配合主插件调度器，关怀根据近期私聊和有效摘要解析 `no_action` / `send_message`，并执行冷却、静默时段、每日评估/发送额度、去重和投递核验。`care_auto` 允许范围内的真实投递，`low_risk_auto` 为兼容别名；不会因此取得手机动作权限。Private Companion 7.x 通过扩展门面发现，关怀调度独立于其原生主动联系。桥接不重写持久人格和记忆；关系提示仅影响当次生成。配置字段见 [`companion-context/_conf_schema.json`](companion-context/_conf_schema.json)。
 
 ## 九、健康数据（可选）
 
@@ -805,9 +805,9 @@ Operit Token 已失效或被重置。重新打开 Operit 外部 HTTP 页面，�
 观察一下当前手机，只观察，不要点击
 ```
 
-### App 能聊天，但显示插件未连接或不能控制手机
+### QQ 能聊天，但 App 显示插件未连接或不能控制手机
 
-聊天通道与插件管理端、手机命令服务是三条独立通道。先检查管理端登录凭据和插件路由是否返回 401/404，再检查手机命令服务是否启动，最后检查 `app_shared_token` 两端是否一致。不要通过更换聊天 API Key 来修复手机命令 Token 不匹配。
+QQ 聊天通道、插件管理端和手机命令服务分别连接。先检查 Dashboard JWT 和插件路由是否返回 401/404，再检查手机命令服务是否启动，最后检查 `app_shared_token` 两端是否一致。当前 App 不承载聊天，更换模型 API Key 不能修复手机命令 Token 不匹配。
 
 ### App 内网地址不可达，Tailscale 地址仍可用
 
@@ -837,7 +837,7 @@ App 提醒网络重试应复用同一个 `request_id`；重复请求会返回原
 
 ### 主动消息没有包含手机或健康摘要
 
-检查 `companion-context` 是否独立加载，`enabled`、`relationship_mode_enabled` 和其自身 `allowed_user_ids` 是否都配置。屏幕摘要还要求 Operit 可用、主插件观察开关开启、`include_screen=true`。纯 App 部署保持屏幕桥接关闭。桥接依赖 Private Companion 的版本和主动生成接口，不兼容时应在日志中看到跳过或重试原因。
+检查 `companion-context` 是否独立加载，`enabled`、`relationship_mode_enabled` 和其自身 `allowed_user_ids` 是否都配置。手机状态摘要要求主插件观察开关与 `include_screen=true`：App 模式检查设备绑定和心跳新鲜度，Operit 模式检查连接；健康摘要还需主插件健康开关与 `include_health`。主动关怀另需调度器与主动决策开关；Private Companion 7.x 的扩展门面不可用时，桥接状态会显示未安装或不兼容。
 
 ### Relay 收到 403、429 或没有任务
 

@@ -1127,6 +1127,9 @@ class PhoneCompanionContext(Star):
         return signal
 
     async def _health_snapshot(self, phone: Any) -> dict[str, Any]:
+        if not self._health_read_allowed(phone):
+            self._health_cache = None
+            return {}
         key = self._health_source_key(phone)
         # A phone snapshot can be cleared or invalidated immediately after the
         # user withdraws consent. Always consult its current source selection;
@@ -1138,13 +1141,32 @@ class PhoneCompanionContext(Star):
         if self._health_cache and datetime.now() - self._health_cache[1] < timedelta(seconds=ttl):
             return dict(self._health_cache[2])
         result = await asyncio.to_thread(phone._read_health_db_sync, 1)
-        if self._health_source_key(phone) != key:
+        if not self._health_read_allowed(phone) or self._health_source_key(phone) != key:
             self._health_cache = None
             return {}
         snapshot = result if isinstance(result, dict) else {}
         if cache_allowed:
             self._health_cache = (key, datetime.now(), snapshot)
         return dict(snapshot)
+
+    def _health_read_allowed(self, phone: Any) -> bool:
+        return self._feature_enabled("include_health", True) and self._phone_read_allowed(phone, "phone_health")
+
+    def _screen_read_allowed(self, phone: Any) -> bool:
+        return self._feature_enabled("include_screen", False) and self._phone_read_allowed(phone, "phone_observe")
+
+    def _phone_read_allowed(self, phone: Any, tool: str) -> bool:
+        """The bridge cannot bypass the owning plugin's data-access gates."""
+        if not self._enabled():
+            return False
+        plugin_enabled = getattr(phone, "_enabled", None)
+        tool_enabled = getattr(phone, "_tool_enabled", None)
+        if not callable(plugin_enabled) or not callable(tool_enabled):
+            return False
+        try:
+            return plugin_enabled() is True and tool_enabled(tool) is True
+        except Exception:
+            return False
 
     @staticmethod
     def _health_source_key(phone: Any) -> tuple[int, str, int]:
@@ -1153,16 +1175,9 @@ class PhoneCompanionContext(Star):
         return id(phone), mode, PhoneCompanionContext._device_generation(phone)
 
     async def _screen_snapshot(self, phone: Any) -> dict[str, Any]:
-        # Keep proactive context observation behind the phone plugin's explicit
-        # observe flag as well, including when an older config has include_screen
-        # enabled already.
-        enabled = getattr(phone, "_tool_enabled", None)
-        if callable(enabled):
-            try:
-                if not enabled("phone_observe"):
-                    return {}
-            except Exception:
-                return {}
+        if not self._screen_read_allowed(phone):
+            self._screen_cache = None
+            return {}
         ttl = self._cache_seconds("screen_cache_seconds", 90, 600)
         generation = self._device_generation(phone)
         # v4: check cache validity by the ORIGINAL sample's age, not by how
@@ -1193,6 +1208,9 @@ class PhoneCompanionContext(Star):
             backend = backend()
         if backend == "app":
             snapshot = self._screen_snapshot_from_app(phone)
+            if not self._screen_read_allowed(phone) or self._device_generation(phone) != generation:
+                self._screen_cache = None
+                return {}
             if snapshot:
                 # Store the original reported_at so cache validity is
                 # checked against the phone's sampling time, not our cache time.
@@ -1206,6 +1224,9 @@ class PhoneCompanionContext(Star):
             )
         except Exception:
             return {}
+        if not self._screen_read_allowed(phone) or self._device_generation(phone) != generation:
+            self._screen_cache = None
+            return {}
         if not isinstance(available, dict) or not available.get("available"):
             return {}
         prompt = (
@@ -1214,6 +1235,9 @@ class PhoneCompanionContext(Star):
             "不要返回屏幕原文、联系人、账号或消息内容，不要点击、输入或修改任何内容。"
         )
         result = await asyncio.to_thread(phone._operit_task_sync, prompt, False, "WINDOW")
+        if not self._screen_read_allowed(phone) or self._device_generation(phone) != generation:
+            self._screen_cache = None
+            return {}
         snapshot = self._strict_screen_signal(result)
         if snapshot:
             self._screen_cache = (generation, datetime.now(), snapshot)
@@ -1325,9 +1349,17 @@ class PhoneCompanionContext(Star):
             if isinstance(result, Exception) or not isinstance(result, dict):
                 continue
             if kind == "screen":
+                if not self._screen_read_allowed(phone):
+                    self._screen_cache = None
+                    continue
                 # v4: strip internal _reported_at before exposing to LLM context.
                 screen_signal = {k: v for k, v in result.items() if not k.startswith("_")}
             elif kind == "health":
+                # Another awaited collector can outlive a completed health read.
+                # Recheck at the point where values enter the model context.
+                if not self._health_read_allowed(phone):
+                    self._health_cache = None
+                    continue
                 days = result.get("days") if isinstance(result.get("days"), list) else []
                 latest = days[0] if days and isinstance(days[0], dict) else {}
                 # R07: carry freshness metadata so stale data doesn't drive

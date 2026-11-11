@@ -107,6 +107,8 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(self.store.read("phone-a")["available"])
         self.path.write_text(" " * 65537)
         self.assertFalse(self.store.read("phone-a")["available"])
+        self.path.write_text(json.dumps(payload(captured_at=10 ** 400, days=[])))
+        self.assertFalse(self.store.read("phone-a")["available"])
 
     def test_clear_is_idempotent_and_never_deletes_other_devices(self):
         self.store.accept(payload())
@@ -198,6 +200,30 @@ class ApiAndSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post("snapshot", payload())).status_code, 403)
         self.assertEqual((await self.post("clear", {"device_id": "phone-a"})).status_code, 200)
 
+    async def test_chunked_body_still_obeys_size_limit(self):
+        url = "/astrbot_plugin_phone_agent/app/health/snapshot"
+        for size, expected in [(100, 200), (70000, 413)]:
+            value = payload(snapshot_id=f"body-{size}", ignored_padding="x" * size)
+            response = await self.client.post(url, data=json.dumps(value),
+                headers={"Content-Type": "application/json", "Transfer-Encoding": "chunked"})
+            self.assertEqual(response.status_code, expected)
+            if expected == 413:
+                self.assertEqual((await response.get_json())["error_code"], "payload_too_large")
+
+    async def test_oversized_integer_and_deep_json_are_client_errors(self):
+        for field in ("captured_at", "steps"):
+            value = payload()
+            if field == "steps": value["days"][0]["metrics"][field] = 10 ** 400
+            else: value[field] = 10 ** 400
+            response = await self.post("snapshot", value)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn((await response.get_json())["error_code"], ["invalid_metric_value", "invalid_capture_time"])
+        raw = '{"deep":' + '[' * 1500 + '0' + ']' * 1500 + '}'
+        response = await self.client.post("/astrbot_plugin_phone_agent/app/health/snapshot", data=raw,
+                                         headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual((await response.get_json())["error_code"], "invalid_json")
+
     async def test_rejects_unregistered_device_and_cross_origin_upload(self):
         self.assertEqual((await self.post("snapshot", payload(device_id="phone-b"))).status_code, 409)
         self.assertEqual((await self.post("snapshot", payload(), headers={"Origin": "http://other.example"})).status_code, 403)
@@ -231,6 +257,29 @@ class ApiAndSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_response.status_code, 409)
         self.assertEqual((await old_response.get_json())["error_code"], "device_changed")
         self.assertTrue(self.plugin._health_connect.read("phone-b")["available"])
+
+    async def test_received_upload_cannot_restore_snapshot_after_successful_clear(self):
+        await self.post("snapshot", payload())
+        started, release = threading.Event(), threading.Event()
+        original = self.plugin._health_connect.accept
+        def delayed(value, **kwargs):
+            started.set()
+            if not release.wait(5): raise TimeoutError("test upload was not released")
+            return original(value, **kwargs)
+        with patch.object(self.plugin._health_connect, "accept", side_effect=delayed):
+            pending = asyncio.create_task(self.post("snapshot", payload(snapshot_id="pending")))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 3))
+                self.assertEqual((await self.post("clear", {"device_id": "phone-a"})).status_code, 200)
+                self.assertFalse(self.plugin._health_connect.read("phone-a")["available"])
+            finally:
+                release.set()
+                rejected = await pending
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual((await rejected.get_json())["error_code"], "snapshot_invalidated")
+        self.assertFalse(self.plugin._health_connect.read("phone-a")["available"])
+        self.assertFalse(Path(self.config["health_connect_path"]).exists())
+        self.assertEqual((await self.post("snapshot", payload(snapshot_id="after-clear"))).status_code, 200)
 
     async def test_health_read_works_without_cloud_database(self):
         self.assertEqual((await self.post("snapshot", payload())).status_code, 200)

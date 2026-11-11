@@ -638,7 +638,13 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 operit = {"available": False, "error": "Operit health check timed out"}
         else:
             operit = None
-        health = await asyncio.to_thread(self._read_health_db_sync, 1)
+        if self._enabled() and self._feature("health_tools"):
+            health = await asyncio.to_thread(self._read_health_db_sync, 1)
+        if not self._enabled() or not self._feature("health_tools"):
+            # The combined dashboard must respect the same consent switch as
+            # /health, including when a user disables it after plugin startup.
+            health = {"source": None, "available": False, "fresh": False, "days": [],
+                      "error": "health_tools_disabled" if self._enabled() else "phone_agent_disabled"}
         return jsonify({
             "success": True,
             "control_backend": backend,
@@ -1052,18 +1058,39 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return jsonify({"success": False, "error_code": "forbidden", "error": error}), 403
         if request.content_length is not None and request.content_length > 65536:
             return jsonify({"success": False, "error_code": "payload_too_large"}), 413
-        payload = await request.get_json(silent=True)
-        if not isinstance(payload, dict) or not self._finite_json(payload):
+        health_generation = self._health_connect.generation()
+        if not request.is_json:
             return jsonify({"success": False, "error_code": "invalid_json"}), 400
+
+        async def bounded_body():
+            data = bytearray()
+            async for chunk in request.body:
+                if len(data) + len(chunk) > 65536:
+                    return None
+                data.extend(chunk)
+            return bytes(data)
+
+        try:
+            raw = await asyncio.wait_for(bounded_body(), timeout=10)
+            if raw is None:
+                return jsonify({"success": False, "error_code": "payload_too_large"}), 413
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or not self._finite_json(payload):
+                return jsonify({"success": False, "error_code": "invalid_json"}), 400
+        except (ValueError, UnicodeError, RecursionError):
+            return jsonify({"success": False, "error_code": "invalid_json"}), 400
+        except asyncio.TimeoutError:
+            return jsonify({"success": False, "error_code": "body_timeout"}), 408
         binding = self.device_app.binding()
         if not binding[0] or payload.get("device_id") != binding[0]:
             return jsonify({"success": False, "error_code": "device_changed"}), 409
         try:
             result = await asyncio.to_thread(self._health_connect.accept, payload,
-                                            binding_valid=lambda: self.device_app.binding() == binding)
+                                            binding_valid=lambda: self.device_app.binding() == binding,
+                                            expected_generation=health_generation)
         except ValueError as exc:
             code = str(exc)
-            return jsonify({"success": False, "error_code": code}), 409 if code in {"device_changed", "snapshot_conflict", "snapshot_older_than_current"} else 400
+            return jsonify({"success": False, "error_code": code}), 409 if code in {"device_changed", "snapshot_conflict", "snapshot_older_than_current", "snapshot_invalidated"} else 400
         except OSError:
             return jsonify({"success": False, "error_code": "storage_unavailable"}), 503
         if self.device_app.binding() != binding:
@@ -1182,7 +1209,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._task_runs.add_run(run)
         self._task_runs.add_approval(approval)
         self._task_runs.save()
-        self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=actions)
+        self._audit("task_proposed", run_id=run.run_id, goal_length=len(goal), actions=actions)
         return jsonify({"success": True, "run": run.to_dict(), "approval": approval.to_dict()}), 200
 
     async def _web_app_task_approve(self):
@@ -1304,7 +1331,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         run = await self._task_executor.execute(run, grant=grant, allow_active=allow_active)
         self._audit(
             "task_execute",
-            goal=goal[:120],
+            goal_length=len(goal),
             subject=subject,
             status=run.status,
             allow_active=allow_active,
@@ -1414,7 +1441,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         )
         self._audit(
             "task_plan_dry_run",
-            goal=goal[:120],
+            goal_length=len(goal),
             subject=subject,
             simulated=run.summary.get("simulated", 0),
             blocked=run.summary.get("blocked", 0),
@@ -1880,7 +1907,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             provider = self.context.get_using_provider(umo=session)
         except Exception as exc:
             self._audit("night_guard_warning_llm_fallback", reason="provider_lookup_failed",
-                        error=_text(exc, 160))
+                        error_type=type(exc).__name__)
             return fallback, "template"
         if provider is None:
             self._audit("night_guard_warning_llm_fallback", reason="no_provider")
@@ -1905,18 +1932,18 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             self._audit("night_guard_warning_llm_fallback", reason="timeout", timeout=timeout)
             return fallback, "template"
         except Exception as exc:
-            self._audit("night_guard_warning_llm_fallback", reason="error", error=_text(exc, 160))
+            self._audit("night_guard_warning_llm_fallback", reason="error", error_type=type(exc).__name__)
             return fallback, "template"
         raw = str(getattr(response, "completion_text", "") or "")
         if "\n" in raw.strip():
             # A multi-line answer is a chat reply, not a reminder; keep the
             # fixed template rather than flattening whatever came back.
-            self._audit("night_guard_warning_llm_fallback", reason="multi_line", text=_text(raw, 160))
+            self._audit("night_guard_warning_llm_fallback", reason="multi_line", response_length=len(raw))
             return fallback, "template"
         text = _text(raw, 400).strip().strip('"“”「」\'').strip()
         problem = self._night_guard_warning_problem(text, app_name, grace)
         if problem:
-            self._audit("night_guard_warning_llm_fallback", reason=problem, text=_text(text, 160))
+            self._audit("night_guard_warning_llm_fallback", reason=problem, response_length=len(raw))
             return fallback, "template"
         return text, "llm"
 
@@ -1942,7 +1969,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         except Exception as exc:
             state["last_error"] = _text(exc, 200)
             self._save_night_guard_state()
-            self._audit("night_guard_warning_failed", user_id=user_id, error=state["last_error"])
+            self._audit("night_guard_warning_failed", user_id=user_id, error_type=type(exc).__name__)
             return False
         now = time.time()
         state["warning_sent_at"] = now
@@ -1952,7 +1979,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         state["last_error"] = ""
         self._save_night_guard_state()
         self._audit("night_guard_warning_sent", user_id=user_id, package=package, session=session,
-                    source=source, text=_text(text, 200))
+                    source=source, message_length=len(text))
         return True
 
     async def _night_guard_enforce(self, user_id: str, state: dict[str, Any], package: str) -> bool:
@@ -2428,11 +2455,22 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return {"success": False, "error_code": "unsupported_task_backend",
                     "error": "verified task execution requires the phone App backend"}
         args = dict(args)
+        recovery = args.pop("_task_recovery", False) is True
         device_id = args.pop("_expected_device_id", None)
         generation = args.pop("_expected_generation", None)
         binding = (device_id, generation) if device_id is not None and generation is not None else self.device_app.binding()
         if self.device_app.binding() != binding:
             return {"success": False, "error_code": "device_changed", "error": "device binding changed"}
+        # Approval is not a permanent copy of the server's runtime policy.
+        # Check immediately before each write, including after an awaited step.
+        # Only the executor's bound rollback may restore an app after opt-out.
+        restore_only = (recovery and action == "unsuspend_app" and device_id is not None
+                        and generation is not None and CURRENT_TASK_BINDING.get() == binding)
+        if not restore_only:
+            if not self._enabled() or not self._feature("task_execute"):
+                return {"success": False, "error_code": "disabled", "error": "task execution was disabled"}
+            if action not in self._task_allowed_actions():
+                return {"success": False, "error_code": "action_not_enabled", "error": "task action is no longer enabled"}
         if action in {"suspend_app", "unsuspend_app"}:
             return await self._apply_app_policy(
                 _text(args.get("package"), 160),
@@ -3172,7 +3210,9 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 value_text = _text(value, 500)
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", key_text) or not value_text:
                     return {"success": False, "action": action, "error": "invalid workflow extra"}
-                command_parts.extend(("--es", key_text, value_text))
+                # adb shell joins arguments into a device-side shell command.
+                # Keep workflow extras literal just like input_text above.
+                command_parts.extend(("--es", key_text, shlex.quote(value_text)))
             command = tuple(command_parts)
         else:
             return {"success": False, "action": action, "error": "unsupported action"}
@@ -3620,7 +3660,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._task_runs.add_run(run)
         self._task_runs.add_approval(approval)
         self._task_runs.save()
-        self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=actions, source="chat")
+        self._audit("task_proposed", run_id=run.run_id, goal_length=len(goal), actions=actions, source="chat")
         if self._is_private_session(event):
             guidance = (f"已在手机上发起待批准任务：{goal}。"
                         f"请让用户打开 App 的「自主功能 → 待你决定」，或在手机屏幕上点悬浮卡片的允许；"
@@ -3766,6 +3806,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
             return self._group_tool_error("operit_task")
         if not task or len(task) > 2000:
             return json.dumps({"success": False, "error": "task must contain 1-2000 characters"}, ensure_ascii=False)
+        confirmed = self._coerce_bool(confirmed)
         if self._task_requires_confirmation(task) and not confirmed:
             return json.dumps({"success": False, "needs_confirmation": True, "error": "This task has an external side effect; ask the user for confirmation first."}, ensure_ascii=False)
         if self._control_backend() == "app":
@@ -4051,7 +4092,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
         self._task_runs.add_run(run)
         self._task_runs.add_approval(approval)
         self._task_runs.save()
-        self._audit("task_proposed", run_id=run.run_id, goal=goal[:120], actions=[action], source="tool")
+        self._audit("task_proposed", run_id=run.run_id, goal_length=len(goal), actions=[action], source="tool")
         payload = self._approval_payload(approval)
         if event is not None and not self._is_private_session(event):
             payload["message"] = f"已在手机上发起待批准任务：{goal}。" + self._issue_group_code(event, approval)
@@ -4187,7 +4228,7 @@ class PhoneAgentPlugin(CareSchedulerMixin, Star):
                 return self._group_tool_error("phone_observe")
         if action in {"suspend_app", "unsuspend_app", "suspend_video_apps", "unsuspend_video_apps"} and not self._tool_enabled("phone_app_policy"):
             return json.dumps({"success": False, "error": "app policy actions are disabled; enable policy_tools in the plugin config"}, ensure_ascii=False)
-        if action == "trigger_workflow" and not confirmed:
+        if action == "trigger_workflow" and not self._coerce_bool(confirmed):
             return json.dumps({"success": False, "needs_confirmation": True, "error": "Ask the user for confirmation before triggering an external workflow."}, ensure_ascii=False)
         # With task execution enabled, anything that changes the phone must go
         # through a proposal the user approves. Direct execution here used to

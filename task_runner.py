@@ -1,9 +1,7 @@
-"""Autonomous phone-task primitives (P1-E stage 1).
+"""Scoped phone-task planning, persistence, execution and verification.
 
-This module is deliberately inert: it defines the objects a multi-step task
-needs, the rules a scoped grant must satisfy, and the persistence for runs. It
-does not execute anything and is not wired into the plugin yet — stage 2 adds
-the read-only runner on top of these pieces.
+The plugin supplies device observation and action callbacks. This module
+enforces device binding, scoped grants and persisted budgets around them.
 
 Design notes
 ------------
@@ -20,7 +18,6 @@ Design notes
 """
 import asyncio
 import json
-import logging
 import math
 import os
 import time
@@ -30,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 CURRENT_TASK_BINDING: ContextVar[tuple[str, int] | None] = ContextVar("phone_task_binding", default=None)
 
 # ---------------------------------------------------------------- constants
@@ -1035,6 +1032,8 @@ class TaskExecutor:
 
     def _action_args(self, run: PhoneTaskRun, args: dict[str, Any]) -> dict[str, Any]:
         result = dict(args)
+        # Stored/model-provided steps cannot claim the rollback-only path.
+        result.pop("_task_recovery", None)
         if self._device_binding is not None:
             result["_expected_device_id"] = run.device_id
             result["_expected_generation"] = run.summary["device_generation"]
@@ -1154,8 +1153,10 @@ class TaskExecutor:
         if not allowed or package in self._protected or self._binding_error(run):
             return False
         try:
+            recovery_args = self._action_args(run, {"package": package})
+            recovery_args["_task_recovery"] = True
             result = await asyncio.wait_for(
-                self._act("unsuspend_app", self._action_args(run, {"package": package})), timeout=self._step_timeout)
+                self._act("unsuspend_app", recovery_args), timeout=self._step_timeout)
         except Exception:
             return False
         return bool(isinstance(result, dict) and result.get("success"))
