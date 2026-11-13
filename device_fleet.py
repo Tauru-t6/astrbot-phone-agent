@@ -182,6 +182,7 @@ class DeviceFleet:
                 digest = hashlib.sha256(device_id.encode()).hexdigest()[:24]
                 timeline = self.path.parent / ("device_" + digest + "_timeline.json")
                 backend = DeviceAppBackend(_DeviceConfig(self.config, device_id, timeline), self.audit)
+            backend.token_lookup = getattr(self, "token_lookup", None)
 
             rows = dict(self.rows)
             if not existing:

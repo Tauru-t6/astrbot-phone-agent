@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>手机 Agent 控制台</title>
+  <title>Phone Control 控制台</title>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
   <style>
     :root { color-scheme:light dark; --bg:#f5f7f6; --panel:#fff; --panel-2:#f8faf9; --rail:#eef2ef; --ink:#20332e; --muted:#708079; --line:#e3eae5; --accent:#246954; --accent-soft:#e8f2ec; --good:#217453; --good-soft:#e8f4ed; --bad:#bb4c44; --bad-soft:#fceeea; --warn:#94691f; --warn-soft:#fcf4df; --shadow:0 3px 16px #213a2c04; --radius:18px; }
@@ -142,13 +142,14 @@
 <body>
 <div class="app-layout">
   <aside class="sidebar">
-    <div class="brand"><div class="brand-mark"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 5h4m-3 14h2"/></svg></div><div><strong>Phone Agent</strong><small>ASTRBOT · 手机控制台</small></div></div>
+    <div class="brand"><div class="brand-mark"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 5h4m-3 14h2"/></svg></div><div><strong>Phone Control</strong><small>ASTRBOT · 手机控制台</small></div></div>
     <div class="nav-label">工作空间</div>
     <nav class="tabs" aria-label="控制台导航">
       <button id="navOverview" class="tab active" data-view="overview" aria-controls="overview" aria-current="page" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>手机概览</span></button>
       <button id="navSettings" class="tab" data-view="settings" aria-controls="settings" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h8m4 0h4M4 17h3m4 0h9"/><circle cx="14" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg><span>连接配置</span></button>
       <button id="navPolicy" class="tab" data-view="policy" aria-controls="policy" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v5c0 5 3 8 8 10 5-2 8-5 8-10V6z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg><span>应用管理</span></button>
       <button id="navLogs" class="tab" data-view="logs" aria-controls="logs" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8m-8 4h5"/></svg><span>任务与记录</span></button>
+      <button id="navPairing" class="tab" data-view="pairing" aria-controls="pairing" type="button"><span>扫码配对</span></button>
     </nav>
     <div class="sidebar-footer"><label class="toggle"><input id="autoRefresh" type="checkbox" checked> 自动刷新</label><p>你的手机，你的连接。<br>为日常留一点从容。</p></div>
   </aside>
@@ -181,7 +182,7 @@
       <div class="settings-intro">选择手机使用的控制后端。已保存的凭据不会回显，Token 留空即可保持原值。</div>
       <article class="panel"><form id="settingsForm">
         <div class="form-section"><h3>设备连接</h3><div class="form-grid">
-          <label>控制后端<select id="control_backend"><option value="app">AstrBot Phone Agent App</option><option value="operit">OperitAI</option><option value="adb" hidden>ADB（旧版诊断）</option></select></label>
+          <label>控制后端<select id="control_backend"><option value="app">Phone Control App</option><option value="operit">OperitAI</option><option value="adb" hidden>ADB（旧版诊断）</option></select></label>
           <label data-backend="operit">Operit 地址<input id="operit_base_url" placeholder="http://PHONE_TAILSCALE_IP:8094" autocapitalize="none" spellcheck="false"></label>
           <label data-backend="operit">Operit Token<input id="operit_token" type="password" autocomplete="new-password" placeholder="留空保持已配置 Token"></label>
           <label data-backend="app">App 共享命令 Token<input id="app_shared_token" type="password" autocomplete="new-password" placeholder="留空保持已配置 Token"></label>
@@ -192,6 +193,16 @@
       </form><div class="form-footer"><p id="configDraftStatus">修改后保存，后台刷新会保留尚未保存的内容。</p><button id="saveBtn" class="primary" type="button">保存配置</button></div></article>
     </section>
 
+    <section id="pairing" class="view" aria-label="设备配对">
+      <article class="panel"><div class="panel-head"><div><h2>扫码连接手机</h2><p>配对码两分钟有效、只可使用一次。手机获得独立凭据，可随时撤销。</p></div></div>
+        <div class="form-grid"><label>设备用途<select id="pairKind"><option value="bot">Bot 专用机</option><option value="personal">个人手机</option></select></label>
+        <label>重新配对设备 ID（新设备留空）<input id="pairReplace" autocomplete="off" placeholder="仅在替换该设备凭据时填写"></label></div>
+        <div class="actions"><button id="pairCreateBtn" class="primary">生成配对码</button><button id="pairRefreshBtn">刷新设备状态</button></div>
+        <p id="pairNotice" class="notice"></p><img id="pairQr" hidden alt="一次性设备配对二维码" style="max-width:300px;background:white;padding:12px;border-radius:12px">
+        <label>无法扫码时，在手机粘贴这段配对信息<textarea id="pairPayload" readonly spellcheck="false"></textarea></label>
+        <div id="pairDevices" class="rows"></div>
+      </article>
+    </section>
     <section id="policy" class="view" aria-label="应用管理"><div class="grid two">
       <article class="panel"><div class="panel-head"><div><h2>单个应用</h2><p>按需限制或恢复指定 App</p></div></div><form><div class="form-grid"><label>操作<select id="policy_action"><option value="disable">限制使用</option><option value="enable">恢复使用</option></select></label><label>持续分钟数<input id="policy_minutes" type="number" min="0" max="1440" value="0"><small>0 表示保持到下一次手动恢复。</small></label><label class="full">应用名称或包名<input id="policy_package" placeholder="例如：抖音极速版"></label></div><div class="actions"><button id="policyApplyBtn" class="primary" type="button">执行操作</button><button id="policyRestoreBtn" type="button">立即恢复</button></div><p id="policyNotice" class="notice"></p></form>
       <details><summary>管理临时模式的默认应用列表</summary><form><label>默认限制应用<input id="sleep_guard_packages" placeholder="例如：B站,快手,优酷"></label><label>默认例外应用<input id="sleep_guard_exempt_apps" placeholder="例如：微信"></label><div class="actions"><button id="policyConfigSaveBtn" type="button">保存默认列表</button></div><p id="policyConfigNotice" class="notice"></p></form></details></article>
@@ -202,7 +213,7 @@
       <article class="panel"><div class="panel-head"><div><h2>Operit 任务</h2><p>查看当前运行实例中的后台任务</p></div><button id="tasksBtn" type="button">刷新</button></div><p id="tasksNotice" class="notice"></p><div id="taskList" class="task-list"><div class="empty">暂无任务</div></div></article>
       <article class="panel"><div class="panel-head"><div><h2>操作记录</h2><p>最近 50 条审计，不包含密钥和消息正文</p></div><button id="auditBtn" type="button">刷新</button></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>详情</th></tr></thead><tbody id="auditBody"></tbody></table></div><p id="auditNotice" class="notice"></p></article>
     </div><article class="panel section-gap"><div class="panel-head"><div><h2>手机提醒</h2><p>把稍后要做的事，交给一个提醒。</p></div><button id="remindersBtn" type="button">刷新列表</button></div><form id="reminderForm"><div class="form-grid"><label>提醒内容<input id="reminder_text" maxlength="500" placeholder="例如：喝水，休息一下" required></label><label>多少分钟后<input id="reminder_minutes" type="number" min="1" max="10080" step="1" value="15" required></label></div><div class="actions"><button id="reminderCreateBtn" class="primary" type="button">创建手机提醒</button></div><p class="muted" style="font-size:12px">到期后同步至手机动态与本地通知。手机需保持连接，并允许发送通知。</p></form><p id="reminderNotice" class="notice"></p><div id="reminderList" class="task-list section-gap"><div class="empty">暂无提醒</div></div><p id="reminderListNotice" class="notice"></p></article></section>
-    <footer class="page-footnote"><span>AstrBot Phone Agent · 你的设备工作空间</span><span id="lastRefresh">等待首次刷新</span></footer>
+    <footer class="page-footnote"><span>Phone Control · 你的设备工作空间</span><span id="lastRefresh">等待首次刷新</span></footer>
   </main>
 </div>
 <script>
@@ -314,7 +325,7 @@ function renderHealth(health) {
 }
 function renderStatus(data, updateConfig = true) {
   const isApp = data.control_backend === 'app';
-  const label = isApp ? 'Phone Agent App' : data.control_backend === 'adb' ? 'ADB（旧版诊断）' : 'OperitAI';
+  const label = isApp ? 'Phone Control App' : data.control_backend === 'adb' ? 'ADB（旧版诊断）' : 'OperitAI';
   const device = (isApp ? data.device_app : data.operit) || {};
   const health = data.health || {};
   const sleep = data.sleep_mode || {};
@@ -625,7 +636,43 @@ const views = {
   settings:['连接配置','让 AstrBot 与你的手机保持连接。'],
   policy:['应用管理','按需安排应用使用，为专注留出时间。'],
   logs:['任务与记录','查看执行过程，安排下一件小事。'],
+  pairing:['设备配对','为每台手机签发独立、可撤销的凭据。'],
 };
+let pairExpiryTimer = null;
+function clearPairingCode() {
+  $('pairPayload').value = '';
+  $('pairQr').hidden = true;
+  $('pairQr').removeAttribute('src');
+  if (pairExpiryTimer !== null) clearTimeout(pairExpiryTimer);
+  pairExpiryTimer = null;
+}
+function loadPairing() {
+  return runAction('pairing-read','pairNotice',['pairRefreshBtn'],async () => {
+    const data = await get('app/pairing');
+    const rows = Array.isArray(data.devices) ? data.devices : [];
+    $('pairDevices').innerHTML = rows.map(row => `<div class="row"><span>${escapeHtml(row.device_id)} · ${escapeHtml(row.device_kind)}</span><button type="button" data-revoke-device="${escapeHtml(row.device_id)}" ${row.revoked?'disabled':''}>${row.revoked?'已撤销':'撤销连接'}</button></div>`).join('');
+    document.querySelectorAll('[data-revoke-device]').forEach(button => {
+      button.onclick = () => runAction('pair-revoke:'+button.dataset.revokeDevice,'pairNotice',[button],async () => {
+        await post('app/pairing/revoke',{device_id:button.dataset.revokeDevice});
+        clearPairingCode(); await loadPairing(); setNotice('pairNotice','已撤销该设备的连接凭据',true);
+      });
+    });
+    setNotice('pairNotice',data.ready ? '配对服务就绪 · '+text(data.public_url) : '请在插件配置启用设备配对，并填写网关监听地址与手机可访问的地址。',data.ready);
+  });
+}
+function createPairing() {
+  return runAction('pairing-create','pairNotice',['pairCreateBtn'],async () => {
+    clearPairingCode();
+    const data = await post('app/pairing',{device_kind:$('pairKind').value,replace_device_id:$('pairReplace').value.trim()});
+    if (!data.pairing || !Number.isFinite(data.pairing.expires_at)) throw Error('服务器未返回有效配对码');
+    $('pairPayload').value=JSON.stringify(data.pairing);
+    if (typeof data.qr_image === 'string' && data.qr_image.startsWith('data:image/svg+xml;base64,')) {
+      $('pairQr').setAttribute('src',data.qr_image); $('pairQr').hidden=false;
+    }
+    pairExpiryTimer=setTimeout(() => { clearPairingCode(); setNotice('pairNotice','配对码已过期，请重新生成。'); },Math.max(0,data.pairing.expires_at*1000-Date.now()));
+    setNotice('pairNotice','请用对应版本 App 扫码，或粘贴配对信息。两分钟内有效。',true);
+  });
+}
 function selectView(name) {
   if (!views[name]) return;
   document.querySelectorAll('.tab').forEach(button => {
@@ -639,6 +686,7 @@ function selectView(name) {
   });
   $('pageTitle').textContent = views[name][0];
   $('pageDescription').textContent = views[name][1];
+  if(name === 'pairing') loadPairing(); else clearPairingCode();
 }
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click',() => selectView(button.dataset.view)));
 $('control_backend').onchange = showBackendFields;
@@ -657,6 +705,8 @@ $('tasksBtn').onclick = loadTasks;
 $('auditBtn').onclick = loadAudit;
 $('remindersBtn').onclick = loadReminders;
 $('reminderCreateBtn').onclick = createReminder;
+$('pairCreateBtn').onclick = createPairing;
+$('pairRefreshBtn').onclick = loadPairing;
 let refreshTimer = null;
 function scheduleRefresh() {
   if (refreshTimer !== null) clearTimeout(refreshTimer);

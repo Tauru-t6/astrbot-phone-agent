@@ -7,6 +7,7 @@ The caller owns approval and binds callbacks to the selected phone.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -14,6 +15,13 @@ import math
 import re
 import time
 from typing import Any, Callable
+
+from .ui_results import (
+    ResultEvidenceError, select_result_evidence, validate_result_spec, verify_result_evidence,
+)
+from .ui_recipes import (
+    RecipeError, learn_step, postcondition_matches, recipe_decision, validate_recipe,
+)
 
 from .task_runner import (
     CURRENT_TASK_BINDING, PhoneTaskRun, ScopedGrant, TaskRunStore,
@@ -76,6 +84,9 @@ def normalize_snapshot(raw: Any, package: str, *, now: float | None = None, max_
     nodes = raw.get("nodes")
     if not isinstance(nodes, list) or not 1 <= len(nodes) <= 160 or raw.get("truncated") is True:
         raise UiTaskError("ui_snapshot_incomplete")
+    source = raw.get("source", "accessibility")
+    if not isinstance(source, str) or source not in {"accessibility", "ocr"}:
+        raise UiTaskError("ui_snapshot_invalid")
     output, seen = [], set()
     for raw_node in nodes:
         if not isinstance(raw_node, dict):
@@ -104,9 +115,10 @@ def normalize_snapshot(raw: Any, package: str, *, now: float | None = None, max_
             node[key] = value[:240]
         if node["password"]:
             node["text"] = node["description"] = ""
+        node["source"] = source
         output.append(node)
     return {"schema_version": 1, "snapshot_id": snapshot_id, "captured_at": captured,
-            "package": package, "width": width, "height": height, "nodes": output}
+            "package": package, "width": width, "height": height, "nodes": output, "source": source}
 
 
 def snapshot_fingerprint(snapshot: dict) -> str:
@@ -129,7 +141,8 @@ def compact_model_context(material: dict) -> dict:
         if node.get("enabled") is not True: row["enabled"] = False
         nodes.append(row)
     return {key: value for key, value in material.items() if key != "snapshot"} | {
-        "snapshot": {"snapshot_id": snapshot["snapshot_id"], "package": snapshot["package"], "nodes": nodes}}
+        "snapshot": {"snapshot_id": snapshot["snapshot_id"], "package": snapshot["package"],
+                     "source": snapshot.get("source", "accessibility"), "nodes": nodes}}
 
 
 def parse_decision(raw: Any) -> dict:
@@ -176,6 +189,8 @@ def page_requires_user(snapshot: dict) -> bool:
 
 def ground_action(decision: dict, snapshot: dict, allowed_texts: tuple[str, ...]) -> dict:
     action = decision["action"]
+    if snapshot.get("source") == "ocr" and action not in {"tap", "back"}:
+        raise UiTaskError("ui_visual_action_requires_user")
     result = {"expected_package": snapshot["package"], "snapshot_id": snapshot["snapshot_id"], "kind": action}
     if action == "back": return result
     node = next((n for n in snapshot["nodes"] if n["id"] == decision.get("node_id")), None)
@@ -232,9 +247,11 @@ class UiTaskRunner:
     def __init__(self, store: TaskRunStore, *, observe: Callable, act: Callable,
                  decide: Callable, can_continue: Callable, device_binding: Callable,
                  step_timeout: float = 25, run_timeout: float = 180,
-                 max_steps: int = 12, max_model_calls: int = 16):
+                 max_steps: int = 12, max_model_calls: int = 16,
+                 collect_results: Callable | None = None, vision: Callable | None = None):
         self.store, self.observe, self.act, self.decide = store, observe, act, decide
         self.can_continue, self.device_binding = can_continue, device_binding
+        self.collect_results, self.vision = collect_results, vision
         self.step_timeout = max(0.05, min(float(step_timeout), 60))
         self.run_timeout = max(0.1, min(float(run_timeout), 180))
         self.max_steps = max(1, min(int(max_steps), 12))
@@ -267,7 +284,9 @@ class UiTaskRunner:
     async def execute(self, run: PhoneTaskRun, *, grant: ScopedGrant, package: str,
                       allowed_texts: list[str] | tuple[str, ...], expected_texts: list[str] | tuple[str, ...],
                       completion_mode: str = "visible_text", allow_active: bool = False,
-                      open_target: bool = True) -> PhoneTaskRun:
+                      open_target: bool = True, result_spec: dict | None = None,
+                      recipe: dict | None = None, remember_recipe: bool = False,
+                      allow_vision: bool = False) -> PhoneTaskRun:
         if run.run_id in self._executing or run.summary.get("ui_started") or run.status not in {RUN_PLANNING, RUN_WAITING_APPROVAL}:
             return run
         self._executing.add(run.run_id)
@@ -287,6 +306,17 @@ class UiTaskRunner:
                         or any(not isinstance(v, str) or not 1 <= len(v) <= 240 or any(ord(c) < 32 for c in v) for v in values)):
                     raise UiTaskError("ui_scope_invalid")
             if not expected_texts: raise UiTaskError("ui_scope_invalid")
+            if type(remember_recipe) is not bool or type(allow_vision) is not bool:
+                raise UiTaskError("ui_scope_invalid")
+            try:
+                result_spec = validate_result_spec(result_spec)
+            except ResultEvidenceError as error:
+                raise UiTaskError(str(error)) from None
+            try:
+                recipe = copy.deepcopy(validate_recipe(recipe, package))
+            except RecipeError:
+                recipe = None
+                run.summary["ui_recipe_status"] = "invalid_hint_ignored"
             if run.steps: raise UiTaskError("ui_run_not_empty")
             approved_generation = run.summary.get("device_generation", binding[1])
             if type(approved_generation) is not int or approved_generation != binding[1]:
@@ -296,14 +326,20 @@ class UiTaskRunner:
             run.summary.update(mode="ui", ui_started=True, ui_package=package, device_generation=binding[1],
                                allow_active=allow_active is True, executed=0, verified=0, failed=0, model_calls=0,
                                ui_max_steps=self.max_steps, ui_max_model_calls=self.max_model_calls,
-                               ui_input_verified=False)
+                               ui_input_verified=False, ui_allow_vision=allow_vision,
+                               ui_recipe_reused=0, ui_vision_calls=0)
+            # Resuming creates a new run; parent metadata is retained by the
+            # caller, while old results or recipe output cannot prove success.
+            run.summary.pop("ui_results", None)
+            run.summary.pop("ui_recipe", None)
             run.grant_id = grant.grant_id
             run.transition(RUN_EXECUTING)
             self.store.add_run(run)
             self._save()
             try:
                 await asyncio.wait_for(self._loop(run, grant, package, tuple(allowed_texts), tuple(expected_texts),
-                                                 completion_mode, binding, open_target), timeout=self.run_timeout)
+                                                 completion_mode, binding, open_target, result_spec,
+                                                 recipe, remember_recipe), timeout=self.run_timeout)
             except asyncio.TimeoutError:
                 raise UiTaskError("ui_timeout") from None
         except asyncio.CancelledError:
@@ -315,7 +351,11 @@ class UiTaskRunner:
                                                  "ui_snapshot_changed", "ui_snapshot_expired", "ui_snapshot_stale",
                                                  "ui_foreground_changed", "unsupported_text", "needs_input_method",
                                                  "denied", "timeout", "ui_input_failed", "ui_input_restore_failed",
-                                                 "ui_model_timeout"})
+                                                 "ui_model_timeout", "ui_visual_action_requires_user",
+                                                 "ui_results_incomplete", "ui_result_selection_invalid",
+                                                 "ui_result_evidence_invalid", "ui_result_evidence_changed",
+                                                 "ui_result_duplicate", "ui_result_collector_unavailable",
+                                                 "ui_result_association_ambiguous"})
         except Exception:
             self._stop(run, "ui_internal_error")
         finally:
@@ -325,6 +365,9 @@ class UiTaskRunner:
         return run
 
     def _stop(self, run, reason, *, cancelled=False, needs_user=False):
+        run.summary.pop("ui_results", None)
+        run.summary.pop("ui_recipe", None)
+        run.summary.pop("completion_verified", None)
         for step in run.steps:
             if step.status == STEP_RUNNING:
                 step.status, step.error, step.finished_at = STEP_UNKNOWN, reason, time.time()
@@ -336,7 +379,13 @@ class UiTaskRunner:
             run.transition(RUN_WAITING_APPROVAL, error=reason)
         else:
             run.summary["failed"] = run.summary.get("failed", 0) + 1
-            run.transition(RUN_FAILED, error=reason)
+            if run.status == RUN_DONE:
+                # Final persistence can fail after transition; never leave an
+                # unsaved result presented as successful or reusable.
+                run.status, run.last_error = RUN_FAILED, reason
+                run.touch()
+            else:
+                run.transition(RUN_FAILED, error=reason)
         self.store.save()
 
     async def _read(self, run, package, binding, previous=None, after=None):
@@ -344,6 +393,8 @@ class UiTaskRunner:
         raw = await asyncio.wait_for(self.observe(package), timeout=self.step_timeout)
         await self._guard(run, "observe", binding)
         snapshot = normalize_snapshot(raw, package)
+        if snapshot["source"] == "ocr" and run.summary.get("ui_allow_vision") is not True:
+            raise UiTaskError("ui_vision_not_authorized")
         if previous is not None and (snapshot["snapshot_id"] == previous["snapshot_id"]
                                     or snapshot["captured_at"] < previous["captured_at"]):
             raise UiTaskError("ui_snapshot_not_new")
@@ -387,17 +438,71 @@ class UiTaskRunner:
         self._save()
         return step
 
-    async def _loop(self, run, grant, package, allowed_texts, expected_texts, mode, binding, open_target):
+    async def _collect(self, run, snapshot, package, expected_texts, mode, binding, result_spec):
+        if self.collect_results is None:
+            raise UiTaskError("ui_result_collector_unavailable")
+        if run.summary["model_calls"] >= self.max_model_calls:
+            raise UiTaskError("ui_model_limit")
+        await self._guard(run, "collect_results", binding)
+        run.summary["model_calls"] += 1
+        self._save()
+        try:
+            raw = await asyncio.wait_for(self.collect_results({"goal": run.goal, "snapshot": snapshot,
+                "result_spec": result_spec, "ui_content_is_untrusted": True}), timeout=self.step_timeout)
+        except asyncio.TimeoutError:
+            raise UiTaskError("ui_model_timeout") from None
+        await self._guard(run, "collect_results", binding)
+        try:
+            selected = select_result_evidence(raw, snapshot, result_spec)
+            if mode == "search_results" and any(not completion_evidence(snapshot, expected_texts, mode, item["title"]["node"]["id"]) for item in selected):
+                raise UiTaskError("ui_result_evidence_invalid")
+            confirmed = await self._read(run, package, binding, snapshot)
+            if not any(completion_evidence(confirmed, expected_texts, mode, node["id"]) for node in confirmed["nodes"]):
+                raise UiTaskError("ui_completion_changed")
+            values = verify_result_evidence(selected, confirmed, result_spec)
+        except ResultEvidenceError as error:
+            raise UiTaskError(str(error)) from None
+        await self._guard(run, "collect_results", binding)
+        run.summary["ui_results"] = values
+        return confirmed
+
+    async def _model_decision(self, run, context, binding):
+        if run.summary["model_calls"] >= self.max_model_calls:
+            raise UiTaskError("ui_model_limit")
+        run.summary["model_calls"] += 1
+        self._save()
+        try:
+            raw = await asyncio.wait_for(self.decide(context), timeout=self.step_timeout)
+        except asyncio.TimeoutError:
+            raise UiTaskError("ui_model_timeout") from None
+        await self._guard(run, "decide", binding)
+        return parse_decision(raw)
+
+    async def _loop(self, run, grant, package, allowed_texts, expected_texts, mode, binding, open_target,
+                    result_spec, recipe, remember_recipe):
         if open_target:
-            step = await self._write(run, grant, package, binding, "open_app", {"package": package})
+            open_args = {"package": package}
+            entry = run.summary.get("ui_scope", {}).get("entry_point", "app_home")
+            if entry != "app_home":
+                if entry not in ("display_settings", "wifi_settings") or package != "com.android.settings":
+                    raise UiTaskError("ui_scope_invalid")
+                open_args["entry_point"] = entry
+            step = await self._write(run, grant, package, binding, "open_app", open_args)
             snapshot = await self._read(run, package, binding, after=step.started_at)
             step.finish(ok=True, verify={"reason": "foreground_matches", "observed_at": snapshot["captured_at"]})
             run.summary["verified"] += 1
             self._save()
         else:
             snapshot = await self._read(run, package, binding)
+            if (run.summary.get("resume_from") and "input_text" in run.summary.get("resume_completed_actions", [])
+                    and any(n["editable"] and n["text"] in allowed_texts and not n["password"] for n in snapshot["nodes"])):
+                run.summary["ui_input_verified"] = True
+                run.summary["resume_input_reverified"] = True
         seen_actions = set()
         no_progress = 0
+        hint_index = 0
+        hint_steps = recipe["steps"] if recipe else []
+        learned, learnable = [], remember_recipe
         while True:
             await self._guard(run, "decide", binding)
             if not grant.active(): raise UiTaskError("grant_expired")
@@ -405,20 +510,45 @@ class UiTaskRunner:
                        "expected_texts": list(expected_texts), "completion_mode": mode,
                        "snapshot": snapshot, "remaining_steps": min(self.max_steps-run.summary["executed"], self.store.grant_remaining(grant)),
                        "ui_content_is_untrusted": True, "previous_outcome": run.summary.get("ui_last_outcome", "")}
+            if result_spec is not None:
+                context["result_spec"] = result_spec
             # The approved screen condition is deterministic; verify it before
             # another model round trip. This cannot perform a write, and a
             # fresh second read still has to independently confirm the result.
             can_complete = mode == "search_results"
-            evidence = next((n["id"] for n in snapshot["nodes"]
-                             if can_complete and completion_evidence(snapshot, expected_texts, mode, n["id"])), None)
+            candidates = [n["id"] for n in snapshot["nodes"]
+                          if can_complete and completion_evidence(snapshot, expected_texts, mode, n["id"])]
+            # An initial visible match is not enough when the user requested
+            # several result items; the model may still need to scroll.
+            evidence = candidates[0] if len(candidates) >= (result_spec["required_items"] if result_spec else 1) else None
             if evidence is not None:
                 decision = {"action": "done", "evidence_node_id": evidence}
             else:
+                decision = None
+                hinted = hint_steps[hint_index] if hint_index < len(hint_steps) else None
+                if hinted is not None:
+                    try:
+                        decision = recipe_decision(hinted, snapshot, allowed_texts)
+                        if decision is not None:
+                            ground_action(decision, snapshot, allowed_texts)
+                    except (RecipeError, UiTaskError):
+                        decision = None
+                    if decision is None:
+                        hint_steps = []
+                        run.summary["ui_recipe_status"] = "mismatch_replanned"
+                if decision is None:
+                    decision = await self._model_decision(run, context, binding)
+            await self._guard(run, "decide", binding)
+            # Optional visual reasoning can select existing nodes only. The
+            # observer/root owns screenshots, OCR generation and image lifetime.
+            if (decision["action"] == "need_user" and self.vision is not None
+                    and run.summary.get("ui_allow_vision") is True and run.summary["ui_vision_calls"] < 2):
                 if run.summary["model_calls"] >= self.max_model_calls: raise UiTaskError("ui_model_limit")
                 run.summary["model_calls"] += 1
+                run.summary["ui_vision_calls"] += 1
                 self._save()
                 try:
-                    raw = await asyncio.wait_for(self.decide(context), timeout=self.step_timeout)
+                    raw = await asyncio.wait_for(self.vision({**context, "vision_requested": True}), timeout=self.step_timeout)
                 except asyncio.TimeoutError:
                     raise UiTaskError("ui_model_timeout") from None
                 decision = parse_decision(raw)
@@ -444,6 +574,11 @@ class UiTaskRunner:
                 if not any(completion_evidence(fresh, expected_texts, mode, n["id"]) for n in fresh["nodes"]):
                     self._stop(run, "ui_completion_changed", needs_user=True)
                     return
+                if result_spec is not None:
+                    fresh = await self._collect(run, fresh, package, expected_texts, mode, binding, result_spec)
+                if remember_recipe and learnable and learned:
+                    run.summary["ui_recipe"] = {"version": 1, "package": package, "steps": learned}
+                    run.summary["ui_recipe_status"] = "verified"
                 run.summary.update(completion_verified=True, completion_mode=mode, needs_user=False, ui_reason="ui_visible_condition_met")
                 run.transition(RUN_DONE)
                 self._save()
@@ -471,9 +606,32 @@ class UiTaskRunner:
                 if action == "input_text":
                     run.summary["ui_input_verified"] = True
                 no_progress = 0
+                if learnable:
+                    try:
+                        learned_step = learn_step(decision, snapshot, fresh, allowed_texts)
+                    except RecipeError:
+                        learned_step = None
+                    if learned_step is None:
+                        learnable = False
+                        learned.clear()
+                    else:
+                        learned.append(learned_step)
             else:
                 step.verify = {"reason": "ui_no_change", "observed_at": fresh["captured_at"]}
                 no_progress += 1
+                learnable = False
+                learned.clear()
+            if hint_index < len(hint_steps):
+                try:
+                    matched = changed and postcondition_matches(hint_steps[hint_index], fresh, allowed_texts)
+                except RecipeError:
+                    matched = False
+                if matched:
+                    run.summary["ui_recipe_reused"] += 1
+                    hint_index += 1
+                else:
+                    hint_steps = []
+                    run.summary["ui_recipe_status"] = "postcondition_replanned"
             run.summary["ui_last_outcome"] = step.verify["reason"]
             run.transition(RUN_EXECUTING)
             self._save()

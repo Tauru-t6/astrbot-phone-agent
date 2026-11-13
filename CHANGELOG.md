@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.0] - 2026-11-13
+
+- Return requested, freshly verified page-result fields (title required; optional author, duration and URL may be null), bounded to 1–10 items. Models select evidence references; they do not invent result values.
+- Save parameterized task scopes and opt-in successful selector recipes. Re-observe each target/postcondition, fall back to model decisions on mismatches, and never replay unknown writes or saved coordinates.
+- Continue paused/failed attempts through a new run, fresh approval and remaining action budget. Unknown results require explicit current-state confirmation; completed/cancelled runs cannot continue.
+- Add finite Bot-only daily schedules with timezones, quiet hours, durable slot/model-call reservations, restart/DST deduplication and no offline catch-up. Notification is separately approved, private-only and optionally only on verified result changes.
+- Add an optional device-pairing gateway and 120-second one-use QR codes, revocable per-device credentials and connection diagnostics. Owner JWT remains server-side; paired devices currently use direct transport. Legacy JWT/shared-token/Relay connections remain compatible.
+- Add task-opt-in screenshot/local OCR assistance that still selects grounded semantic/OCR nodes. OCR actions are tap/back only and require a fresh pixel guard; arbitrary model coordinates remain unsupported.
+- Keep the personal App home screen compact and distinguish health source, last attempt, last successful upload, stale state and errors. Pair with App 0.5.0; Bot still excludes health-reading components.
+- Verification and rollout are pending; see [0.11 release notes](docs/RELEASE_0_11.md) and [setup](docs/UI_TASKS.md).
+
 ## [0.10.0] - 2026-11-11
 
 - Real-device acceptance fixes: match unchanged controls across unrelated feed refreshes; support editor hints during input; avoid requiring a missing Bilibili video tab; verify search results locally with a fresh confirmation read. Compact the model context and report model timeouts as a manual handoff.

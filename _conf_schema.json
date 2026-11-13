@@ -368,5 +368,40 @@
     "type": "int",
     "default": 6,
     "description": "Maximum planned actions, excluding the mandatory observation. Range 1-10."
+  },
+  "enable_task_routines": {
+    "type": "bool",
+    "default": false,
+    "description": "启用Bot手机日程。每个日程仍需明确批准设备、模板、时段、次数和模型调用上限；离线不补跑。"
+  },
+  "enable_ui_vision": {
+    "type": "bool",
+    "default": false,
+    "description": "允许任务显式申请截图和设备本地OCR辅助；需App0.5.0、手机对应授权及可看图模型。"
+  },
+  "enable_device_pairing": {
+    "type": "bool",
+    "default": false,
+    "description": "启用一次性扫码配对网关。设备使用独立可撤销凭据，传统JWT连接仍可用。"
+  },
+  "pairing_bind_host": {
+    "type": "text",
+    "default": "127.0.0.1",
+    "description": "设备网关监听地址。建议填服务器Tailscale地址；公开HTTP不允许生成配对码。"
+  },
+  "pairing_port": {
+    "type": "int",
+    "default": 8766,
+    "description": "设备网关端口，启用前确认不被占用。"
+  },
+  "pairing_public_url": {
+    "type": "text",
+    "default": "",
+    "description": "手机可访问的网关根地址，如http://100.x.x.x:8766；公网需HTTPS反向代理。"
+  },
+  "pairing_upstream_url": {
+    "type": "text",
+    "default": "http://127.0.0.1:6185/api/plug/astrbot_plugin_phone_agent",
+    "description": "网关固定转发的本机插件地址。仅服务器保存面板授权，不向设备发面板JWT。"
   }
 }

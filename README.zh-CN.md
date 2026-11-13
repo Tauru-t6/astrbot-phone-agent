@@ -9,6 +9,14 @@ Android 前端：[AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-p
 
 [项目主页](README.md) · [English Guide](README.en.md) · [界面任务与双设备](docs/UI_TASKS.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
 
+## 0.11.0 任务成果、收藏与配对（待发布）
+
+配套 App **0.5.0** 增加有证据的任务结果、带参数收藏、已验证控件经验、人工接手后新审批续跑，以及有限额的 Bot 日程。标题必须来自新读屏核对过的非输入节点，作者、时长和链接缺失时为 `null`；不猜内容。日程只在指定 Bot 手机和当前预定分钟执行，离线不补跑，次数与模型调用额度在执行前持久预留。
+
+可选扫码网关使用 120 秒一次性码，手机获得可撤销的独立凭据，面板 JWT 留在服务器；新配对当前使用直连，传统 JWT / Relay 配置继续兼容。截图/OCR 辅助需单独启用和批准，仍只操作语义或 OCR 节点，不提供任意坐标点击。个人版继续保持简洁首页，补充健康来源、最近尝试/成功与设备自检。
+
+详见[设置与使用](docs/UI_TASKS.md)及[发布前验收要求](docs/RELEASE_0_11.md)。本节不代表新版已发布或真机验证已完成。
+
 ## 0.10.0 界面任务与第二台手机
 
 配套 App 0.4.0 增加独立 **Phone Control Bot**：个人版保留健康同步，Bot 版仅承担设备控制，不包含 Health Connect SDK、健康权限、健康读取和同步实现。两者包名、存储和安装身份独立。服务端按设备分别保存注册、状态和任务路由，保留原个人主设备；Bot 手机离线不会回退到个人手机。这是同一部署内的设备分工，不是不同账户之间的安全隔离。
@@ -103,7 +111,7 @@ tailscale ping PHONE_TAILSCALE_IP
 
 ## 四、App 模式：AstrBot Phone Agent App
 
-App 模式使用 [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) 和 Shizuku。安装 App 后按其引导启动 Shizuku、授权 App，并在连接设置中填写插件地址、Dashboard JWT 和共享命令 Token。聊天在 QQ 等 AstrBot 会话中进行，当前 App 不需要聊天 API 配置。App 命令服务通常监听 `8260`，具体以 App 页面为准。
+App 模式使用 [AstrBot Phone Agent App](https://github.com/Tauru-t6/astrbot-phone-agent-app) 和 Shizuku。安装 App 后按其引导启动 Shizuku、授权 App。0.11.0 / App 0.5.0 可扫码取得独立设备凭据；传统连接仍填写插件地址、Dashboard JWT 和共享命令 Token。聊天在 QQ 等 AstrBot 会话中进行，当前 App 不需要聊天 API 配置。App 命令服务通常监听 `8260`，具体以 App 页面为准。
 
 先在手机开发者选项打开无线调试，按 Shizuku 的配对指引启动服务；确认 Shizuku 首页显示运行中，再启动 App 并允许授权。手机重启后通常要重新启动 Shizuku，手机与服务器之间的控制链路仍是 HTTP，不需要服务器持续连着 ADB。
 

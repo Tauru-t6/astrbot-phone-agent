@@ -79,6 +79,8 @@ COMMAND_ACTIONS = frozenset({
     "key_event",
     "ui_snapshot",
     "ui_action",
+    "ui_visual_snapshot",
+    "ui_visual_action",
 })
 
 # Actions that change device state or expose screen content. The app prompts for
@@ -99,6 +101,8 @@ DANGEROUS_ACTIONS = frozenset({
     "screenshot",
     "ui_snapshot",
     "ui_action",
+    "ui_visual_snapshot",
+    "ui_visual_action",
 })
 
 # Screenshots ride inside the result envelope as base64, so both ends need an
@@ -119,7 +123,7 @@ _REGISTER_TIMEOUT_SECONDS = 8
 # per-attempt window than the fast-path cap; everything else answers in
 # milliseconds and keeps the short cap so a dead route cannot eat the budget.
 SLOW_ACTIONS = frozenset({
-    "status", "quick_status", "screen_text", "screenshot", "usage_stats", "location", "ui_snapshot", "ui_action",
+    "status", "quick_status", "screen_text", "screenshot", "usage_stats", "location", "ui_snapshot", "ui_action", "ui_visual_snapshot", "ui_visual_action",
 })
 SLOW_ACTION_ATTEMPT_SECONDS = 35.0
 
@@ -246,7 +250,11 @@ class DeviceAppBackend:
 
     # ---------- config ----------
 
-    def shared_token(self) -> str:
+    def shared_token(self, device_id=None) -> str:
+        lookup = getattr(self, "token_lookup", None)
+        if lookup is not None:
+            found, value = lookup(device_id or self.binding()[0])
+            if found: return value
         return str(self._config.get("app_shared_token") or "").strip()
 
     def command_timeout(self) -> float:
@@ -265,6 +273,11 @@ class DeviceAppBackend:
         return str(self._config.get("relay_token") or "").strip()
 
     def relay_enabled(self) -> bool:
+        lookup = getattr(self, "token_lookup", None)
+        if lookup is not None and lookup(self.binding()[0])[0]:
+            # Paired credentials are per-device. The legacy Relay still uses a
+            # deployment-wide secret, so it is not provisioned to paired Apps.
+            return False
         return bool(self.relay_url() and self.relay_token())
 
     def direct_urls(self) -> list[str]:
@@ -318,7 +331,7 @@ class DeviceAppBackend:
             base_urls = valid_urls
             if not base_url and base_urls:
                 base_url = base_urls[0]
-        expected_fingerprint = self._token_fingerprint()
+        expected_fingerprint = self._token_fingerprint(device_id)
         if (
             expected_fingerprint
             and token_fingerprint
@@ -330,7 +343,8 @@ class DeviceAppBackend:
                 before_commit()
             previous = self._registration
             rebind = (previous is None or previous.get("device_id") != device_id
-                      or sorted(previous.get("base_urls") or []) != sorted(base_urls or [base_url]))
+                      or sorted(previous.get("base_urls") or []) != sorted(base_urls or [base_url])
+                      or previous.get("token_fingerprint", "") != token_fingerprint)
             if rebind:
                 # P1-C: a new binding must not inherit the old device's status.
                 self._registration_generation += 1
@@ -377,10 +391,10 @@ class DeviceAppBackend:
                 "command_id": envelope["command_id"], "action": envelope["action"],
                 "error": "the registered device or its endpoints changed"}
 
-    def _token_fingerprint(self) -> str:
+    def _token_fingerprint(self, device_id=None) -> str:
         import hashlib
 
-        token = self.shared_token()
+        token = self.shared_token(device_id)
         return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] if token else ""
 
     # ---------- status cache (from poll payloads / results) ----------
@@ -590,7 +604,7 @@ class DeviceAppBackend:
             # uiautomator dump that took >15 s). The app bounds screen_text to
             # ~29 s worst case, so 35 s covers it; fast actions keep the short
             # cap so a hanging route cannot eat the shared budget.
-            ui_command = envelope["action"] in {"ui_snapshot", "ui_action"}
+            ui_command = envelope["action"] in {"ui_snapshot", "ui_action", "ui_visual_snapshot", "ui_visual_action"}
             attempt_cap = SLOW_ACTION_ATTEMPT_SECONDS if envelope["action"] in SLOW_ACTIONS else 8.0
             # UI input may need two fresh dumps plus an IME switch. Give the
             # reachable route the caller's budget; once posted, an uncertain
@@ -733,6 +747,11 @@ class DeviceAppBackend:
         except ValueError as exc:
             return {"success": False, "action": action, "error_code": "unsupported_action", "error": str(exc)[:200]}
         target_device = expected_binding[0] if expected_binding else self.binding()[0]
+        lookup = getattr(self, "token_lookup", None)
+        if lookup and target_device:
+            paired, secret = lookup(target_device)
+            if paired and not secret:
+                return {"success": False, "error_code": "device_revoked", "action": action}
         if target_device:
             envelope["target_device_id"] = target_device
         # Callers that cannot wait (task verification) pass a tighter budget.

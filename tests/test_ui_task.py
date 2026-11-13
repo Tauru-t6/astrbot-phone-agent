@@ -430,5 +430,174 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reads,1)
         self.assertFalse(self.writes)
 
+    async def test_requested_results_are_collected_and_revalidated_before_completion(self):
+        self.screens=[results()]
+        received=[]
+        async def collect(context):
+            received.append(context)
+            return {"items":[{"title":{"node_id":"result","attribute":"text"}}]}
+        result=await self.execute(self.runner(collect_results=collect),result_spec={"fields":["title","url"],"max_items":2})
+        self.assertEqual(result.status,"done")
+        self.assertEqual(result.summary["ui_results"]["items"],[{"title":"demo example video","url":None}])
+        self.assertEqual(self.reads,3)
+        self.assertEqual(result.summary["model_calls"],1)
+        self.assertTrue(received[0]["ui_content_is_untrusted"])
+
+    async def test_requested_results_cannot_be_silently_skipped_without_a_collector(self):
+        self.screens=[results()]
+        result=await self.execute(result_spec={"fields":["title"]})
+        self.assertEqual(result.status,"waiting_approval")
+        self.assertEqual(result.last_error,"ui_result_collector_unavailable")
+        self.assertNotIn("ui_results",result.summary)
+        self.assertNotIn("completion_verified",result.summary)
+
+    async def test_search_tab_cannot_be_returned_as_a_result_title(self):
+        self.screens=[results()]
+        async def collect(context):return {"items":[{"title":{"node_id":"tab1"}}]}
+        result=await self.execute(self.runner(collect_results=collect),result_spec={"fields":["title"]})
+        self.assertEqual(result.last_error,"ui_result_evidence_invalid")
+        self.assertNotIn("ui_results",result.summary)
+
+    async def test_changed_result_after_selection_is_not_persisted(self):
+        changed=results();changed[0]["text"]="demo changed title"
+        self.screens=[results(),results(),changed]
+        async def collect(context):return {"items":[{"title":{"node_id":"result"}}]}
+        result=await self.execute(self.runner(collect_results=collect),result_spec={"fields":["title"]})
+        self.assertEqual(result.last_error,"ui_result_evidence_changed")
+        self.assertNotIn("ui_results",result.summary)
+        self.assertNotIn("demo example video",self.path.read_text(encoding="utf-8"))
+
+    async def test_revoked_policy_during_collection_cannot_save_visible_results(self):
+        self.screens=[results()]
+        async def collect(context):
+            self.policy=False
+            return {"items":[{"title":{"node_id":"result"}}]}
+        result=await self.execute(self.runner(collect_results=collect),result_spec={"fields":["title"]})
+        self.assertEqual(result.last_error,"ui_policy_changed")
+        self.assertNotIn("ui_results",result.summary)
+
+    async def test_more_required_items_keep_the_model_in_control_until_result_scope_is_met(self):
+        self.screens=[results()]
+        self.decisions=[{"action":"need_user"}]
+        result=await self.execute(result_spec={"fields":["title"],"max_items":3,"required_items":3})
+        self.assertEqual(result.last_error,"ui_user_handoff")
+        self.assertEqual(self.calls,1)
+        self.assertNotIn("completion_verified",result.summary)
+
+    async def test_verified_recipe_is_returned_only_after_success_and_contains_no_input_literal(self):
+        field=node("field","",resource_id=APP+":id/query",editable=True,focused=True)
+        entered={**field,"text":"demo"}
+        self.screens=[[node()],[field],[entered],results(),results()]
+        self.decisions=[{"action":"tap","node_id":"n1"},{"action":"input_text","node_id":"field","text":"demo"},
+                        {"action":"back"}]
+        # Back cannot be learned with just one page anchor; use a labelled
+        # search button and a verified tap to the results instead.
+        button=node("submit","搜索",resource_id=APP+":id/submit")
+        self.screens[1].append(button);self.screens[2].append(button)
+        self.decisions[2]={"action":"tap","node_id":"submit"}
+        result=await self.execute(remember_recipe=True)
+        self.assertEqual(result.status,"done")
+        recipe=result.summary["ui_recipe"]
+        self.assertEqual(recipe["version"],1)
+        self.assertEqual(recipe["steps"][1]["parameter_index"],0)
+        self.assertNotIn("demo",json.dumps(recipe))
+        self.assertNotIn("bounds",json.dumps(recipe))
+
+    async def test_recipe_unique_match_runs_without_model_and_postcondition_is_checked(self):
+        before=ui.normalize_snapshot(snapshot([node()]),APP)
+        after=ui.normalize_snapshot(snapshot(results()),APP)
+        learned=ui.learn_step({"action":"tap","node_id":"n1"},before,after,("demo",))
+        recipe={"version":1,"package":APP,"steps":[learned]}
+        async def no_model(context):raise AssertionError("matching recipe needs no model")
+        result=await self.execute(self.runner(decide=no_model),recipe=recipe)
+        self.assertEqual(result.status,"done")
+        self.assertEqual(result.summary["ui_recipe_reused"],1)
+        self.assertEqual(result.summary["model_calls"],0)
+
+    async def test_recipe_target_or_postcondition_mismatch_replans_without_replay(self):
+        before=ui.normalize_snapshot(snapshot([node()]),APP)
+        after=ui.normalize_snapshot(snapshot(results()),APP)
+        learned=ui.learn_step({"action":"tap","node_id":"n1"},before,after,("demo",))
+        recipe={"version":1,"package":APP,"steps":[learned]}
+        self.screens=[[node(text="不同入口")],results(),results()]
+        result=await self.execute(recipe=recipe)
+        self.assertEqual(result.status,"done")
+        self.assertEqual(result.summary["ui_recipe_status"],"mismatch_replanned")
+        self.assertEqual(self.calls,1)
+        self.assertEqual(len(self.writes),1)
+
+    async def test_recipe_postcondition_mismatch_drops_rest_and_asks_model(self):
+        before=ui.normalize_snapshot(snapshot([node()]),APP)
+        after=ui.normalize_snapshot(snapshot(results()),APP)
+        learned=ui.learn_step({"action":"tap","node_id":"n1"},before,after,("demo",))
+        recipe={"version":1,"package":APP,"steps":[learned,learned]}
+        self.screens=[[node()],[node(text="中间页")]]
+        self.decisions=[{"action":"need_user"}]
+        result=await self.execute(recipe=recipe,remember_recipe=True)
+        self.assertEqual(result.last_error,"ui_user_handoff")
+        self.assertEqual(result.summary["ui_recipe_status"],"postcondition_replanned")
+        self.assertEqual(len(self.writes),1)
+        self.assertEqual(self.calls,1)
+        self.assertNotIn("ui_recipe",result.summary)
+
+    async def test_unknown_recipe_action_is_never_replayed_or_saved(self):
+        before=ui.normalize_snapshot(snapshot([node()]),APP)
+        after=ui.normalize_snapshot(snapshot(results()),APP)
+        recipe={"version":1,"package":APP,"steps":[ui.learn_step({"action":"tap","node_id":"n1"},before,after,("demo",))]}
+        async def unknown(action,args):
+            self.writes.append((action,args))
+            return {"success":False,"error_code":"connection_failed","outcome":"unknown"}
+        result=await self.execute(self.runner(act=unknown),recipe=recipe,remember_recipe=True)
+        self.assertEqual(result.steps[-1].status,"unknown")
+        self.assertEqual(len(self.writes),1)
+        self.assertNotIn("ui_recipe",result.summary)
+
+    async def test_visual_snapshots_require_explicit_scope_and_never_persist_image(self):
+        async def observe(package):
+            value=await self.observe(package)
+            value.update(source="ocr",screenshot={"data_base64":"PRIVATE_IMAGE_BYTES"})
+            return value
+        result=await self.execute(self.runner(observe=observe))
+        self.assertEqual(result.last_error,"ui_vision_not_authorized")
+        self.assertFalse(self.writes)
+        self.assertNotIn("PRIVATE_IMAGE_BYTES",self.path.read_text(encoding="utf-8"))
+
+    async def test_authorized_visual_tap_is_grounded_and_never_learned(self):
+        async def observe(package):
+            value=await self.observe(package);value["source"]="ocr"
+            return value
+        result=await self.execute(self.runner(observe=observe),allow_vision=True,remember_recipe=True)
+        self.assertEqual(result.status,"done")
+        self.assertNotIn("ui_recipe",result.summary)
+        self.assertEqual(self.writes[0][1]["node_id"],"n1")
+        self.assertNotIn("x",self.writes[0][1])
+
+    async def test_visual_input_is_not_silently_upgraded_to_a_coordinate_action(self):
+        async def observe(package):
+            value=await self.observe(package);value["source"]="ocr"
+            return value
+        self.screens=[[node(editable=True,focused=True)]]
+        self.decisions=[{"action":"input_text","node_id":"n1","text":"demo"}]
+        result=await self.execute(self.runner(observe=observe),allow_vision=True)
+        self.assertEqual(result.last_error,"ui_visual_action_requires_user")
+        self.assertFalse(self.writes)
+
+    async def test_resume_new_run_observes_current_page_without_opening_app_or_old_grant(self):
+        self.run.summary["parent_run_id"]="previous-run"
+        self.screens=[results()]
+        result=await self.execute(open_target=False)
+        self.assertEqual(result.status,"done")
+        self.assertEqual(result.summary["parent_run_id"],"previous-run")
+        self.assertFalse(self.writes)
+
+    async def test_failed_final_persistence_cannot_publish_results_or_recipe(self):
+        self.screens=[results()]
+        original=self.store.save
+        def fail_done():return False if self.run.status=="done" else original()
+        with patch.object(self.store,"save",side_effect=fail_done):result=await self.execute()
+        self.assertEqual(result.status,"failed")
+        self.assertEqual(result.last_error,"ui_persistence_failed")
+        self.assertNotIn("completion_verified",result.summary)
+
 
 if __name__ == "__main__": unittest.main()

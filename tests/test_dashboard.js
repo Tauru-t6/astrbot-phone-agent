@@ -261,3 +261,23 @@ test('failed initial refresh ends loading placeholders and preserves an existing
   assert.equal(d.elements.get('healthRows').innerHTML,snapshot);
   assert.equal(d.elements.get('headerStatus').textContent,'状态读取失败');
 });
+
+test('pairing renders only local QR data and clears short-lived secrets when leaving',async()=>{
+  const d=await dashboard();
+  d.transport.post=async()=>({success:true,pairing:{expires_at:Date.now()/1000+120,code:'synthetic-one-time-code'},qr_image:'https://outside.example/collect'});
+  await d.context.createPairing();
+  assert.match(d.elements.get('pairPayload').value,/synthetic-one-time-code/);
+  assert.equal(d.elements.get('pairQr').hidden,true);
+  d.context.selectView('overview');
+  assert.equal(d.elements.get('pairPayload').value,'');
+  assert.equal(d.elements.get('pairQr').hidden,true);
+});
+
+test('pairing device list escapes attacker-controlled names',async()=>{
+  const d=await dashboard();
+  d.transport.get=async()=>({success:true,ready:true,devices:[{device_id:'"><img src=x onerror=1>',device_kind:'<script>x</script>',revoked:false}]});
+  await d.context.loadPairing();
+  const body=d.elements.get('pairDevices').innerHTML;
+  assert.doesNotMatch(body,/<(?:img|script)\b/);
+  assert.match(body,/&lt;img/);
+});

@@ -2,9 +2,9 @@ name: astrbot_plugin_phone_agent
 display_name: Phone Control
 author: tauru
 description: |
-  AstrBot 手机控制插件：App / OperitAI 双模式，Shizuku 执行。支持按设备审批的读屏、点击、输入和逐步核验任务，以及独立 Bot 手机 App；个人版保留健康同步、提醒与夜间守护。
-  Android phone control for AstrBot: approved UI tasks with observation and verification, a separate Bot phone App, and personal health sync, reminders and night guard.
-version: 0.10.0
+  AstrBot 手机控制插件：支持逐步核验的手机任务、页面结果回传、参数化收藏、接手续跑和限额 Bot 日程；可选扫码配对与截图辅助。个人版保留健康同步、提醒与夜间守护。
+  Verified phone tasks for AstrBot with grounded results, reusable templates, fresh approval on resume, bounded Bot schedules, optional device pairing and screenshot assistance. Personal health sync and reminders remain available.
+version: 0.11.0
 astrbot_version: ">=4.22.0"
 support_platforms:
   - aiocqhttp

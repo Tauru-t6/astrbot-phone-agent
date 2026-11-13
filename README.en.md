@@ -4,7 +4,7 @@
 
 Control an Android phone from AstrBot through **Phone Control / Phone Control Bot** or **OperitAI**. App mode executes structured commands through Shizuku and can optionally use a server model for bounded UI tasks. Operit mode uses its phone-side model and tools.
 
-**0.10.0, paired with App 0.4.0.** UI tasks follow observe → choose a current node → act → observe again. Review the exact device, single app, permitted input text, completion conditions and step limit before each task. The App includes a Bilibili search template and custom tasks for browsing, non-sensitive settings and drafting. Login, payments, sending/publishing, deletion and permission grants require manual handoff. This is not a promise of universal app automation.
+**0.11.0 with App 0.5.0; physical-device acceptance is pending.** Adds verified result fields, parameterized saved tasks, reusable verified selectors, fresh-approval continuation, and finite Bot schedules. Optional QR pairing issues revocable device credentials; the dashboard JWT stays on the server. Opt-in screenshot/OCR assistance still selects grounded nodes. The personal App keeps its clean home screen and distinguishes health-sync attempts from successful uploads. Login, payments, sending/publishing, deletion and permission grants require manual handoff. See [setup](docs/UI_TASKS.md) and [release verification scope](docs/RELEASE_0_11.md).
 
 Install **Phone Control** on your personal phone and the separate **Phone Control Bot** on the Bot's phone. The Bot APK has its own package/storage and excludes the Health Connect SDK, health permissions, readers and sync implementation. Roles route tasks to their chosen device; an offline Bot phone never falls back to the personal phone. Roles do not create separate account security boundaries. See the [setup and limitations](docs/UI_TASKS.md).
 
@@ -131,7 +131,7 @@ Wireless debugging here is only a way to start Shizuku. It is not the AstrBot se
 
 ### 4.2 App mode setup
 
-Install the App release, let its foreground connection service run, then open **我的 -> 服务器连接**. Enter the plugin route base URL, Dashboard JWT and phone command token matching `app_shared_token`. Save and test the plugin connection. Chat stays in QQ or another AstrBot conversation; the current App has no chat UI and needs no chat API credentials. Configure ordered LAN/Tailscale endpoints on the plugin:
+Install the App release and let its foreground connection service run. App 0.5.0 can use the optional 120-second QR pairing flow with a dedicated device credential. Paired devices currently use direct commands, without the shared Relay secret. Existing clients can still open **我的 -> 服务器连接** and enter the plugin route base URL, Dashboard JWT and phone command token matching `app_shared_token`. Save and test the plugin connection. Chat stays in QQ or another AstrBot conversation; the current App has no chat UI and needs no chat API credentials. Configure ordered LAN/Tailscale endpoints on the plugin:
 
 ```json
 {
@@ -142,7 +142,7 @@ Install the App release, let its foreground connection service run, then open **
 }
 ```
 
-The public App contains no preset service URL or credentials. Its closed command set includes taps, long presses, swipes, scrolling, text input and key events with explicit parameters and on-device confirmation. Plugin 0.10.0 and App 0.4.0 add approved single-app UI tasks through `phone_ui_task`; `phone_task_status` reports progress. `phone_observe` remains a structured device-status read, and screenshots remain a separate action.
+The public App contains no preset service URL or credentials. Its closed command set includes taps, long presses, swipes, scrolling, text input and key events with explicit parameters and on-device confirmation. Plugin 0.10.0 and App 0.4.0 add approved single-app UI tasks through `phone_ui_task`; `phone_task_status` reports progress and explicitly requested result fields. Results contain 1–10 independently verified titles and optional author/duration/URL values; missing optional fields are null. Saved tasks and resumed attempts always need fresh approval; Bot schedules have separate finite standing consent. `phone_observe` remains a structured device-status read, and screenshot/OCR assistance requires both a server switch and explicit task consent.
 
 For UI tasks, enable `enable_ui_tasks`, `enable_task_execute` and `enable_observe_tool`, configure `ui_task_allowed_packages`, and optionally select `ui_task_provider_id`. The model receives visible page-node text. On the execution device, manually enable the Phone Control input method; it is temporarily selected for text input, then restoration of the previous input method is attempted. Continuous execution also requires explicit opt-in to the **Read UI nodes** and **Operate UI** no-confirmation switches. Both default off. This trusts the connected server for those command types; server-side full task approval remains separate. See [UI tasks](docs/UI_TASKS.md).
 

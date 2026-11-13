@@ -1,6 +1,6 @@
 # Phone Control · AstrBot 手机控制插件
 
-[完整中文教程](README.zh-CN.md) · [English guide](README.en.md) · [界面任务与双设备](docs/UI_TASKS.md) · [更新日志](CHANGELOG.md) · [App API v2](docs/APP_API_V2.md)
+[完整中文教程](README.zh-CN.md) · [English guide](README.en.md) · [界面任务与双设备](docs/UI_TASKS.md) · [更新日志](CHANGELOG.md) · [0.11 升级说明](docs/RELEASE_0_11.md) · [App API v2](docs/APP_API_V2.md)
 
 DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GPT 太贵了
 
@@ -10,13 +10,13 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 
 ## 5 分钟上手（自有 App 模式）
 
-**0.10.0，配套 App 0.4.0**：新增有范围、有步数上限的界面任务。服务器模型根据当前页面节点决定下一步，手机执行后重新观察；先支持 B 站搜索模板，也可填写单个 App 的浏览、非敏感设置或草稿任务。每次必须核对设备、应用、允许输入原文和完成条件后批准；登录、付款、发送、删除和权限授予等步骤交人工接手。设置与限制见[界面任务与双设备](docs/UI_TASKS.md)。历史修复见[更新日志](CHANGELOG.md)。
+**0.11.0（配套 App 0.5.0）**：在有范围的界面任务上增加已核验结果回传、参数化收藏、操作经验复用、接手后新审批续跑和限额 Bot 日程。另有可撤销扫码配对、设备自检及显式开启的截图/OCR 辅助；个人版保留简洁首页，健康同步区分最近尝试和成功。结果只复制新读屏核对过的页面事实，敏感步骤仍由人工处理。配置和限制见[界面任务与双设备](docs/UI_TASKS.md)，发布前验收要求见[0.11 说明](docs/RELEASE_0_11.md)。
 
 个人手机安装 **Phone Control**，Bot 专用第二台手机安装独立的 **Phone Control Bot**。Bot 版有独立包名和存储，不包含 Health Connect SDK、健康权限或读取功能。设备按「我的手机 / Bot 的手机」分别选择，第二台离线不会转而操作第一台；角色划分不是不同账户之间的权限隔离。
 
 1. **装插件**：在 AstrBot 插件市场搜索 `Phone Control` 安装，或按[安装与升级](#安装与升级)用 Git 拉取。
 2. **装 App**：从 [App Releases](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases/latest) 下载最新 APK，安装后把 Shizuku 启动并授权。
-3. **填三个字段**（App 的「纸笺 → 服务器连接」）：
+3. **连接服务器**：0.11.0 / App 0.5.0 可按[扫码设置](docs/UI_TASKS.md)生成 120 秒一次性配对码，手机只取得设备专用凭据。传统方式继续在 App「我的 / 设置 → 服务器连接」填三个字段：
 
    | 字段 | 填什么 |
    | --- | --- |
@@ -51,7 +51,10 @@ DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GP
 | 自然语言手机任务 | `operit_task` | OperitAI 模式；App 模式明确拒绝自由文本执行 |
 | 后台任务查询、取消、重试 | `operit_task_status` / `operit_task_cancel` / `operit_task_retry` | 保留 Operit 后台任务、并发限制与任务元数据持久化 |
 | 白名单手机操作 | `phone_action` | 两模式支持各自执行端的动作，App 不会误走 ADB |
-| 有范围的界面任务 | `phone_ui_task` / `phone_task_status` | App 0.4.0+；开启 `enable_ui_tasks`、`enable_task_execute`、`enable_observe_tool`，每个任务先审批 |
+| 有范围的界面任务与结果 | `phone_ui_task` / `phone_task_status` | App 0.5.0 可申请 1–10 条页面结果；基础三个开关和任务审批仍生效 |
+| 任务收藏、续跑与 Bot 日程 | App「任务收藏与自主日程」 | 参数化提案、当前状态续跑；日程另开 `enable_task_routines` 并批准有限额度 |
+| 扫码配对与设备自检 | WebUI / App 连接设置 | `enable_device_pairing`；设备凭据可撤销，新配对当前直连，传统 Relay 兼容 |
+| 截图/OCR 辅助 | `enable_ui_vision` + 每任务 `allow_vision` | 只选择可核验节点，OCR 只点击/返回，变化停止 |
 | 观察前台与屏幕 | `phone_observe` | `enable_observe_tool`；Operit 可读屏，App 返回设备状态 |
 | 截图回传聊天 | `phone_screenshot` | `enable_screenshot_tool`；仅 App 模式，图片直接发进当前会话 |
 | 手机通知转发 | `phone_notifications` | `enable_notification_tool`；App 端需授予通知读取权限 |
@@ -156,7 +159,7 @@ python deploy\relay\relay_server.py
 
 ## 模式一：自有 App
 
-下载 [App Release](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases)，启动 Shizuku 并授权。在 App 的连接设置中填写插件地址、Dashboard JWT 和手机共享 Token。聊天在 QQ 等 AstrBot 会话中进行，当前 App 不需要配置聊天 API。
+下载 [App Release](https://github.com/Tauru-t6/astrbot-phone-agent-app/releases)，启动 Shizuku 并授权。可按[扫码配对说明](docs/UI_TASKS.md)使用独立设备凭据，或在 App 连接设置填写传统插件地址、Dashboard JWT 和手机共享 Token。聊天在 QQ 等 AstrBot 会话中进行，当前 App 不需要配置聊天 API。
 
 ```json
 {
@@ -183,7 +186,7 @@ App 端凭据各有用途：
 
 可选 Relay 另用独立 `relay_token`。App 初始不含任何角色名字、头像、服务器地址或密钥。
 
-**当前能力边界**：底层 App 保留状态、应用管理、导航、截图、读屏、固定界面动作、定位、通知等指令。0.10.0 的 `phone_ui_task` 增加单应用的「观察 → 模型选择节点 → 执行 → 再观察」，默认最多 8 步，配置上限为 12 步。模型会收到目标页面的可见节点文字，只能输入已批准原文；它不是任意 App 的通用自动操作保证。`phone_observe` 仍返回设备状态，截图是独立能力。完整准备、搜索验收与人工接手规则见[界面任务说明](docs/UI_TASKS.md)。
+**当前能力边界**：底层 App 保留状态、应用管理、导航、截图、读屏、固定界面动作、定位、通知等指令。`phone_ui_task` 提供单应用的「观察 → 模型选择节点 → 执行 → 再观察」，默认最多 8 步，配置上限为 12 步。模型会收到目标页面的可见节点文字，只能输入已批准原文；它不是任意 App 的通用自动操作保证。`phone_observe` 仍返回设备状态；截图/OCR 辅助需服务端和本次任务分别开启，结果回传需明确选择字段与数量。完整准备、搜索验收与人工接手规则见[界面任务说明](docs/UI_TASKS.md)。
 
 连续界面任务需在**执行设备**的「隐私与自动化」明确打开「读取界面节点」和「操作界面」免确认，并在 Android 设置手动启用 Phone Control 输入法。输入时临时切换、结束后尝试恢复原输入法。两项免确认默认关闭；开启代表信任已连接服务器发送该类命令，服务端每次任务的完整范围审批仍保留。
 
