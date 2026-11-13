@@ -2,7 +2,7 @@
 
 [完整中文教程](README.zh-CN.md) · [English guide](README.en.md) · [界面任务与双设备](docs/UI_TASKS.md) · [更新日志](CHANGELOG.md) · [0.11 升级说明](docs/RELEASE_0_11.md) · [App API v2](docs/APP_API_V2.md)
 
-DeepSeek V4.1 Flash 1017发布了后面可能会让这个模型继续更新，GPT 太贵了
+别问为啥我3天发了5个release，捡到大便宜了倍率低满血不降智的GPT （不用担心代码含毒因为我也用）README都是gpt写的看不懂丢给ai即可，我自己都不知道写了什么 （）
 
 让 AstrBot 通过聊天控制 Android 手机：开关应用、观察屏幕、查询电量和使用时长、临时限制应用、设置提醒，以及按需查询位置和小米健康数据。
 
